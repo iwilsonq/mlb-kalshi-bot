@@ -21,12 +21,17 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set
 
+from slugger.calibration import CalibrationLayer
 from slugger.config import Config
 from slugger.journal import record_signal
 from slugger.kalshi_client import KalshiClient, market_price
 from slugger.sizing import kelly_count
 
 log = logging.getLogger(__name__)
+
+# Module-level calibration layer — loaded once, shared across all calls.
+# Initialized as pass-through (identity) until load_calibration() is called.
+_calibration = CalibrationLayer()
 
 
 # ─── Data types ──────────────────────────────────────────────────────────────
@@ -162,6 +167,19 @@ def parse_threshold_regex(title: str, pattern: str, ceil: bool = False) -> Optio
     return int(math.ceil(val)) if ceil else int(val)
 
 
+# ─── Calibration management ──────────────────────────────────────────────────
+
+def load_calibration(path: str) -> None:
+    """Load calibration curves from disk into the module-level layer."""
+    global _calibration
+    _calibration = CalibrationLayer.load(path)
+
+
+def get_calibration() -> CalibrationLayer:
+    """Return the current calibration layer (for inspection/testing)."""
+    return _calibration
+
+
 # ─── Default confidence function ─────────────────────────────────────────────
 
 def _default_confidence(edge_cents: float) -> float:
@@ -269,17 +287,22 @@ def evaluate_markets(
         if result is None:
             continue
 
-        prob_pct = result.prob_pct
+        raw_prob_pct = result.prob_pct
+
+        # ── Apply calibration ──────────────────────────────────────────────
+        # Record raw probability in signals.jsonl (for future recalibration),
+        # then use calibrated probability for edge/trade decisions.
+        prob_pct = _calibration.calibrate(spec.strategy_name, raw_prob_pct)
         edge = prob_pct - price
         evaluated.append((threshold, prob_pct, price, edge))
 
-        # ── Record signal for calibration ──────────────────────────────────
+        # ── Record signal (raw model prob for calibration data) ────────────
         traded = edge >= edge_floor and prob_pct >= spec.min_model_prob
         record_signal(
             config.log_dir,
             ticker,
             spec.strategy_name,
-            model_prob_pct=prob_pct,
+            model_prob_pct=raw_prob_pct,
             market_price_cents=price,
             edge_cents=float(edge),
             traded=traded,
@@ -411,7 +434,8 @@ def _evaluate_no_side(
         if result is None:
             continue
 
-        model_yes_pct = result.prob_pct
+        raw_yes_pct = result.prob_pct
+        model_yes_pct = _calibration.calibrate(spec.strategy_name, raw_yes_pct)
 
         # Only consider NO when model is very confident YES won't happen
         if model_yes_pct > spec.no_max_model_prob:

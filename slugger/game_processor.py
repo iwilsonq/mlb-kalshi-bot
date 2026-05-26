@@ -22,6 +22,7 @@ from slugger.kalshi_client import KalshiClient
 from slugger.mlb_data import (
     GameContext, GameInfo, LiveMLBDataProvider, get_todays_games,
 )
+from slugger.signal_pipeline import load_calibration
 from slugger.strategies import BATTER_STRATEGIES, STRATEGIES, TradeSignal, strategy_combo, strategy_game_winner
 from slugger.tickers import game_event_ticker
 import slugger.journal as journal
@@ -459,6 +460,10 @@ def run(config: Config, game_filter: Optional[str] = None):
     client = config.create_kalshi_client()
     circuit = CircuitBreaker(config)
     provider = LiveMLBDataProvider()
+
+    # Load calibration curves (if available) for probability adjustment
+    cal_path = str(Path(config.log_dir) / "calibration.json")
+    load_calibration(cal_path)
 
     # Load today's ledger — persists placed tickers across invocations
     placed_tickers: Set[str] = load_ledger(config.log_dir)

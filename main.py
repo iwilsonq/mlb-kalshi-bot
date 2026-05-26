@@ -124,12 +124,12 @@ def cmd_stats(config: Config):
     print(journal.format_stats(overall, per_strategy))
 
 
-def cmd_calibrate(config: Config):
-    """Analyze model calibration: predicted probability vs. actual outcomes.
+def cmd_calibrate(config: Config, fit: bool = False):
+    """Analyze model calibration and optionally fit calibration curves.
 
-    Joins signals.jsonl against journal.jsonl settlements to bucket
-    predictions into probability bands and show how often they actually hit.
-    This reveals whether the model is over- or under-confident at each level.
+    Without --fit: shows predicted probability vs. actual outcomes by band.
+    With --fit: trains isotonic regression per strategy and saves to
+    logs/calibration.json for use by the signal pipeline.
     """
     signals = journal.load_signals(config.log_dir)
     if not signals:
@@ -141,6 +141,19 @@ def cmd_calibrate(config: Config):
     settlements = {
         r["ticker"]: r for r in records if r.get("type") == "settlement"
     }
+
+    # ── Fit mode: train and save calibration curves ────────────────────────
+    if fit:
+        from slugger.calibration import CalibrationLayer
+        from pathlib import Path
+
+        cal = CalibrationLayer.fit(signals, settlements)
+        cal_path = str(Path(config.log_dir) / "calibration.json")
+        cal.save(cal_path)
+        print(cal.format_report())
+        print(f"\nCalibration saved to {cal_path}")
+        print("The bot will load this automatically on next run.")
+        return
 
     # Bucket signals by strategy and probability band
     from collections import defaultdict
@@ -236,6 +249,10 @@ def main():
         help="Filter to a specific game by team abbreviation (e.g. LAD, SFLAD). "
              "Implies a single pass — exits after one scan.",
     )
+    parser.add_argument(
+        "--fit", action="store_true",
+        help="(calibrate only) Fit isotonic regression curves and save to logs/calibration.json.",
+    )
 
     args = parser.parse_args()
 
@@ -253,10 +270,11 @@ def main():
         "status": cmd_status,
         "settle": cmd_settle,
         "stats": cmd_stats,
-        "calibrate": cmd_calibrate,
     }
     if args.command == "run":
         cmd_run(config, game_filter=args.game)
+    elif args.command == "calibrate":
+        cmd_calibrate(config, fit=args.fit)
     else:
         commands[args.command](config)
 
