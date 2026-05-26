@@ -226,7 +226,7 @@ class TestProcessGameWithContext:
 
     def test_process_game_accepts_context(self):
         """process_game should accept a GameContext without errors."""
-        from main import process_game, CircuitBreaker
+        from slugger.game_processor import process_game, CircuitBreaker
         from slugger.config import Config
 
         ctx = _make_context()
@@ -248,7 +248,7 @@ class TestProcessGameWithContext:
 
     def test_process_game_uses_context_pitchers(self):
         """process_game should use pitchers from context, not fetch them."""
-        from main import process_game, CircuitBreaker
+        from slugger.game_processor import process_game, CircuitBreaker
         from slugger.config import Config
 
         ctx = _make_context()
@@ -273,7 +273,7 @@ class TestProcessGameWithContext:
 
     def test_process_game_with_started_game(self):
         """A game past its start time should be skipped entirely."""
-        from main import process_game, CircuitBreaker
+        from slugger.game_processor import process_game, CircuitBreaker
         from slugger.config import Config
 
         ctx = _make_context(game=_make_game(
