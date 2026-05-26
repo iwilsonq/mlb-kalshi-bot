@@ -18,85 +18,20 @@ from __future__ import annotations
 import logging
 import math
 import re
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from slugger.calibration import CalibrationLayer
 from slugger.config import Config
 from slugger.journal import record_signal
 from slugger.kalshi_client import KalshiClient, market_price
 from slugger.sizing import kelly_count
+from slugger.types import MarketSpec, ModelFn, ModelResult, TradeSignal
 
 log = logging.getLogger(__name__)
 
 # Module-level calibration layer — loaded once, shared across all calls.
 # Initialized as pass-through (identity) until load_calibration() is called.
 _calibration = CalibrationLayer()
-
-
-# ─── Data types ──────────────────────────────────────────────────────────────
-
-@dataclass
-class ModelResult:
-    """Output from a strategy's probability model for a single market.
-
-    Attributes:
-        prob_pct:  Model probability as integer percentage (0-100).
-        reason:    Human-readable explanation for logging / journal.
-    """
-    prob_pct: int
-    reason: str
-
-
-@dataclass
-class MarketSpec:
-    """Describes how to find and evaluate markets for a strategy.
-
-    Attributes:
-        event_ticker:       Kalshi event ticker to query.
-        strategy_name:      Name for TradeSignal.strategy and journal recording.
-        title_keywords:     Market title must contain at least one of these
-                            (case-insensitive).  Empty list = no keyword filter.
-        player_name:        If set, market title must contain this player's last
-                            name (case-insensitive).
-        ticker_suffix:      If set, market ticker must end with this suffix
-                            (case-insensitive, e.g. "-LAD" for home team).
-        threshold_pattern:  Regex pattern to extract a numeric threshold from the
-                            title.  Must have one capture group yielding a number.
-                            If None, threshold is not parsed (passed as None to model).
-        threshold_ceil:     If True, ceil the parsed threshold (for "over 6.5" → 7).
-        min_threshold:      Skip markets with threshold below this value.
-        min_model_prob:     Minimum model probability (%) to consider trading YES.
-        min_edge_cents:     Minimum edge in cents to trade (overrides config if higher).
-        max_signals:        Maximum number of YES signals to return (sorted by edge).
-                            0 = unlimited.
-        confidence_fn:      Compute TradeSignal.confidence from edge_cents.
-                            Default: min(0.5 + edge/100, 0.85).
-        no_side:            If True, also evaluate NO-side trades.
-        no_max_model_prob:  For NO-side: only buy NO when model YES prob ≤ this (%).
-        no_min_edge_cents:  For NO-side: minimum edge to buy NO.
-    """
-    event_ticker: str
-    strategy_name: str
-    title_keywords: List[str] = field(default_factory=list)
-    player_name: str = ""
-    ticker_suffix: str = ""
-    threshold_pattern: Optional[str] = None
-    threshold_ceil: bool = False
-    min_threshold: int = 0
-    min_model_prob: int = 0
-    min_edge_cents: int = 0
-    max_signals: int = 0
-    confidence_fn: Optional[Callable[[float], float]] = None
-    no_side: bool = False
-    no_max_model_prob: int = 10
-    no_min_edge_cents: int = 5
-
-
-# Probability model callable type:
-#   (market_title, threshold_or_none, market_price_cents) → ModelResult or None
-#   Return None to skip this market entirely.
-ModelFn = Callable[[str, Optional[int], int], Optional[ModelResult]]
 
 
 # ─── Threshold parsing ───────────────────────────────────────────────────────
@@ -193,7 +128,7 @@ def evaluate_markets(
     model: ModelFn,
     client: KalshiClient,
     config: Config,
-) -> List["TradeSignal"]:
+) -> List[TradeSignal]:
     """Run the full signal pipeline for a strategy.
 
     Fetches markets for spec.event_ticker, filters/matches them according to
@@ -210,8 +145,6 @@ def evaluate_markets(
     Returns:
         List of TradeSignal objects (may be empty).
     """
-    from slugger.strategies import TradeSignal  # avoid circular import
-
     signals: List[TradeSignal] = []
 
     if not spec.event_ticker:
@@ -386,14 +319,12 @@ def _evaluate_no_side(
     edge_floor: int,
     confidence_fn: Callable[[float], float],
     yes_tickers: Set[str],
-) -> List["TradeSignal"]:
+) -> List[TradeSignal]:
     """Evaluate NO-side trades for markets where the model says YES is unlikely.
 
     Only called when spec.no_side is True.  Buys NO when the model's YES
     probability is very low but the market prices YES higher.
     """
-    from slugger.strategies import TradeSignal
-
     no_signals: List[TradeSignal] = []
 
     player_last = ""

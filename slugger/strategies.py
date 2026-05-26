@@ -13,31 +13,21 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from slugger.config import Config
-from slugger.mlb_data import GameInfo, PitcherProfile, BatterProfile, TeamProfile, get_team_profile
 from slugger.kalshi_client import KalshiClient, market_price
 from slugger.journal import record_signal
+from slugger.mlb_data import get_team_profile
 from slugger.sizing import kelly_count
-from slugger.signal_pipeline import MarketSpec, ModelResult, evaluate_markets
+from slugger.signal_pipeline import evaluate_markets
 from slugger.tickers import (
     kalshi_team, kalshi_date, game_event_ticker, ks_event_ticker,
     hr_event_ticker, total_event_ticker, hit_event_ticker, hrr_event_ticker,
 )
+from slugger.types import (
+    BatterProfile, GameInfo, MarketSpec, ModelResult, PitcherProfile,
+    TeamProfile, TradeSignal,
+)
 
 log = logging.getLogger(__name__)
-
-
-@dataclass
-class TradeSignal:
-    """A suggested trade from a strategy."""
-    ticker: str
-    action: str           # "buy"
-    side: str             # "yes" or "no"
-    count: int            # number of contracts
-    price: int            # limit price in cents (1-99)
-    strategy: str         # e.g. "game_winner"
-    confidence: float     # 0.0-1.0
-    edge_cents: float     # expected edge in cents
-    reason: str = ""      # human-readable rationale
 
 
 

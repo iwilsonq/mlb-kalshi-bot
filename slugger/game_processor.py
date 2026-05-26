@@ -19,12 +19,11 @@ import requests
 
 from slugger.config import Config
 from slugger.kalshi_client import KalshiClient
-from slugger.mlb_data import (
-    GameContext, GameInfo, LiveMLBDataProvider, get_todays_games,
-)
+from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
 from slugger.signal_pipeline import load_calibration
-from slugger.strategies import BATTER_STRATEGIES, STRATEGIES, TradeSignal, strategy_combo, strategy_game_winner
+from slugger.strategies import BATTER_STRATEGIES, STRATEGIES, strategy_combo, strategy_game_winner
 from slugger.tickers import game_event_ticker
+from slugger.types import GameContext, GameInfo, TradeSignal
 import slugger.journal as journal
 
 log = logging.getLogger("slugger")

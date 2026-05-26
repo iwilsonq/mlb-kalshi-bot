@@ -13,7 +13,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
-from slugger.mlb_data import GameInfo
+from slugger.types import GameInfo
 
 
 # ─── Team abbreviation mapping ───────────────────────────────────────────────
