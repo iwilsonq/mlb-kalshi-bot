@@ -78,7 +78,11 @@ def save_ledger(tickers: Set[str], log_dir: str) -> None:
 # ─── Circuit Breaker ──────────────────────────────────────────────────────────
 
 class CircuitBreaker:
-    """Monitors losses and trips the bot if thresholds are exceeded."""
+    """Monitors losses and trips the bot if thresholds are exceeded.
+
+    Fed by settlement P&L (not placement cost).  A negative pnl_usd
+    means a loss; a positive pnl_usd means a win.
+    """
 
     def __init__(self, config: Config):
         self.max_loss = config.cb_max_loss_usd
@@ -87,9 +91,14 @@ class CircuitBreaker:
         self.consec_losses = 0
         self.tripped = False
 
-    def record_trade(self, loss_usd: float):
-        if loss_usd < 0:
-            self.total_loss += abs(loss_usd)
+    def record_settlement(self, pnl_usd: float):
+        """Record a settlement outcome.
+
+        Args:
+            pnl_usd: Profit/loss in dollars.  Negative = loss, positive = win.
+        """
+        if pnl_usd < 0:
+            self.total_loss += abs(pnl_usd)
             self.consec_losses += 1
             if self.total_loss > self.max_loss or self.consec_losses >= self.max_consec:
                 self.tripped = True
@@ -258,7 +267,6 @@ def execute_signals(
                 )
                 held_tickers.add(signal.ticker)
                 placed_tickers.add(signal.ticker)
-                circuit.record_trade(cost_usd)
                 if budget:
                     budget.record(cost_usd)
                 journal.record_trade(
@@ -455,11 +463,18 @@ def process_game(
 
 # ─── Settlement ───────────────────────────────────────────────────────────────
 
-def settle_pending(client: KalshiClient, config: Config) -> int:
+def settle_pending(
+    client: KalshiClient,
+    config: Config,
+    circuit: Optional[CircuitBreaker] = None,
+) -> int:
     """Check Kalshi for outcomes on any unsettled journal trades.
 
     Returns the number of newly recorded settlements.
     Safe to call repeatedly — skips tickers already in the journal.
+
+    If a CircuitBreaker is provided, each settlement's P&L is fed into
+    it so the breaker can trip on consecutive or total losses.
     """
     records = journal.load_journal(config.log_dir)
     if not records:
@@ -501,6 +516,8 @@ def settle_pending(client: KalshiClient, config: Config) -> int:
             settled_at=settled_at,
         )
         pnl = revenue_usd - yes_cost - fee
+        if circuit is not None:
+            circuit.record_settlement(pnl)
         log.info("  📋 Settled %-45s  result=%-4s  P&L $%+.2f", ticker, result or "?", pnl)
         found += 1
 
@@ -630,7 +647,7 @@ def run(config: Config, game_filter: Optional[str] = None):
         # Auto-settle: check for outcomes on any open journal trades
         if not single_pass:
             try:
-                n = settle_pending(client, config)
+                n = settle_pending(client, config, circuit=circuit)
                 if n:
                     overall, _ = journal.get_stats(journal.load_journal(config.log_dir))
                     log.info(
