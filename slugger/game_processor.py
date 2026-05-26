@@ -428,21 +428,8 @@ def process_game(
 
     # ── Combo / parlay strategy ───────────────────────────────────────────
     if "combo" in config.enabled_strategies and not circuit.is_tripped():
-        # Use batter data from context (already fetched by provider)
-        combo_bp_pairs = batter_pitcher_pairs
-        if not combo_bp_pairs:
-            combo_bp_pairs = (
-                [(b, home_pitch) for b in away_batters]
-                + [(b, away_pitch) for b in home_batters]
-            )
-
         combo_signals = strategy_combo(
             game, client, config,
-            away_pitcher=away_pitch,
-            home_pitcher=home_pitch,
-            home_team=ctx.home_team,
-            away_team=ctx.away_team,
-            batter_pitcher_pairs=combo_bp_pairs,
             single_leg_signals=all_single_leg_signals,
         )
         if execute_signals(

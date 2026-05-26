@@ -261,6 +261,7 @@ def evaluate_markets(
                     confidence=confidence_fn(edge),
                     edge_cents=float(edge),
                     reason=result.reason,
+                    model_prob_pct=float(prob_pct),
                 ))
 
     # ── NO-side evaluation (opt-in) ────────────────────────────────────────
@@ -415,6 +416,7 @@ def _evaluate_no_side(
                 confidence=confidence_fn(no_edge),
                 edge_cents=float(no_edge),
                 reason=no_reason,
+                model_prob_pct=float(100 - model_yes_pct),
             ))
 
     return no_signals

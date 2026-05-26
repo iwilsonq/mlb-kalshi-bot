@@ -193,6 +193,7 @@ class TradeSignal:
     confidence: float     # 0.0-1.0
     edge_cents: float     # expected edge in cents
     reason: str = ""      # human-readable rationale
+    model_prob_pct: float = 0.0  # calibrated model probability (0-100)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

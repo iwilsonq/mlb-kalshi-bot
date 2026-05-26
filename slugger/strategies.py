@@ -879,27 +879,22 @@ def _legs_are_valid_combo(legs: List[ComboLeg]) -> bool:
 
 
 def build_combo_legs(
-    game_info: GameInfo,
     single_leg_signals: List[TradeSignal],
-    client: KalshiClient,
-    config: Config,
 ) -> List[ComboLeg]:
     """Convert single-leg TradeSignals into ComboLeg candidates.
 
     Filters to legs that meet minimum edge and probability thresholds.
-    Each signal already has a ticker, price, edge, and probability
-    embedded from the single-leg strategy that produced it.
+    Each signal carries its calibrated model_prob_pct from the pipeline,
+    so no reverse-engineering is needed.
     """
     legs: List[ComboLeg] = []
 
     for sig in single_leg_signals:
-        # Reconstruct model probability from edge + price
-        if sig.side == "yes":
-            model_prob = sig.price + sig.edge_cents
-        else:
-            # For NO signals: price is the NO cost, edge is how overpriced YES is
-            model_prob = (100 - sig.price) - sig.edge_cents
-            model_prob = 100 - model_prob  # convert to NO prob
+        model_prob = sig.model_prob_pct
+        if model_prob <= 0:
+            # Fallback for signals without model_prob_pct (shouldn't happen
+            # but be defensive for signals from older code paths)
+            model_prob = sig.price + sig.edge_cents if sig.side == "yes" else 100 - sig.price + sig.edge_cents
 
         if model_prob < _COMBO_MIN_LEG_PROB:
             continue
@@ -907,10 +902,6 @@ def build_combo_legs(
             continue
 
         event_ticker = _event_ticker_for_market(sig.ticker)
-
-        # Build a short human-readable label
-        # Ticker like KXMLBKS-26MAY231420HOUCHC-CHCCREA53-7
-        # -> "Rea 7+ Ks" (extract from reason or ticker suffix)
         label = sig.reason[:50] if sig.reason else sig.ticker.split("-")[-1]
 
         legs.append(ComboLeg(
@@ -925,245 +916,6 @@ def build_combo_legs(
         ))
 
     return _dedupe_legs(legs)
-
-
-# ── Direct leg sourcing for combos ────────────────────────────────────────────
-# These functions scan markets and build ComboLeg candidates using the same
-# probability models as the single-leg strategies, but with relaxed edge
-# thresholds.  A leg that isn't worth trading solo (e.g. game winner at 2c
-# edge) can still add value inside a combo.
-
-_COMBO_LEG_MIN_PROB = 20   # legs below 20% prob produce very low joint probs
-
-
-def _source_game_winner_leg(
-    game_info: GameInfo,
-    away_pitcher: Optional[PitcherProfile],
-    home_pitcher: Optional[PitcherProfile],
-    client: KalshiClient,
-    config: Config,
-    home_team: Optional[TeamProfile] = None,
-    away_team: Optional[TeamProfile] = None,
-) -> List[ComboLeg]:
-    """Source a game-winner leg by picking the favoured team.
-
-    Uses game_winner_probability() to estimate each side's win probability
-    from the full multi-factor model, then returns the favoured side.
-    """
-    legs: List[ComboLeg] = []
-    event_ticker = game_event_ticker(game_info)
-    if not event_ticker:
-        return legs
-
-    try:
-        markets = client.get_event_markets(event_ticker, min_liquidity=0)
-    except Exception:
-        return legs
-
-    if not markets:
-        return legs
-
-    home_prob, away_prob = game_winner_probability(
-        home_pitcher, away_pitcher, home_team, away_team,
-    )
-
-    home_kalshi = kalshi_team(game_info.home_abbrev)
-    away_kalshi = kalshi_team(game_info.away_abbrev)
-
-    for m in markets:
-        price = market_price(m)
-        if price <= 0 or price >= 100:
-            continue
-        ticker = m.get("ticker", "")
-
-        if ticker.upper().endswith(f"-{home_kalshi}"):
-            model_prob = home_prob
-            label = f"{game_info.home_team} win"
-        elif ticker.upper().endswith(f"-{away_kalshi}"):
-            model_prob = away_prob
-            label = f"{game_info.away_team} win"
-        else:
-            continue
-
-        if model_prob < _COMBO_LEG_MIN_PROB:
-            continue
-
-        legs.append(ComboLeg(
-            market_ticker=ticker,
-            event_ticker=event_ticker,
-            side="yes",
-            model_prob_pct=model_prob,
-            market_price=price,
-            edge_cents=model_prob - price,
-            strategy="game_winner",
-            label=label,
-        ))
-
-    # Keep only the favoured side (highest model prob)
-    if legs:
-        legs.sort(key=lambda l: l.model_prob_pct, reverse=True)
-        legs = [legs[0]]
-
-    return legs
-
-
-def _source_pitcher_ks_legs(
-    game_info: GameInfo,
-    pitchers: List[PitcherProfile],
-    client: KalshiClient,
-    config: Config,
-) -> List[ComboLeg]:
-    """Source pitcher strikeout legs using the Poisson model.
-
-    Picks the single best K threshold per pitcher (highest edge).
-    """
-    legs: List[ComboLeg] = []
-    event_ticker = ks_event_ticker(game_info)
-    if not event_ticker:
-        return legs
-
-    try:
-        markets = client.get_event_markets(event_ticker, min_liquidity=0)
-    except Exception:
-        return legs
-
-    if not markets:
-        return legs
-
-    for pitcher in pitchers:
-        if not pitcher or (pitcher.k_per_9 == 0 and pitcher.recent_k_per_start == 0):
-            continue
-
-        # Get opponent K rate
-        opp_k_rate = 0.0
-        try:
-            if pitcher.player_id == game_info.away_pitcher_id:
-                opp_abbrev = game_info.home_abbrev
-            else:
-                opp_abbrev = game_info.away_abbrev
-            opp_team = get_team_profile(opp_abbrev)
-            opp_k_rate = opp_team.k_rate
-        except Exception:
-            pass
-
-        lam = expected_ks(pitcher, opp_k_rate)
-        if lam <= 0:
-            continue
-
-        pitcher_last = pitcher.name.split()[-1].lower() if pitcher.name else ""
-        best_leg: Optional[ComboLeg] = None
-
-        for m in markets:
-            title = m.get("title", "").lower()
-            if "strikeout" not in title and "k+" not in title and " ks" not in title:
-                continue
-            if pitcher_last and pitcher_last not in title:
-                continue
-
-            price = market_price(m)
-            if price <= 0 or price >= 100:
-                continue
-
-            threshold = parse_k_threshold(m.get("title", ""))
-            if threshold is None or threshold < _KS_MIN_THRESHOLD:
-                continue
-
-            prob_pct = round(poisson_ge(threshold, lam) * 100)
-            if prob_pct < _COMBO_LEG_MIN_PROB:
-                continue
-
-            edge = prob_pct - price
-            ticker = m.get("ticker", "")
-
-            if best_leg is None or edge > best_leg.edge_cents:
-                best_leg = ComboLeg(
-                    market_ticker=ticker,
-                    event_ticker=event_ticker,
-                    side="yes",
-                    model_prob_pct=prob_pct,
-                    market_price=price,
-                    edge_cents=edge,
-                    strategy="pitcher_ks",
-                    label=f"{pitcher.name} {threshold}+ Ks",
-                )
-
-        if best_leg:
-            legs.append(best_leg)
-
-    return legs
-
-
-def _source_player_hits_legs(
-    game_info: GameInfo,
-    batter_pitcher_pairs: List[Tuple],
-    client: KalshiClient,
-    config: Config,
-) -> List[ComboLeg]:
-    """Source player hit legs using the shared Poisson model.
-
-    Uses expected_hits_lambda() — the same model as strategy_player_hits.
-    Picks the single best hit threshold per batter (highest edge).
-    """
-    legs: List[ComboLeg] = []
-    event_ticker = hit_event_ticker(game_info)
-    if not event_ticker:
-        return legs
-
-    try:
-        markets = client.get_event_markets(event_ticker, min_liquidity=0)
-    except Exception:
-        return legs
-
-    if not markets:
-        return legs
-
-    for batter, opp_pitcher in batter_pitcher_pairs:
-        if not batter:
-            continue
-
-        lam = expected_hits_lambda(batter, opp_pitcher, game_info.home_abbrev)
-        if lam <= 0:
-            continue
-
-        last_name = batter.name.split()[-1].lower()
-        best_leg: Optional[ComboLeg] = None
-
-        for m in markets:
-            title = m.get("title", "").lower()
-            if last_name not in title or "hit" not in title:
-                continue
-
-            price = market_price(m)
-            if price <= 0 or price >= 100:
-                continue
-
-            threshold = parse_hit_threshold(m.get("title", ""))
-            if threshold is None:
-                continue
-
-            prob_pct = round(poisson_ge(threshold, lam) * 100)
-            if prob_pct < _COMBO_LEG_MIN_PROB:
-                continue
-
-            edge = prob_pct - price
-            ticker = m.get("ticker", "")
-
-            if best_leg is None or edge > best_leg.edge_cents:
-                best_leg = ComboLeg(
-                    market_ticker=ticker,
-                    event_ticker=event_ticker,
-                    side="yes",
-                    model_prob_pct=prob_pct,
-                    market_price=price,
-                    edge_cents=edge,
-                    strategy="player_hits",
-                    label=f"{batter.name} {threshold}+ hits",
-                )
-
-        if best_leg:
-            legs.append(best_leg)
-
-    return legs
 
 
 def generate_combos(
@@ -1194,55 +946,35 @@ def strategy_combo(
     game_info: GameInfo,
     client: KalshiClient,
     config: Config,
-    away_pitcher: Optional[PitcherProfile] = None,
-    home_pitcher: Optional[PitcherProfile] = None,
-    home_team: Optional[TeamProfile] = None,
-    away_team: Optional[TeamProfile] = None,
-    batter_pitcher_pairs: Optional[List[Tuple]] = None,
     single_leg_signals: Optional[List[TradeSignal]] = None,
+    **kwargs,
 ) -> List[TradeSignal]:
     """Same-game combo (parlay) strategy.
 
-    Sources legs directly from live markets across three prop types:
-      - Game winner (multi-factor model with both pitchers + team stats)
-      - Pitcher strikeouts (Poisson model, best threshold per pitcher)
-      - Player hits (Poisson model, best threshold per batter)
+    Builds combo legs from single-leg signals already produced by other
+    strategies (game_winner, pitcher_ks, player_hits, etc.).  Each signal
+    carries its calibrated model_prob_pct from the pipeline, so no
+    re-fetching of markets or re-running of models is needed.
 
-    Also incorporates any existing single-leg signals from other strategies.
-    Builds 2-3 leg combos mixing different prop types, creates the combo
-    market on Kalshi via the MVE API, and returns TradeSignals if edge exists.
+    Generates 2-3 leg combos mixing different prop types, creates the
+    combo market on Kalshi via the MVE API, and returns TradeSignals
+    if edge exists.
 
     This strategy is called separately in process_game() rather than
     through the STRATEGIES registry.
     """
     signals: List[TradeSignal] = []
 
-    # ── Source legs from each prop type ─────────────────────────────────────
-    pitchers = [p for p in [away_pitcher, home_pitcher] if p]
+    # ── Build combo legs from single-leg signals ───────────────────────────
+    legs = build_combo_legs(single_leg_signals or [])
 
-    gw_legs = _source_game_winner_leg(
-        game_info, away_pitcher, home_pitcher, client, config,
-        home_team=home_team, away_team=away_team,
-    )
-    ks_legs = _source_pitcher_ks_legs(game_info, pitchers, client, config) if pitchers else []
-    hit_legs = _source_player_hits_legs(game_info, batter_pitcher_pairs or [], client, config)
-
-    # Also pull in any single-leg signal candidates
-    signal_legs = build_combo_legs(game_info, single_leg_signals or [], client, config)
-
-    # Merge all legs, deduplicating by market_ticker (keep highest edge)
-    all_legs = _dedupe_legs(gw_legs + ks_legs + hit_legs + signal_legs)
-
-    if len(all_legs) < 2:
+    if len(legs) < 2:
         log.debug("combo | %s@%s — only %d eligible legs, need 2+",
-                  game_info.away_abbrev, game_info.home_abbrev, len(all_legs))
+                  game_info.away_abbrev, game_info.home_abbrev, len(legs))
         return signals
 
-    legs = all_legs
-
-    log.info("  🎰 combo | %d eligible legs for %s@%s  (GW:%d KS:%d HIT:%d SIG:%d)",
-             len(legs), game_info.away_abbrev, game_info.home_abbrev,
-             len(gw_legs), len(ks_legs), len(hit_legs), len(signal_legs))
+    log.info("  🎰 combo | %d eligible legs for %s@%s",
+             len(legs), game_info.away_abbrev, game_info.home_abbrev)
     for leg in legs:
         log.debug("    Leg: %s %s  prob=%d%%  edge=%+d¢  [%s] %s",
                   leg.side, leg.market_ticker, leg.model_prob_pct,
