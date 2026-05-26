@@ -438,48 +438,50 @@ def get_pitcher_profile(player_id: int, season: int = None) -> PitcherProfile:
             log.debug("Statcast pitcher fetch failed for %d: %s", player_id, exc)
         return {}
 
-    # ── Fire all sub-fetches in parallel ───────────────────────────────────
-    fut_season   = _POOL.submit(_fetch_season_stats)
-    fut_hand     = _POOL.submit(_fetch_handedness)
-    fut_gamelog  = _POOL.submit(_fetch_game_log)
-    fut_statcast = _POOL.submit(_fetch_statcast)
+    # ── Fire all sub-fetches in parallel (dedicated pool to avoid deadlock
+    #    with the shared _POOL used by hydrate_game) ────────────────────────
+    with ThreadPoolExecutor(max_workers=4) as local_pool:
+        fut_season   = local_pool.submit(_fetch_season_stats)
+        fut_hand     = local_pool.submit(_fetch_handedness)
+        fut_gamelog  = local_pool.submit(_fetch_game_log)
+        fut_statcast = local_pool.submit(_fetch_statcast)
 
-    # ── Collect results ────────────────────────────────────────────────────
-    season_data = fut_season.result()
-    if season_data:
-        name = season_data.get("first_name", "") + " " + season_data.get("last_name", "")
-        profile.name = name.strip()
-        if season_data.get("stats"):
-            s = season_data["stats"][0].get("stats", {})
-            profile.era = _safe_float(s.get("era"))
-            profile.whip = _safe_float(s.get("whip"))
-            profile.k_per_9 = _safe_float(s.get("strikeoutsPer9Inn"))
-            profile.bb_per_9 = _safe_float(s.get("walksPer9Inn"))
-            profile.hr_per_9 = _safe_float(s.get("homeRunsPer9"))
-            profile.innings_pitched = _safe_float(s.get("inningsPitched"))
-            profile.strikeouts = int(s.get("strikeOuts", 0))
-            profile.games_started = int(s.get("gamesStarted", 0))
+        # ── Collect results ────────────────────────────────────────────────
+        season_data = fut_season.result()
+        if season_data:
+            name = season_data.get("first_name", "") + " " + season_data.get("last_name", "")
+            profile.name = name.strip()
+            if season_data.get("stats"):
+                s = season_data["stats"][0].get("stats", {})
+                profile.era = _safe_float(s.get("era"))
+                profile.whip = _safe_float(s.get("whip"))
+                profile.k_per_9 = _safe_float(s.get("strikeoutsPer9Inn"))
+                profile.bb_per_9 = _safe_float(s.get("walksPer9Inn"))
+                profile.hr_per_9 = _safe_float(s.get("homeRunsPer9"))
+                profile.innings_pitched = _safe_float(s.get("inningsPitched"))
+                profile.strikeouts = int(s.get("strikeOuts", 0))
+                profile.games_started = int(s.get("gamesStarted", 0))
 
-    profile.throws = fut_hand.result()
+        profile.throws = fut_hand.result()
 
-    splits = fut_gamelog.result()
-    if splits:
-        all_ks = [int(g["stat"].get("strikeOuts", 0)) for g in splits]
-        profile.k_per_start_list = all_ks
-        profile.max_k_in_start = max(all_ks) if all_ks else 0
-        recent = splits[-5:] if len(splits) >= 5 else splits
-        if recent:
-            total_er = sum(_safe_float(g["stat"].get("earnedRuns")) for g in recent)
-            total_ip = sum(_safe_float(g["stat"].get("inningsPitched")) for g in recent)
-            total_k = sum(int(g["stat"].get("strikeOuts", 0)) for g in recent)
-            if total_ip > 0:
-                profile.recent_era = (total_er / total_ip) * 9.0
-            profile.recent_k_per_start = total_k / len(recent) if recent else 0
-            profile.recent_ip_per_start = total_ip / len(recent) if recent else 0
+        splits = fut_gamelog.result()
+        if splits:
+            all_ks = [int(g["stat"].get("strikeOuts", 0)) for g in splits]
+            profile.k_per_start_list = all_ks
+            profile.max_k_in_start = max(all_ks) if all_ks else 0
+            recent = splits[-5:] if len(splits) >= 5 else splits
+            if recent:
+                total_er = sum(_safe_float(g["stat"].get("earnedRuns")) for g in recent)
+                total_ip = sum(_safe_float(g["stat"].get("inningsPitched")) for g in recent)
+                total_k = sum(int(g["stat"].get("strikeOuts", 0)) for g in recent)
+                if total_ip > 0:
+                    profile.recent_era = (total_er / total_ip) * 9.0
+                profile.recent_k_per_start = total_k / len(recent) if recent else 0
+                profile.recent_ip_per_start = total_ip / len(recent) if recent else 0
 
-    sc_result = fut_statcast.result()
-    if sc_result.get("data") is not None:
-        _apply_pitcher_statcast(profile, sc_result["data"])
+        sc_result = fut_statcast.result()
+        if sc_result.get("data") is not None:
+            _apply_pitcher_statcast(profile, sc_result["data"])
 
     _pitcher_cache[cache_key] = profile
     return profile
@@ -585,55 +587,57 @@ def get_batter_profile(player_id: int, season: int = None) -> BatterProfile:
             log.debug("Splits fetch failed for batter %d: %s", player_id, e)
             return {}
 
-    # ── Fire all sub-fetches in parallel ───────────────────────────────────
-    fut_season   = _POOL.submit(_fetch_season_stats)
-    fut_gamelog  = _POOL.submit(_fetch_game_log)
-    fut_statcast = _POOL.submit(_fetch_statcast)
-    fut_splits   = _POOL.submit(_fetch_splits)
+    # ── Fire all sub-fetches in parallel (dedicated pool to avoid deadlock
+    #    with the shared _POOL used by hydrate_game) ────────────────────────
+    with ThreadPoolExecutor(max_workers=4) as local_pool:
+        fut_season   = local_pool.submit(_fetch_season_stats)
+        fut_gamelog  = local_pool.submit(_fetch_game_log)
+        fut_statcast = local_pool.submit(_fetch_statcast)
+        fut_splits   = local_pool.submit(_fetch_splits)
 
-    # ── Collect results ────────────────────────────────────────────────────
-    season_data = fut_season.result()
-    if season_data:
-        name = season_data.get("first_name", "") + " " + season_data.get("last_name", "")
-        profile.name = name.strip()
-        profile.team = season_data.get("current_team", "")
-        if season_data.get("stats"):
-            s = season_data["stats"][0].get("stats", {})
-            profile.avg = _safe_float(s.get("avg"))
-            profile.obp = _safe_float(s.get("obp"))
-            profile.slg = _safe_float(s.get("slg"))
-            profile.ops = _safe_float(s.get("ops"))
-            profile.hr = int(s.get("homeRuns", 0))
-            profile.ab = int(s.get("atBats", 0))
-            profile.hits = int(s.get("hits", 0))
-            if profile.ab > 0:
-                profile.hr_per_ab = profile.hr / profile.ab
-                ks = int(s.get("strikeOuts", 0))
-                bbs = int(s.get("baseOnBalls", 0))
-                pa = int(s.get("plateAppearances", profile.ab))
-                if pa > 0:
-                    profile.k_rate = ks / pa
-                    profile.bb_rate = bbs / pa
+        # ── Collect results ────────────────────────────────────────────────
+        season_data = fut_season.result()
+        if season_data:
+            name = season_data.get("first_name", "") + " " + season_data.get("last_name", "")
+            profile.name = name.strip()
+            profile.team = season_data.get("current_team", "")
+            if season_data.get("stats"):
+                s = season_data["stats"][0].get("stats", {})
+                profile.avg = _safe_float(s.get("avg"))
+                profile.obp = _safe_float(s.get("obp"))
+                profile.slg = _safe_float(s.get("slg"))
+                profile.ops = _safe_float(s.get("ops"))
+                profile.hr = int(s.get("homeRuns", 0))
+                profile.ab = int(s.get("atBats", 0))
+                profile.hits = int(s.get("hits", 0))
+                if profile.ab > 0:
+                    profile.hr_per_ab = profile.hr / profile.ab
+                    ks = int(s.get("strikeOuts", 0))
+                    bbs = int(s.get("baseOnBalls", 0))
+                    pa = int(s.get("plateAppearances", profile.ab))
+                    if pa > 0:
+                        profile.k_rate = ks / pa
+                        profile.bb_rate = bbs / pa
 
-    splits = fut_gamelog.result()
-    if splits:
-        recent = splits[-10:] if len(splits) >= 10 else splits
-        if recent:
-            total_h = sum(int(g["stat"].get("hits", 0)) for g in recent)
-            total_ab = sum(int(g["stat"].get("atBats", 0)) for g in recent)
-            total_hr = sum(int(g["stat"].get("homeRuns", 0)) for g in recent)
-            if total_ab > 0:
-                profile.recent_avg = total_h / total_ab
-                profile.recent_ops = (total_h + sum(int(g["stat"].get("baseOnBalls", 0)) for g in recent)) / (total_ab + sum(int(g["stat"].get("baseOnBalls", 0)) for g in recent))
-            profile.recent_hr = total_hr
+        splits = fut_gamelog.result()
+        if splits:
+            recent = splits[-10:] if len(splits) >= 10 else splits
+            if recent:
+                total_h = sum(int(g["stat"].get("hits", 0)) for g in recent)
+                total_ab = sum(int(g["stat"].get("atBats", 0)) for g in recent)
+                total_hr = sum(int(g["stat"].get("homeRuns", 0)) for g in recent)
+                if total_ab > 0:
+                    profile.recent_avg = total_h / total_ab
+                    profile.recent_ops = (total_h + sum(int(g["stat"].get("baseOnBalls", 0)) for g in recent)) / (total_ab + sum(int(g["stat"].get("baseOnBalls", 0)) for g in recent))
+                profile.recent_hr = total_hr
 
-    sc_result = fut_statcast.result()
-    if sc_result.get("data") is not None:
-        _apply_batter_statcast(profile, sc_result["data"])
+        sc_result = fut_statcast.result()
+        if sc_result.get("data") is not None:
+            _apply_batter_statcast(profile, sc_result["data"])
 
-    splits_data = fut_splits.result()
-    if splits_data:
-        _apply_batter_splits(profile, splits_data)
+        splits_data = fut_splits.result()
+        if splits_data:
+            _apply_batter_splits(profile, splits_data)
 
     _batter_cache[cache_key] = profile
     return profile
@@ -775,46 +779,48 @@ def get_team_profile(team_name_or_id, season: int = None) -> TeamProfile:
         except Exception:
             return {}
 
-    # ── Fire all sub-fetches in parallel ───────────────────────────────────
-    fut_info      = _POOL.submit(_fetch_team_info)
-    fut_batting   = _POOL.submit(_fetch_batting)
-    fut_pitching  = _POOL.submit(_fetch_pitching)
-    fut_standings = _POOL.submit(_fetch_standings)
+    # ── Fire all sub-fetches in parallel (dedicated pool to avoid deadlock
+    #    with the shared _POOL used by hydrate_game) ────────────────────────
+    with ThreadPoolExecutor(max_workers=4) as local_pool:
+        fut_info      = local_pool.submit(_fetch_team_info)
+        fut_batting   = local_pool.submit(_fetch_batting)
+        fut_pitching  = local_pool.submit(_fetch_pitching)
+        fut_standings = local_pool.submit(_fetch_standings)
 
-    # ── Collect results ────────────────────────────────────────────────────
-    team_info = fut_info.result()
-    if team_info:
-        profile.name = team_info.get("name", "")
-        profile.abbrev = team_info.get("abbreviation", "")
+        # ── Collect results ────────────────────────────────────────────────
+        team_info = fut_info.result()
+        if team_info:
+            profile.name = team_info.get("name", "")
+            profile.abbrev = team_info.get("abbreviation", "")
 
-    batting_data = fut_batting.result()
-    stats = batting_data.get("stats", [{}])
-    if stats and stats[0].get("splits"):
-        s = stats[0]["splits"][0].get("stat", {})
-        profile.team_avg = _safe_float(s.get("avg"))
-        profile.team_ops = _safe_float(s.get("ops"))
-        profile.team_hr = int(s.get("homeRuns", 0))
-        runs = int(s.get("runs", 0))
-        games = int(s.get("gamesPlayed", 1))
-        profile.runs_per_game = runs / games if games > 0 else 0
-        pa = int(s.get("plateAppearances", 1))
-        ks = int(s.get("strikeOuts", 0))
-        profile.k_rate = ks / pa if pa > 0 else 0
+        batting_data = fut_batting.result()
+        stats = batting_data.get("stats", [{}])
+        if stats and stats[0].get("splits"):
+            s = stats[0]["splits"][0].get("stat", {})
+            profile.team_avg = _safe_float(s.get("avg"))
+            profile.team_ops = _safe_float(s.get("ops"))
+            profile.team_hr = int(s.get("homeRuns", 0))
+            runs = int(s.get("runs", 0))
+            games = int(s.get("gamesPlayed", 1))
+            profile.runs_per_game = runs / games if games > 0 else 0
+            pa = int(s.get("plateAppearances", 1))
+            ks = int(s.get("strikeOuts", 0))
+            profile.k_rate = ks / pa if pa > 0 else 0
 
-    pitching_data = fut_pitching.result()
-    stats = pitching_data.get("stats", [{}])
-    if stats and stats[0].get("splits"):
-        s = stats[0]["splits"][0].get("stat", {})
-        profile.team_era = _safe_float(s.get("era"))
-        profile.team_whip = _safe_float(s.get("whip"))
+        pitching_data = fut_pitching.result()
+        stats = pitching_data.get("stats", [{}])
+        if stats and stats[0].get("splits"):
+            s = stats[0]["splits"][0].get("stat", {})
+            profile.team_era = _safe_float(s.get("era"))
+            profile.team_whip = _safe_float(s.get("whip"))
 
-    standings = fut_standings.result()
-    for div_id, div_data in standings.items():
-        for t in div_data.get("teams", []):
-            if t.get("team_id") == team_id:
-                profile.wins = int(t.get("w", 0))
-                profile.losses = int(t.get("l", 0))
-                profile.run_diff = int(t.get("run_diff", 0))
+        standings = fut_standings.result()
+        for div_id, div_data in standings.items():
+            for t in div_data.get("teams", []):
+                if t.get("team_id") == team_id:
+                    profile.wins = int(t.get("w", 0))
+                    profile.losses = int(t.get("l", 0))
+                    profile.run_diff = int(t.get("run_diff", 0))
 
     _team_cache_ttl[cache_key] = profile
     return profile
