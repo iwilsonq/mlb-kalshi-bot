@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from slugger.config import Config
-from slugger.mlb_data import GameInfo, PitcherProfile, BatterProfile, get_team_profile
+from slugger.mlb_data import GameInfo, PitcherProfile, BatterProfile, TeamProfile, get_team_profile
 from slugger.kalshi_client import KalshiClient, market_price
 from slugger.journal import record_signal
 from slugger.sizing import kelly_count
@@ -289,31 +289,112 @@ def _total_prob(era: float) -> int:
         return 25
 
 
+# ── Game winner model constants ───────────────────────────────────────────────
+_LEAGUE_AVG_RPG = 4.50     # 2024 MLB average runs per game per team
+_LEAGUE_AVG_ERA = 4.10     # 2024 MLB league-average ERA
+_HOME_FIELD_ADV = 0.540    # MLB historical home win rate (~54%)
+_GW_PITCHING_WEIGHT = 0.40 # weight of pitching component in overall rating
+_GW_OFFENSE_WEIGHT  = 0.40 # weight of offensive component in overall rating
+_GW_BULLPEN_WEIGHT  = 0.10 # weight of bullpen component in overall rating
+_GW_RECORD_WEIGHT   = 0.10 # weight of team record / momentum
+
+
+def _pitcher_quality(pitcher: Optional[PitcherProfile]) -> float:
+    """Rate a pitcher relative to league average.
+
+    Returns a multiplier where 1.0 = league average.  Lower ERA means
+    a BETTER pitcher, so we invert: quality = league_avg / pitcher_era.
+
+    Prefers xERA > recent ERA > season ERA as the predictive metric.
+    """
+    if not pitcher:
+        return 1.0
+
+    # Pick best available metric (xERA > recent ERA > season ERA)
+    era = pitcher.xera or pitcher.recent_era or pitcher.era
+    if not era or era <= 0:
+        return 1.0
+
+    return _LEAGUE_AVG_ERA / era
+
+
 def _game_winner_probability(
-    home_era: float,
-    away_era: float,
+    home_pitcher: Optional[PitcherProfile],
+    away_pitcher: Optional[PitcherProfile],
+    home_team: Optional[TeamProfile] = None,
+    away_team: Optional[TeamProfile] = None,
 ) -> Tuple[int, int]:
-    """Estimate home and away win probabilities from pitcher ERA matchup.
+    """Estimate home and away win probabilities using a multi-factor model.
 
-    Uses the relative ERA of both starting pitchers to model who is
-    more likely to win.  A lower ERA indicates a better pitcher.
+    Combines:
+      1. Starting pitcher quality (xERA / recent ERA / season ERA)
+      2. Team offensive strength (runs/game, OPS)
+      3. Bullpen quality (bullpen ERA)
+      4. Team record strength (win% from W/L)
+      5. Home field advantage (~54% baseline)
 
-    The model scales linearly with the away pitcher's fraction of
-    the combined ERA total: if the away pitcher contributes more of
-    the "badness", the home team is more likely to win.
+    Uses a log5-inspired approach: each team gets a composite rating,
+    and the probability is derived from the ratio of ratings adjusted
+    for home field advantage.
 
     Returns:
         (home_prob, away_prob) as integer percentages summing to 100.
     """
-    total_era = home_era + away_era
-    if total_era > 0:
-        away_frac = away_era / total_era
-        home_prob = round(40 + away_frac * 25)  # range ~45-60%
-    else:
-        home_prob = 54  # slight home-field advantage default
+    # ── Component 1: Starting pitcher quality ──────────────────────────────
+    home_pitch_q = _pitcher_quality(home_pitcher)
+    away_pitch_q = _pitcher_quality(away_pitcher)
 
-    home_prob = max(40, min(65, home_prob))
-    return home_prob, 100 - home_prob
+    # ── Component 2: Offensive strength ────────────────────────────────────
+    home_off_q = 1.0
+    away_off_q = 1.0
+    if home_team and home_team.runs_per_game > 0:
+        home_off_q = home_team.runs_per_game / _LEAGUE_AVG_RPG
+    if away_team and away_team.runs_per_game > 0:
+        away_off_q = away_team.runs_per_game / _LEAGUE_AVG_RPG
+
+    # ── Component 3: Bullpen quality ───────────────────────────────────────
+    home_bp_q = 1.0
+    away_bp_q = 1.0
+    if home_team and home_team.bullpen_era > 0:
+        home_bp_q = _LEAGUE_AVG_ERA / home_team.bullpen_era
+    if away_team and away_team.bullpen_era > 0:
+        away_bp_q = _LEAGUE_AVG_ERA / away_team.bullpen_era
+
+    # ── Component 4: Team record strength ──────────────────────────────────
+    home_rec_q = 1.0
+    away_rec_q = 1.0
+    if home_team and (home_team.wins + home_team.losses) >= 20:
+        home_rec_q = (home_team.wins / (home_team.wins + home_team.losses)) / 0.500
+    if away_team and (away_team.wins + away_team.losses) >= 20:
+        away_rec_q = (away_team.wins / (away_team.wins + away_team.losses)) / 0.500
+
+    # ── Composite rating (weighted) ────────────────────────────────────────
+    home_rating = (
+        _GW_PITCHING_WEIGHT * home_pitch_q
+        + _GW_OFFENSE_WEIGHT * home_off_q
+        + _GW_BULLPEN_WEIGHT * home_bp_q
+        + _GW_RECORD_WEIGHT  * home_rec_q
+    )
+    away_rating = (
+        _GW_PITCHING_WEIGHT * away_pitch_q
+        + _GW_OFFENSE_WEIGHT * away_off_q
+        + _GW_BULLPEN_WEIGHT * away_bp_q
+        + _GW_RECORD_WEIGHT  * away_rec_q
+    )
+
+    # ── Log5 probability with home field advantage ─────────────────────────
+    # log5 formula: P(home) = (home_rating * HFA) / (home_rating * HFA + away_rating * (1 - HFA))
+    # where HFA = home field advantage expressed as probability (~0.54)
+    if home_rating <= 0 or away_rating <= 0:
+        return 54, 46
+
+    home_raw = home_rating * _HOME_FIELD_ADV
+    away_raw = away_rating * (1.0 - _HOME_FIELD_ADV)
+    home_prob = home_raw / (home_raw + away_raw)
+
+    # Clamp to reasonable range (no team is >70% or <30% to win)
+    home_prob_pct = round(max(30, min(70, home_prob * 100)))
+    return home_prob_pct, 100 - home_prob_pct
 
 
 def _expected_hits_lambda(
@@ -494,47 +575,66 @@ def strategy_pitcher_ks(
 
 def strategy_game_winner(
     game_info: GameInfo,
-    pitcher_profile: PitcherProfile,
-    batter_profile: Optional[BatterProfile],
     client: KalshiClient,
     config: Config,
+    home_pitcher: Optional[PitcherProfile] = None,
+    away_pitcher: Optional[PitcherProfile] = None,
+    home_team: Optional[TeamProfile] = None,
+    away_team: Optional[TeamProfile] = None,
 ) -> List[TradeSignal]:
-    """Game winner prop — ERA-ratio model via signal pipeline.
+    """Game winner prop — multi-factor model via signal pipeline.
 
-    Uses _game_winner_probability() which models both pitchers' ERA
-    relative to each other.  When the away pitcher's ERA is unavailable
-    (this strategy only receives the home pitcher), defaults to league
-    average (4.50).
+    Uses _game_winner_probability() which combines:
+      - Both pitchers' quality (xERA preferred over ERA)
+      - Team offensive strength (runs/game)
+      - Bullpen quality
+      - Team record / momentum
+      - Home field advantage (~54%)
+
+    Called directly by process_game (not through the per-pitcher loop)
+    so it has access to both pitchers and both team profiles.
     """
-    # Only run once per game: skip if this pitcher is NOT the home starter.
-    if (
-        pitcher_profile
-        and game_info.home_pitcher_id
-        and pitcher_profile.player_id != game_info.home_pitcher_id
-    ):
-        return []
-
     event_ticker = game_event_ticker(game_info)
-    if not event_ticker or not pitcher_profile.recent_era:
+    if not event_ticker:
         return []
 
     home_abbrev = kalshi_team(game_info.home_abbrev)
-    home_era = pitcher_profile.recent_era
-    away_era = 4.50  # league average default (away pitcher not in scope)
-    home_prob, _ = _game_winner_probability(home_era, away_era)
+    home_prob, away_prob = _game_winner_probability(
+        home_pitcher, away_pitcher, home_team, away_team,
+    )
+
+    # ── Build reason string with all model inputs ──────────────────────────
+    def _era_str(p: Optional[PitcherProfile]) -> str:
+        if not p:
+            return "TBD"
+        era = p.xera or p.recent_era or p.era
+        label = "xERA" if p.xera else ("rERA" if p.recent_era else "ERA")
+        return f"{label}={era:.2f}" if era else "TBD"
+
+    def _team_str(t: Optional[TeamProfile]) -> str:
+        parts = []
+        if t and t.runs_per_game > 0:
+            parts.append(f"{t.runs_per_game:.1f}rpg")
+        if t and t.bullpen_era > 0:
+            parts.append(f"bp={t.bullpen_era:.2f}")
+        if t and (t.wins + t.losses) >= 20:
+            parts.append(f"{t.wins}-{t.losses}")
+        return " ".join(parts) if parts else "?"
+
+    reason_detail = (
+        f"Home({game_info.home_abbrev}): {_era_str(home_pitcher)} {_team_str(home_team)}"
+        f"  Away({game_info.away_abbrev}): {_era_str(away_pitcher)} {_team_str(away_team)}"
+    )
 
     def gw_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
-        reason = (
-            f"Home win: home ERA {home_era:.1f} vs away ERA {away_era:.1f}"
-            f" → {home_prob}% vs {price}¢"
-        )
+        reason = f"Home win {home_prob}% | {reason_detail}"
         return ModelResult(prob_pct=home_prob, reason=reason)
 
     spec = MarketSpec(
         event_ticker=event_ticker,
         strategy_name="game_winner",
         ticker_suffix=home_abbrev,
-        confidence_fn=lambda _: 0.55,
+        confidence_fn=lambda e: min(0.45 + e / 80, 0.75),
     )
     return evaluate_markets(spec, gw_model, client, config)
 
@@ -1140,11 +1240,13 @@ def _source_game_winner_leg(
     home_pitcher: Optional[PitcherProfile],
     client: KalshiClient,
     config: Config,
+    home_team: Optional[TeamProfile] = None,
+    away_team: Optional[TeamProfile] = None,
 ) -> List[ComboLeg]:
     """Source a game-winner leg by picking the favoured team.
 
     Uses _game_winner_probability() to estimate each side's win probability
-    from both pitchers' recent ERA, then returns the favoured side.
+    from the full multi-factor model, then returns the favoured side.
     """
     legs: List[ComboLeg] = []
     event_ticker = game_event_ticker(game_info)
@@ -1159,9 +1261,9 @@ def _source_game_winner_leg(
     if not markets:
         return legs
 
-    home_era = home_pitcher.recent_era if home_pitcher and home_pitcher.recent_era else 4.50
-    away_era = away_pitcher.recent_era if away_pitcher and away_pitcher.recent_era else 4.50
-    home_prob, away_prob = _game_winner_probability(home_era, away_era)
+    home_prob, away_prob = _game_winner_probability(
+        home_pitcher, away_pitcher, home_team, away_team,
+    )
 
     home_kalshi = kalshi_team(game_info.home_abbrev)
     away_kalshi = kalshi_team(game_info.away_abbrev)
@@ -1392,13 +1494,15 @@ def strategy_combo(
     config: Config,
     away_pitcher: Optional[PitcherProfile] = None,
     home_pitcher: Optional[PitcherProfile] = None,
+    home_team: Optional[TeamProfile] = None,
+    away_team: Optional[TeamProfile] = None,
     batter_pitcher_pairs: Optional[List[Tuple]] = None,
     single_leg_signals: Optional[List[TradeSignal]] = None,
 ) -> List[TradeSignal]:
     """Same-game combo (parlay) strategy.
 
     Sources legs directly from live markets across three prop types:
-      - Game winner (favoured team from pitcher ERA matchup)
+      - Game winner (multi-factor model with both pitchers + team stats)
       - Pitcher strikeouts (Poisson model, best threshold per pitcher)
       - Player hits (Poisson model, best threshold per batter)
 
@@ -1414,7 +1518,10 @@ def strategy_combo(
     # ── Source legs from each prop type ─────────────────────────────────────
     pitchers = [p for p in [away_pitcher, home_pitcher] if p]
 
-    gw_legs = _source_game_winner_leg(game_info, away_pitcher, home_pitcher, client, config)
+    gw_legs = _source_game_winner_leg(
+        game_info, away_pitcher, home_pitcher, client, config,
+        home_team=home_team, away_team=away_team,
+    )
     ks_legs = _source_pitcher_ks_legs(game_info, pitchers, client, config) if pitchers else []
     hit_legs = _source_player_hits_legs(game_info, batter_pitcher_pairs or [], client, config)
 
@@ -1614,7 +1721,7 @@ def strategy_combo(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 STRATEGIES = {
-    "game_winner":    strategy_game_winner,
+    # game_winner is called directly by process_game (needs both pitchers + teams)
     "pitcher_ks":     strategy_pitcher_ks,
     "player_hr":      strategy_player_hr,
     "player_hits":    strategy_player_hits,

@@ -22,7 +22,7 @@ from slugger.kalshi_client import KalshiClient
 from slugger.mlb_data import (
     GameContext, GameInfo, LiveMLBDataProvider, get_todays_games,
 )
-from slugger.strategies import BATTER_STRATEGIES, STRATEGIES, TradeSignal, strategy_combo
+from slugger.strategies import BATTER_STRATEGIES, STRATEGIES, TradeSignal, strategy_combo, strategy_game_winner
 from slugger.tickers import game_event_ticker
 import slugger.journal as journal
 
@@ -266,13 +266,34 @@ def process_game(
             bankroll_usd, config.max_position_usd, effective_bankroll,
         )
 
-    pitcher_strats = [s for s in config.enabled_strategies if s not in BATTER_STRATEGIES]
+    # game_winner has its own call path (needs both pitchers + teams)
+    _SPECIAL_STRATEGIES = {"game_winner", "combo"}
+    pitcher_strats = [
+        s for s in config.enabled_strategies
+        if s not in BATTER_STRATEGIES and s not in _SPECIAL_STRATEGIES
+    ]
     batter_strats  = [s for s in config.enabled_strategies if s in BATTER_STRATEGIES]
 
     any_signals = False
 
     # Collect all single-leg signals for potential combo use later
     all_single_leg_signals: List[TradeSignal] = []
+
+    # ── Game winner (full-game strategy, needs both pitchers + teams) ─────
+    if "game_winner" in config.enabled_strategies and not circuit.is_tripped():
+        gw_signals = strategy_game_winner(
+            game, client, config,
+            home_pitcher=home_pitch,
+            away_pitcher=away_pitch,
+            home_team=ctx.home_team,
+            away_team=ctx.away_team,
+        )
+        all_single_leg_signals.extend(gw_signals)
+        if execute_signals(
+            gw_signals, client, config, circuit,
+            effective_bankroll, held_tickers, placed_tickers,
+        ):
+            any_signals = True
 
     # ── Pitcher / game-level strategies (run once per pitcher) ────────────
     pitchers = [p for p in [away_pitch, home_pitch] if p]
@@ -346,6 +367,8 @@ def process_game(
             game, client, config,
             away_pitcher=away_pitch,
             home_pitcher=home_pitch,
+            home_team=ctx.home_team,
+            away_team=ctx.away_team,
             batter_pitcher_pairs=combo_bp_pairs,
             single_leg_signals=all_single_leg_signals,
         )
