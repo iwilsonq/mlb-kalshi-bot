@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 
 from slugger.config import Config
 from slugger.mlb_data import GameInfo, PitcherProfile, BatterProfile, get_team_profile
-from slugger.kalshi_client import KalshiClient, _market_price
+from slugger.kalshi_client import KalshiClient, market_price
 from slugger.journal import record_signal
 from slugger.sizing import kelly_count
 from slugger.signal_pipeline import MarketSpec, ModelResult, evaluate_markets
@@ -1081,7 +1081,7 @@ def _source_game_winner_leg(
     away_kalshi = kalshi_team(game_info.away_abbrev)
 
     for m in markets:
-        price = _market_price(m)
+        price = market_price(m)
         if price <= 0 or price >= 100:
             continue
         ticker = m.get("ticker", "")
@@ -1170,7 +1170,7 @@ def _source_pitcher_ks_legs(
             if pitcher_last and pitcher_last not in title:
                 continue
 
-            price = _market_price(m)
+            price = market_price(m)
             if price <= 0 or price >= 100:
                 continue
 
@@ -1278,7 +1278,7 @@ def _source_player_hits_legs(
             if last_name not in title or "hit" not in title:
                 continue
 
-            price = _market_price(m)
+            price = market_price(m)
             if price <= 0 or price >= 100:
                 continue
 

@@ -23,7 +23,7 @@ from typing import Callable, Dict, List, Optional, Set
 
 from slugger.config import Config
 from slugger.journal import record_signal
-from slugger.kalshi_client import KalshiClient, _market_price
+from slugger.kalshi_client import KalshiClient, market_price
 from slugger.sizing import kelly_count
 
 log = logging.getLogger(__name__)
@@ -244,7 +244,7 @@ def evaluate_markets(
                 continue
 
         # ── Price validation ───────────────────────────────────────────────
-        price = _market_price(m)
+        price = market_price(m)
         if price <= 0 or price >= 100:
             continue
 
@@ -402,7 +402,7 @@ def _evaluate_no_side(
             if threshold is None or threshold < spec.min_threshold:
                 continue
 
-        yes_price = _market_price(m)
+        yes_price = market_price(m)
         if yes_price <= 0 or yes_price >= 100:
             continue
 

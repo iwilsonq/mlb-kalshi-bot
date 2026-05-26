@@ -690,67 +690,16 @@ class KalshiClient:
                 detail=error_body,
             )
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Market price extraction ──────────────────────────────────────────────────
 
-def _best_ask(market: dict) -> int:
-    """Return best ask price in cents for the YES side.
+def market_price(market: dict) -> int:
+    """Extract YES ask price in cents from a Kalshi market dict.
 
-    Handles both nested {"ask": {"price": 30}} and flat yes_ask_dollars formats.
+    Handles multiple Kalshi response formats:
+      - Flat dollar string: {"yes_ask_dollars": "0.35"} → 35
+      - Nested dict:        {"ask": {"price": 35}}      → 35
+      - Numeric:            {"ask": 35}                  → 35
     """
-    ask = market.get("ask")
-    if isinstance(ask, dict):
-        return int(ask.get("price", 0))
-    if isinstance(ask, (int, float)):
-        return int(ask)
-    # Flat dollar string format (e.g. "0.35")
-    if "yes_ask_dollars" in market:
-        try:
-            return int(float(market["yes_ask_dollars"]) * 100)
-        except (ValueError, TypeError):
-            pass
-    return 0
-
-
-def _best_bid(market: dict) -> int:
-    """Return best bid price in cents for the YES side.
-
-    Handles both nested {"bid": {"price": 30}} and flat yes_bid_dollars formats.
-    """
-    bid = market.get("bid")
-    if isinstance(bid, dict):
-        return int(bid.get("price", 0))
-    if isinstance(bid, (int, float)):
-        return int(bid)
-    # Flat dollar string format (e.g. "0.30")
-    if "yes_bid_dollars" in market:
-        try:
-            return int(float(market["yes_bid_dollars"]) * 100)
-        except (ValueError, TypeError):
-            pass
-    return 0
-
-
-def _market_desc(market: dict) -> str:
-    """Get market description, falling back to title."""
-    return market.get("description") or market.get("title", "")
-
-
-def _market_date_str(dt_str: str) -> str:
-    """Convert ISO datetime to Kalshi date format (YYMMDD).
-
-    Example: '2026-05-11T22:10:00Z' -> '26MAY11'
-    """
-    if not dt_str:
-        return ""
-    try:
-        dt = datetime.datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        return dt.strftime("%d%b%y").upper()
-    except (ValueError, TypeError):
-        return ""
-
-
-def _market_price(market: dict) -> int:
-    """Extract YES ask price in cents from a Kalshi market dict."""
     if "yes_ask_dollars" in market:
         try:
             return int(float(market["yes_ask_dollars"]) * 100)
@@ -762,76 +711,3 @@ def _market_price(market: dict) -> int:
     if isinstance(ask, (int, float)):
         return int(ask)
     return 0
-
-
-def _market_no_price(market: dict) -> int:
-    """Extract NO ask price in cents from a Kalshi market dict.
-
-    On Kalshi, NO price = 100 - YES bid price.
-    We want the cost to *buy* a NO contract, which is (100 - yes_bid).
-    """
-    if "yes_bid_dollars" in market:
-        try:
-            yes_bid = int(float(market["yes_bid_dollars"]) * 100)
-            if yes_bid > 0:
-                return 100 - yes_bid
-        except (ValueError, TypeError):
-            pass
-    # Fallback: NO ask price = 100 - YES bid
-    bid = market.get("bid")
-    if isinstance(bid, dict):
-        yes_bid = int(bid.get("price", 0))
-        return 100 - yes_bid if yes_bid > 0 else 0
-    if isinstance(bid, (int, float)) and bid > 0:
-        return 100 - int(bid)
-    return 0
-
-
-def _market_liquidity(market: dict) -> float:
-    """Extract liquidity from various Kalshi response formats."""
-    try:
-        liq = float(market.get("liquidity_dollars", 0))
-        if liq > 0:
-            return liq
-    except (ValueError, TypeError):
-        pass
-
-    vol = market.get("volume")
-    if isinstance(vol, dict):
-        try:
-            return float(vol.get("bid", 0)) + float(vol.get("ask", 0))
-        except (ValueError, TypeError):
-            pass
-    elif isinstance(vol, (int, float)):
-        return float(vol)
-
-    try:
-        fp = float(market.get("volume_fp", 0))
-        if fp > 0:
-            return fp
-    except (ValueError, TypeError):
-        pass
-
-    try:
-        fp = float(market.get("open_interest_fp", 0))
-        if fp > 0:
-            return fp
-    except (ValueError, TypeError):
-        pass
-
-    return 0
-
-
-def _kelly_count(
-    edge_cents: float,
-    price_cents: int,
-    kelly_fraction: float,
-    max_position_usd: float,
-    max_contracts: int = 5000,
-) -> int:
-    """Calculate contract count using fractional Kelly sizing, capped at max_contracts."""
-    if edge_cents <= 0 or price_cents <= 0:
-        return 0
-    kelly_pct = edge_cents / price_cents
-    count = int((kelly_fraction * kelly_pct * max_position_usd * 100) / price_cents)
-    return max(0, min(count, max_contracts))
