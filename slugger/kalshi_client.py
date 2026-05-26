@@ -90,22 +90,8 @@ def _auth_headers(
     }
 
 
-# ─── Response dataclass ───────────────────────────────────────────────────────
-
-@dataclass
-class OrderResult:
-    """Result of an order placement."""
-    order_id: str
-    ticker: str
-    action: str           # "buy" or "sell"
-    side: str             # "yes" or "no"
-    count: int
-    price: int            # in cents (1-99)
-    status: str
-    created_at: str
-    client_order_id: str = ""
-    error: str = ""
-    detail: Dict[str, Any] = field(default_factory=dict)
+# ─── Response dataclass (canonical definition in slugger.types) ───────────────
+from slugger.types import OrderResult  # noqa: F401, E402
 
 
 # ─── Client ───────────────────────────────────────────────────────────────────
@@ -711,3 +697,77 @@ def market_price(market: dict) -> int:
     if isinstance(ask, (int, float)):
         return int(ask)
     return 0
+
+
+# ─── Test adapter ─────────────────────────────────────────────────────────────
+
+
+class FixtureMarketClient:
+    """In-memory MarketClient adapter for tests.
+
+    Satisfies the MarketClient protocol with deterministic, pre-loaded data.
+    No HTTP calls, no authentication.
+
+    Usage:
+        client = FixtureMarketClient(
+            markets={"KXMLBKS-26MAY111810SFLAD": [{"ticker": "...", ...}]},
+            balance=100.0,
+        )
+    """
+
+    def __init__(
+        self,
+        markets: Optional[Dict[str, List[Dict]]] = None,
+        balance: float = 100.0,
+        positions: Optional[List[Dict]] = None,
+        settlements: Optional[List[Dict]] = None,
+    ):
+        self._markets = markets or {}
+        self._balance = balance
+        self._positions = positions or []
+        self._settlements = settlements or []
+        self.orders: List[Dict] = []  # records placed orders for assertion
+
+    def get_event_markets(self, event_ticker: str, min_liquidity: float = 0) -> List[Dict]:
+        return list(self._markets.get(event_ticker, []))
+
+    def create_yes_order(self, ticker: str, count: int, yes_price: int, **kwargs) -> OrderResult:
+        self.orders.append({"ticker": ticker, "side": "yes", "count": count, "price": yes_price})
+        return OrderResult(
+            order_id=f"fix-{len(self.orders)}",
+            ticker=ticker, action="buy", side="yes",
+            count=count, price=yes_price, status="executed", created_at="",
+        )
+
+    def create_no_order(self, ticker: str, count: int, no_price: int, **kwargs) -> OrderResult:
+        self.orders.append({"ticker": ticker, "side": "no", "count": count, "price": no_price})
+        return OrderResult(
+            order_id=f"fix-{len(self.orders)}",
+            ticker=ticker, action="buy", side="no",
+            count=count, price=no_price, status="executed", created_at="",
+        )
+
+    def create_combo_market(
+        self,
+        collection_ticker: str,
+        legs: List[Dict[str, str]],
+        with_market_payload: bool = True,
+    ) -> Optional[Dict]:
+        return None  # combos not supported in fixture mode
+
+    def get_balance(self) -> float:
+        return self._balance
+
+    def get_positions(self) -> List[Dict]:
+        return list(self._positions)
+
+    def get_settlements(
+        self,
+        limit: int = 200,
+        min_ts: Optional[int] = None,
+        max_ts: Optional[int] = None,
+        ticker: Optional[str] = None,
+    ) -> List[Dict]:
+        if ticker:
+            return [s for s in self._settlements if s.get("ticker") == ticker]
+        return list(self._settlements[:limit])

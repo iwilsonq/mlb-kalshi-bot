@@ -177,6 +177,75 @@ class MLBDataProvider(Protocol):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  MARKET CLIENT TYPES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@dataclass
+class OrderResult:
+    """Result of an order placement."""
+    order_id: str
+    ticker: str
+    action: str           # "buy" or "sell"
+    side: str             # "yes" or "no"
+    count: int
+    price: int            # in cents (1-99)
+    status: str
+    created_at: str
+    client_order_id: str = ""
+    error: str = ""
+    detail: Dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class MarketClient(Protocol):
+    """Seam for market data and order execution.
+
+    Production adapter is KalshiClient (HTTP + RSA-PSS auth).
+    Test adapter is FixtureMarketClient (deterministic, in-memory).
+    """
+
+    def get_event_markets(self, event_ticker: str, min_liquidity: float = 0) -> List[Dict]:
+        """Fetch markets for an event."""
+        ...
+
+    def create_yes_order(self, ticker: str, count: int, yes_price: int, **kwargs) -> OrderResult:
+        """Buy YES contracts at the given limit price (cents)."""
+        ...
+
+    def create_no_order(self, ticker: str, count: int, no_price: int, **kwargs) -> OrderResult:
+        """Buy NO contracts at the given limit price (cents)."""
+        ...
+
+    def create_combo_market(
+        self,
+        collection_ticker: str,
+        legs: List[Dict[str, str]],
+        with_market_payload: bool = True,
+    ) -> Optional[Dict]:
+        """Create (or retrieve) a combo market from selected legs."""
+        ...
+
+    def get_balance(self) -> float:
+        """Return available balance in USD."""
+        ...
+
+    def get_positions(self) -> List[Dict]:
+        """Return all open positions."""
+        ...
+
+    def get_settlements(
+        self,
+        limit: int = 200,
+        min_ts: Optional[int] = None,
+        max_ts: Optional[int] = None,
+        ticker: Optional[str] = None,
+    ) -> List[Dict]:
+        """Return settled market records."""
+        ...
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  TRADING TYPES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

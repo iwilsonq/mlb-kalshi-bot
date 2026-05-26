@@ -23,9 +23,9 @@ from typing import Dict, List, Optional, Set
 from slugger.calibration import CalibrationLayer
 from slugger.config import Config
 from slugger.journal import record_signal
-from slugger.kalshi_client import KalshiClient, market_price
+from slugger.kalshi_client import market_price
 from slugger.sizing import kelly_count
-from slugger.types import MarketSpec, ModelFn, ModelResult, TradeSignal
+from slugger.types import MarketClient, MarketSpec, ModelFn, ModelResult, TradeSignal
 
 log = logging.getLogger(__name__)
 
@@ -126,7 +126,7 @@ def _default_confidence(edge_cents: float) -> float:
 def evaluate_markets(
     spec: MarketSpec,
     model: ModelFn,
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
 ) -> List[TradeSignal]:
     """Run the full signal pipeline for a strategy.

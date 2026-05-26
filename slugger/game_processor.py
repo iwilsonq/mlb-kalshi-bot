@@ -18,18 +18,17 @@ from typing import List, Optional, Set
 import requests
 
 from slugger.config import Config
-from slugger.kalshi_client import KalshiClient
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
 from slugger.signal_pipeline import load_calibration
 from slugger.strategies import BATTER_STRATEGIES, STRATEGIES, strategy_combo, strategy_game_winner
 from slugger.tickers import game_event_ticker
-from slugger.types import GameContext, GameInfo, TradeSignal
+from slugger.types import GameContext, GameInfo, MarketClient, TradeSignal
 import slugger.journal as journal
 
 log = logging.getLogger("slugger")
 
 
-def game_markets(client: KalshiClient, game: GameInfo, config: Config) -> List[dict]:
+def game_markets(client: MarketClient, game: GameInfo, config: Config) -> List[dict]:
     """Fetch markets for a single game via its Kalshi event ticker."""
     event_ticker = game_event_ticker(game)
     if not event_ticker:
@@ -187,7 +186,7 @@ class GameBudget:
 
 def execute_signals(
     signals: List[TradeSignal],
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
     circuit: CircuitBreaker,
     effective_bankroll: float,
@@ -293,7 +292,7 @@ def execute_signals(
 
 def process_game(
     ctx: GameContext,
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
     circuit: CircuitBreaker,
     bankroll_usd: float,
@@ -451,7 +450,7 @@ def process_game(
 # ─── Settlement ───────────────────────────────────────────────────────────────
 
 def settle_pending(
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
     circuit: Optional[CircuitBreaker] = None,
 ) -> int:

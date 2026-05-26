@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from slugger.config import Config
-from slugger.kalshi_client import KalshiClient, market_price
+from slugger.kalshi_client import market_price
 from slugger.journal import record_signal
 from slugger.mlb_data import get_team_profile
 from slugger.models import (
@@ -29,8 +29,8 @@ from slugger.tickers import (
     hr_event_ticker, total_event_ticker, hit_event_ticker, hrr_event_ticker,
 )
 from slugger.types import (
-    BatterProfile, GameInfo, MarketSpec, ModelResult, PitcherProfile,
-    TeamProfile, TradeSignal,
+    BatterProfile, GameInfo, MarketClient, MarketSpec, ModelResult,
+    PitcherProfile, TeamProfile, TradeSignal,
 )
 
 log = logging.getLogger(__name__)
@@ -64,7 +64,7 @@ def strategy_pitcher_ks(
     game_info: GameInfo,
     pitcher_profile: PitcherProfile,
     batter_profile: Optional[BatterProfile],
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
 ) -> List[TradeSignal]:
     """Strikeout prop bets — Poisson model via signal pipeline."""
@@ -170,7 +170,7 @@ def strategy_pitcher_ks(
 
 def strategy_game_winner(
     game_info: GameInfo,
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
     home_pitcher: Optional[PitcherProfile] = None,
     away_pitcher: Optional[PitcherProfile] = None,
@@ -242,7 +242,7 @@ def strategy_total_runs(
     game_info: GameInfo,
     pitcher_profile: PitcherProfile,
     batter_profile: Optional[BatterProfile],
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
 ) -> List[TradeSignal]:
     """Total runs (over/under) prop — ERA bucket model via signal pipeline."""
@@ -276,7 +276,7 @@ def strategy_player_hr(
     game_info: GameInfo,
     pitcher_profile: PitcherProfile,
     batter_profile: Optional[BatterProfile],
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
 ) -> List[TradeSignal]:
     """Player home run prop — Poisson model via signal pipeline."""
@@ -425,7 +425,7 @@ def strategy_player_hits_runs_rbis(
     game_info: GameInfo,
     pitcher_profile: PitcherProfile,
     batter_profile: Optional[BatterProfile],
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
 ) -> List[TradeSignal]:
     """Hits + Runs + RBIs prop — AVG bucket model via signal pipeline."""
@@ -470,7 +470,7 @@ def strategy_player_hits(
     game_info: GameInfo,
     pitcher_profile: PitcherProfile,
     batter_profile: Optional[BatterProfile],
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
 ) -> List[TradeSignal]:
     """Player hits prop — Poisson model via signal pipeline."""
@@ -588,7 +588,7 @@ def strategy_pitcher_er(
     game_info: GameInfo,
     pitcher_profile: PitcherProfile,
     batter_profile: Optional[BatterProfile],
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
 ) -> List[TradeSignal]:
     """Pitcher earned runs prop (Under). Stub — not yet implemented."""
@@ -944,7 +944,7 @@ def generate_combos(
 
 def strategy_combo(
     game_info: GameInfo,
-    client: KalshiClient,
+    client: MarketClient,
     config: Config,
     single_leg_signals: Optional[List[TradeSignal]] = None,
     **kwargs,
