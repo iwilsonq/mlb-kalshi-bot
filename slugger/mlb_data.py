@@ -123,6 +123,8 @@ class BatterProfile:
     vs_rhp_avg: float = 0.0
     vs_rhp_hr: int = 0
     vs_rhp_ab: int = 0
+    # Lineup position (set by _fetch_batters when lineup is confirmed)
+    batting_order: int = 0        # 1-9 lineup slot, 0 = unknown
 
 
 @dataclass
@@ -1085,15 +1087,19 @@ class LiveMLBDataProvider:
                 except Exception as exc:
                     log.debug("Could not fetch batter profile %d: %s", pid, exc)
 
-        # Reconstruct ordered lists
+        # Reconstruct ordered lists, stamping batting order position
         if away_lineup.confirmed:
-            for pid in away_pids:
+            for i, pid in enumerate(away_pids):
                 if pid in profile_cache:
-                    away_batters.append(profile_cache[pid])
+                    bp = profile_cache[pid]
+                    bp.batting_order = i + 1
+                    away_batters.append(bp)
         if home_lineup.confirmed:
-            for pid in home_pids:
+            for i, pid in enumerate(home_pids):
                 if pid in profile_cache:
-                    home_batters.append(profile_cache[pid])
+                    bp = profile_cache[pid]
+                    bp.batting_order = i + 1
+                    home_batters.append(bp)
 
         return away_batters, home_batters
 

@@ -174,7 +174,34 @@ def _parse_k_threshold(title: str) -> Optional[int]:
     return None
 
 
-_AVG_AB_PER_GAME      = 3.9    # MLB average ABs per player per game
+_AVG_AB_PER_GAME      = 3.9    # MLB average ABs per player per game (fallback)
+
+# Expected plate appearances by batting order position.
+# Source: MLB averages (2022-2024).  PA includes AB + BB + HBP + SF + SH.
+# AB is slightly lower (~0.1-0.2 fewer per PA due to walks), but we use PA
+# as the opportunity count since walks can still produce runs/RBIs.
+_PA_BY_ORDER = {
+    1: 4.30,    # Leadoff — most PA
+    2: 4.15,
+    3: 4.10,
+    4: 4.05,    # Cleanup
+    5: 3.95,
+    6: 3.85,
+    7: 3.70,
+    8: 3.55,
+    9: 3.40,    # 9th hitter — fewest PA
+}
+
+
+def _expected_ab(batting_order: int) -> float:
+    """Return expected at-bats per game adjusted for lineup position.
+
+    Uses lineup-position PA estimates when the batting order is known
+    (1-9), falls back to league average (3.9) when unknown (0).
+    """
+    if batting_order < 1 or batting_order > 9:
+        return _AVG_AB_PER_GAME
+    return _PA_BY_ORDER[batting_order]
 _LEAGUE_AVG_HR_PER_9  = 1.1   # league-average HR allowed per 9 IP (2024)
 _LEAGUE_AVG_HR_PER_AB = 0.017  # calibrated to ~6.5% per-game HR rate (0.065 / 3.9 AB)
 _HR_PRIOR_AB          = 300    # prior weight in AB-equivalents for shrinkage (stronger pull to mean)
@@ -246,6 +273,7 @@ def _hr_prob_poisson(
     ab: int,
     opp_hr_per_9: float = 0.0,
     opp_ip: float = 0.0,
+    batting_order: int = 0,
 ) -> tuple:
     """P(batter hits 1+ HR in a game) using a Poisson model with shrinkage.
 
@@ -253,12 +281,15 @@ def _hr_prob_poisson(
     for the opposing pitcher's HR/9 only when they have enough innings
     to make that rate meaningful.
 
+    Args:
+        batting_order: 1-9 lineup position for PA adjustment (0 = use default).
+
     Returns:
         (probability, effective_hr_per_ab, applied_pitcher_adj)
         so callers can log what drove the estimate.
     """
     effective_rate = _shrink_hr_rate(hr, ab)
-    lam = effective_rate * _AVG_AB_PER_GAME
+    lam = effective_rate * _expected_ab(batting_order)
 
     # Only apply pitcher HR/9 adjustment if they have sufficient IP,
     # and cap it so a small stretch of bad luck can't dominate the estimate.
@@ -437,13 +468,15 @@ def _expected_hits_lambda(
         split_h = batter.hits
         split_ab = batter.ab
 
+    ab_est = _expected_ab(batter.batting_order)
+
     eff_avg = _shrink_avg(split_h, split_ab)
-    lam = eff_avg * _AVG_AB_PER_GAME
+    lam = eff_avg * ab_est
 
     # xBA blend
     if batter.xba > 0:
         blended_avg = 0.70 * eff_avg + 0.30 * batter.xba
-        lam = blended_avg * _AVG_AB_PER_GAME
+        lam = blended_avg * ab_est
 
     # Pitcher WHIP adjustment
     if opp_whip > 0 and opp_ip >= _HITS_MIN_PITCHER_IP:
@@ -711,11 +744,13 @@ def strategy_player_hr(
         platoon_note = "overall" if not opp_throws else f"overall({opp_throws}_split<20AB)"
 
     # ── Compute λ ──────────────────────────────────────────────────────────
+    ab_est = _expected_ab(batter_profile.batting_order)
     _, eff_rate, pitcher_adj = _hr_prob_poisson(
         hr=split_hr, ab=split_ab,
         opp_hr_per_9=opp_hr_per_9, opp_ip=opp_ip,
+        batting_order=batter_profile.batting_order,
     )
-    lam = eff_rate * _AVG_AB_PER_GAME
+    lam = eff_rate * ab_est
     if pitcher_adj != 1.0:
         lam *= pitcher_adj
 
@@ -953,12 +988,13 @@ def strategy_player_hits(
         platoon_note = "overall"
 
     # ── Compute λ ──────────────────────────────────────────────────────────
+    ab_est = _expected_ab(batter_profile.batting_order)
     eff_avg = _shrink_avg(split_h, split_ab)
-    lam = eff_avg * _AVG_AB_PER_GAME
+    lam = eff_avg * ab_est
 
     if batter_profile.xba > 0:
         blended_avg = 0.70 * eff_avg + 0.30 * batter_profile.xba
-        lam = blended_avg * _AVG_AB_PER_GAME
+        lam = blended_avg * ab_est
 
     pitcher_adj = 1.0
     if opp_whip > 0 and opp_ip >= _HITS_MIN_PITCHER_IP:
@@ -973,10 +1009,11 @@ def strategy_player_hits(
     lam *= park_factor
 
     log.debug(
-        "%s  split=%s %dH/%dAB  eff_avg=%.3f  xba=%.3f"
+        "%s (#%d)  split=%s %dH/%dAB  eff_avg=%.3f  xba=%.3f  ab_est=%.1f"
         "  park=%s(×%.2f)  opp_whip=%.2f(%s,%.0fIP)  pitcher_adj=%.2f  λ=%.3f",
-        batter_profile.name, platoon_note, split_h, split_ab, eff_avg,
-        batter_profile.xba, home_kalshi, park_factor,
+        batter_profile.name, batter_profile.batting_order,
+        platoon_note, split_h, split_ab, eff_avg,
+        batter_profile.xba, ab_est, home_kalshi, park_factor,
         opp_whip, opp_throws or "?", opp_ip, pitcher_adj, lam,
     )
 
