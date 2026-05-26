@@ -1,7 +1,8 @@
 """Trading strategies for Slugger MLB bot.
 
-Each strategy constructs Kalshi event tickers directly from game info
-and queries the specific prop market (strikes, HRs, totals, etc).
+Each strategy provides a probability model; the signal pipeline
+(slugger.signal_pipeline) handles market fetching, edge scoring,
+Kelly sizing, and signal recording.
 """
 from __future__ import annotations
 import itertools
@@ -13,8 +14,10 @@ from typing import Dict, List, Optional, Tuple
 
 from slugger.config import Config
 from slugger.mlb_data import GameInfo, PitcherProfile, BatterProfile, get_team_profile
-from slugger.kalshi_client import KalshiClient, _market_price, _market_no_price, _market_liquidity, _kelly_count
+from slugger.kalshi_client import KalshiClient, _market_price
 from slugger.journal import record_signal
+from slugger.sizing import kelly_count
+from slugger.signal_pipeline import MarketSpec, ModelResult, evaluate_markets
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +114,9 @@ _KS_MIN_THRESHOLD   = 6       # skip 4+ and 5+ K markets (unprofitable historica
 _KS_MIN_MODEL_PROB  = 15      # minimum model prob (%) to consider trading YES side
 _KS_NO_MAX_MODEL_PROB = 10    # buy NO when model says probability is at most this (%)
 _KS_NO_MIN_EDGE_CENTS = 5     # minimum edge (market_yes_price - model_prob) to buy NO
+
+# Threshold regex: matches "7+", "over 6.5", "at least 9" in any K-related title
+_KS_THRESHOLD_PATTERN = r'(\d+)\s*\+'
 
 
 def _poisson_ge(n: int, lam: float) -> float:
@@ -354,39 +360,17 @@ def strategy_pitcher_ks(
     client: KalshiClient,
     config: Config,
 ) -> List[TradeSignal]:
-    """Strikeout prop bets — Poisson model.
-
-    For each open K-threshold market (e.g. "7+ strikeouts"):
-      1. Determine which team is batting against this pitcher.
-      2. Compute expected Ks (λ) from recent K/start, season K/9×IP,
-         opposing team K rate, and Statcast whiff rate.
-      3. Use a Poisson CDF to get P(Ks ≥ threshold) for the *specific*
-         threshold in that market.
-      4. Buy YES when our probability exceeds the market price by
-         at least MIN_EDGE_CENTS.
-    """
-    signals = []
+    """Strikeout prop bets — Poisson model via signal pipeline."""
     event_ticker = _ks_event(game_info)
     if not event_ticker:
-        return signals
+        return []
 
-    # Require at least some meaningful pitcher data
     if not pitcher_profile or (
         pitcher_profile.k_per_9 == 0 and pitcher_profile.recent_k_per_start == 0
     ):
-        return signals
-
-    try:
-        markets = client.get_event_markets(event_ticker, min_liquidity=config.min_liquidity_dollars)
-    except Exception:
-        return signals
-
-    if not markets:
-        return signals
+        return []
 
     # ── Identify opposing team and fetch their K rate ──────────────────────
-    # Determine whether this pitcher is home or away, then look at the other
-    # team's batting K rate as the opponent.
     opp_k_rate = 0.0
     try:
         if pitcher_profile.player_id == game_info.away_pitcher_id:
@@ -394,7 +378,7 @@ def strategy_pitcher_ks(
         else:
             opp_abbrev = game_info.away_abbrev
         opp_team = get_team_profile(opp_abbrev)
-        opp_k_rate = opp_team.k_rate   # fraction, e.g. 0.235
+        opp_k_rate = opp_team.k_rate
         log.debug(
             "Opponent %s K rate: %.1f%% (league avg %.1f%%)",
             opp_abbrev, opp_k_rate * 100, _LEAGUE_AVG_K_RATE * 100,
@@ -405,22 +389,18 @@ def strategy_pitcher_ks(
     # ── Compute expected strikeouts (λ) ────────────────────────────────────
     lam = _expected_ks(pitcher_profile, opp_k_rate)
     if lam <= 0:
-        return signals
+        return []
 
     # ── In-game adjustment ─────────────────────────────────────────────────
-    # If the pitcher is still active in an in-progress game, scale λ down
-    # to reflect only the *remaining* expected Ks (full-game λ × fraction
-    # of start not yet completed).  The threshold comparison is also shifted:
-    # we need (threshold − ks_already_recorded) more Ks from here.
-    current_ks    = getattr(pitcher_profile, "current_ks",    None)
-    ip_today      = getattr(pitcher_profile, "ip_today",      None)
-    in_game       = current_ks is not None and ip_today is not None
+    current_ks = getattr(pitcher_profile, "current_ks", None)
+    ip_today = getattr(pitcher_profile, "ip_today", None)
+    in_game = current_ks is not None and ip_today is not None
 
     if in_game:
-        expected_ip   = pitcher_profile.recent_ip_per_start or _DEFAULT_IP
-        ip_remaining  = max(0.0, expected_ip - ip_today)
+        expected_ip = pitcher_profile.recent_ip_per_start or _DEFAULT_IP
+        ip_remaining = max(0.0, expected_ip - ip_today)
         frac_remaining = ip_remaining / expected_ip if expected_ip > 0 else 0.0
-        lam_remaining  = lam * frac_remaining
+        lam_remaining = lam * frac_remaining
         log.debug(
             "%s  in-game: %dKs/%.1fIP done  ip_remaining=%.1f  "
             "λ_full=%.2f → λ_remaining=%.2f",
@@ -439,42 +419,12 @@ def strategy_pitcher_ks(
             opp_k_rate,
         )
 
-    # ── Score each market using its specific threshold ─────────────────────
-    # Match only markets for this specific pitcher by last name.
-    pitcher_last = pitcher_profile.name.split()[-1].lower() if pitcher_profile.name else ""
-
-    evaluated: list = []   # (threshold, prob_pct, price, edge) for every scored market
-
-    for m in markets:
-        title = m.get("title", "")
-        title_lower = title.lower()
-
-        # Only strikeout markets for this pitcher
-        if "strikeout" not in title_lower and "k+" not in title_lower and " ks" not in title_lower:
-            continue
-        if pitcher_last and pitcher_last not in title_lower:
-            continue
-
-        price = _market_price(m)
-        if price <= 0 or price >= 100:
-            continue
-
-        # Parse the numeric threshold from the title
-        threshold = _parse_k_threshold(title)
+    # ── Build model closure ────────────────────────────────────────────────
+    def ks_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
         if threshold is None:
-            log.debug("Could not parse K threshold from title: %r", title)
-            continue
-
-        # Skip low thresholds that are historically unprofitable
-        if threshold < _KS_MIN_THRESHOLD:
-            log.debug("Skipping %d+ Ks (below min threshold %d)", threshold, _KS_MIN_THRESHOLD)
-            continue
-
-        # If in-game, shift the threshold by Ks already recorded:
-        # e.g. threshold=8, current_ks=5 → need 3 more Ks remaining
+            return None
         if in_game and current_ks is not None:
             if current_ks >= threshold:
-                # Already hit or exceeded this threshold — it's a YES
                 prob_pct = 99
             else:
                 remaining_needed = threshold - current_ks
@@ -482,150 +432,29 @@ def strategy_pitcher_ks(
         else:
             prob_pct = round(_poisson_ge(threshold, lam) * 100)
 
-        edge = prob_pct - price
-        evaluated.append((threshold, prob_pct, price, edge))
-
-        # Log every evaluated market for calibration
-        sig_reason = (
+        reason = (
             f"λ={lam:.1f}Ks  P(≥{threshold})={prob_pct}%"
             f"  recent={pitcher_profile.recent_k_per_start:.1f}K/start"
             + (f"  whiff={pitcher_profile.whiff_rate:.2f}" if pitcher_profile.whiff_rate else "")
             + (f"  opp_k={opp_k_rate:.1%}" if opp_k_rate else "")
         )
-        traded = edge >= config.min_edge_cents and prob_pct >= _KS_MIN_MODEL_PROB
-        record_signal(
-            config.log_dir, m["ticker"], "pitcher_ks",
-            model_prob_pct=prob_pct, market_price_cents=price,
-            edge_cents=float(edge), traded=traded, reason=sig_reason,
-        )
+        return ModelResult(prob_pct=prob_pct, reason=reason)
 
-        if edge >= config.min_edge_cents and prob_pct >= _KS_MIN_MODEL_PROB:
-            count = _kelly_count(
-                edge, price,
-                config.kelly_fraction,
-                config.max_position_usd,
-                config.max_contracts_per_trade,
-            )
-            if count > 0:
-                reason = (
-                    f"λ={lam:.1f}Ks  P(≥{threshold})={prob_pct}%"
-                    f"  recent={pitcher_profile.recent_k_per_start:.1f}K/start"
-                    + (f"  whiff={pitcher_profile.whiff_rate:.2f}" if pitcher_profile.whiff_rate else "")
-                    + (f"  opp_k={opp_k_rate:.1%}" if opp_k_rate else "")
-                )
-                signals.append(TradeSignal(
-                    ticker=m["ticker"], action="buy", side="yes",
-                    count=count, price=price, strategy="pitcher_ks",
-                    confidence=min(0.5 + edge / 100, 0.85),
-                    edge_cents=float(edge),
-                    reason=reason,
-                ))
-
-    # ── NO-side: buy NO when model probability is very low ───────────────
-    # If the model says P(≥threshold) is very low but the market prices YES
-    # higher, the NO side offers positive edge.
-    for m in markets:
-        title = m.get("title", "")
-        title_lower = title.lower()
-        if "strikeout" not in title_lower and "k+" not in title_lower and " ks" not in title_lower:
-            continue
-        if pitcher_last and pitcher_last not in title_lower:
-            continue
-
-        threshold = _parse_k_threshold(title)
-        if threshold is None or threshold < _KS_MIN_THRESHOLD:
-            continue
-
-        # Compute model YES probability
-        if in_game and current_ks is not None:
-            if current_ks >= threshold:
-                continue  # Already hit — YES is near-certain, no NO edge
-            remaining_needed = threshold - current_ks
-            model_yes_pct = round(_poisson_ge(remaining_needed, lam) * 100)
-        else:
-            model_yes_pct = round(_poisson_ge(threshold, lam) * 100)
-
-        # Only consider NO side when model is very confident it WON'T happen
-        if model_yes_pct > _KS_NO_MAX_MODEL_PROB:
-            continue
-
-        # NO edge = (100 - model_yes_pct) - no_price  [i.e. our NO prob vs NO cost]
-        # Equivalently: market_yes_price - model_yes_pct [how much YES is overpriced]
-        yes_price = _market_price(m)
-        if yes_price <= 0 or yes_price >= 100:
-            continue
-
-        no_edge = yes_price - model_yes_pct  # how overpriced YES is
-        if no_edge < _KS_NO_MIN_EDGE_CENTS:
-            continue
-
-        no_price = 100 - yes_price  # what we'd pay for NO
-        if no_price <= 0 or no_price >= 100:
-            continue
-
-        # Already have a YES signal on this ticker? Skip to avoid hedging ourselves
-        if any(s.ticker == m["ticker"] and s.side == "yes" for s in signals):
-            continue
-
-        no_reason = (
-            f"NO λ={lam:.1f}Ks  P(≥{threshold})={model_yes_pct}%  "
-            f"mkt_yes={yes_price}¢  no_edge={no_edge}¢"
-            f"  recent={pitcher_profile.recent_k_per_start:.1f}K/start"
-            + (f"  whiff={pitcher_profile.whiff_rate:.2f}" if pitcher_profile.whiff_rate else "")
-        )
-
-        record_signal(
-            config.log_dir, m["ticker"], "pitcher_ks",
-            model_prob_pct=model_yes_pct, market_price_cents=yes_price,
-            edge_cents=float(no_edge), traded=True,
-            reason=f"[NO] {no_reason}",
-        )
-
-        count = _kelly_count(
-            no_edge, no_price,
-            config.kelly_fraction,
-            config.max_position_usd,
-            config.max_contracts_per_trade,
-        )
-        if count > 0:
-            signals.append(TradeSignal(
-                ticker=m["ticker"], action="buy", side="no",
-                count=count, price=no_price, strategy="pitcher_ks",
-                confidence=min(0.5 + no_edge / 100, 0.85),
-                edge_cents=float(no_edge),
-                reason=f"[NO] {no_reason}",
-            ))
-
-    # ── Limit to best 2 thresholds per pitcher to avoid correlated losses ──
-    if len(signals) > 2:
-        signals.sort(key=lambda s: s.edge_cents, reverse=True)
-        dropped = signals[2:]
-        signals = signals[:2]
-        log.info(
-            "  ✂️ pitcher_ks | %s | kept top 2 of %d signals (dropped: %s)",
-            pitcher_profile.name, len(signals) + len(dropped),
-            ", ".join(f"{s.ticker.rsplit('-',1)[-1]}" for s in dropped),
-        )
-
-    # ── Log reasoning when no signals were found ───────────────────────────
-    if evaluated and not signals:
-        best = max(evaluated, key=lambda x: x[3])   # highest edge row
-        rows = "  ".join(
-            f"{thr}+: P={p}% vs {pr}¢ → {e:+d}¢"
-            for thr, p, pr, e in sorted(evaluated, key=lambda x: x[0])
-        )
-        log.info(
-            "  ⬜ pitcher_ks | %s  λ=%.1f | no edge ≥%d¢  (best: %d+→%+d¢) | %s",
-            pitcher_profile.name, lam, config.min_edge_cents,
-            best[0], best[3], rows,
-        )
-    elif not evaluated:
-        log.info(
-            "  ⬜ pitcher_ks | %s  λ=%.1f | no matching K markets found",
-            pitcher_profile.name, lam,
-        )
-
-    return signals
+    # ── Run pipeline ───────────────────────────────────────────────────────
+    spec = MarketSpec(
+        event_ticker=event_ticker,
+        strategy_name="pitcher_ks",
+        title_keywords=["strikeout", "k+", " ks"],
+        player_name=pitcher_profile.name,
+        threshold_pattern=_KS_THRESHOLD_PATTERN,
+        min_threshold=_KS_MIN_THRESHOLD,
+        min_model_prob=_KS_MIN_MODEL_PROB,
+        max_signals=2,
+        no_side=True,
+        no_max_model_prob=_KS_NO_MAX_MODEL_PROB,
+        no_min_edge_cents=_KS_NO_MIN_EDGE_CENTS,
+    )
+    return evaluate_markets(spec, ks_model, client, config)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -639,71 +468,34 @@ def strategy_game_winner(
     client: KalshiClient,
     config: Config,
 ) -> List[TradeSignal]:
-    """Game winner prop.
-
-    Buys the home team when home pitcher has strong recent form.
-    Only evaluates when called with the home pitcher — skip the away pitcher
-    to avoid duplicate signals per game.
-    """
-    signals = []
-
+    """Game winner prop — ERA-based heuristic via signal pipeline."""
     # Only run once per game: skip if this pitcher is NOT the home starter.
     if (
         pitcher_profile
         and game_info.home_pitcher_id
         and pitcher_profile.player_id != game_info.home_pitcher_id
     ):
-        return signals
+        return []
 
     event_ticker = _game_base(game_info)
-    if not event_ticker:
-        return signals
-
-    try:
-        markets = client.get_event_markets(event_ticker, min_liquidity=config.min_liquidity_dollars)
-    except Exception:
-        return signals
-
-    if not markets or not pitcher_profile.recent_era:
-        return signals
+    if not event_ticker or not pitcher_profile.recent_era:
+        return []
 
     home_abbrev = _kalshi_team(game_info.home_abbrev)
     recent_era = pitcher_profile.recent_era
 
-    for m in markets:
-        price = _market_price(m)
-        if price <= 0 or price >= 100:
-            continue
-
-        # Check if this market is for the home team (ticker ends with -TEAM)
-        ticker = m.get("ticker", "")
-        if not ticker.upper().endswith(f"-{home_abbrev.upper()}"):
-            continue
-
-        # Estimate home win probability
-        # Good pitcher (recent ERA < 3.5) → home team slightly favored
+    def gw_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
         est = 55 if recent_era < 3.5 else (48 if recent_era > 5.0 else 50)
-        edge = est - price
+        reason = f"Home win: recent ERA {recent_era:.1f} → {est}% vs {price}¢"
+        return ModelResult(prob_pct=est, reason=reason)
 
-        sig_reason = f"Home win: recent ERA {recent_era:.1f} → {est}% vs {price}¢"
-        traded = edge >= config.min_edge_cents
-        record_signal(
-            config.log_dir, ticker, "game_winner",
-            model_prob_pct=est, market_price_cents=price,
-            edge_cents=float(edge), traded=traded, reason=sig_reason,
-        )
-
-        if edge >= config.min_edge_cents:
-            count = _kelly_count(edge, price, config.kelly_fraction, config.max_position_usd, config.max_contracts_per_trade)
-            if count > 0:
-                signals.append(TradeSignal(
-                    ticker=ticker, action="buy", side="yes",
-                    count=count, price=price, strategy="game_winner",
-                    confidence=0.55, edge_cents=edge,
-                    reason=f"Home win: recent ERA {recent_era:.1f} → {est}% vs {price}¢",
-                ))
-
-    return signals
+    spec = MarketSpec(
+        event_ticker=event_ticker,
+        strategy_name="game_winner",
+        ticker_suffix=home_abbrev,
+        confidence_fn=lambda _: 0.55,
+    )
+    return evaluate_markets(spec, gw_model, client, config)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -717,60 +509,32 @@ def strategy_total_runs(
     client: KalshiClient,
     config: Config,
 ) -> List[TradeSignal]:
-    """Total runs (over/under) prop.
-
-    Bets OVER when combined ERA is high, UNDER when low.
-    Uses the pitcher_profile as the "combined" pitcher quality proxy.
-    """
-    signals = []
+    """Total runs (over/under) prop — ERA bucket model via signal pipeline."""
     event_ticker = _total_event(game_info)
-    if not event_ticker:
-        return signals
-
-    try:
-        markets = client.get_event_markets(event_ticker, min_liquidity=config.min_liquidity_dollars)
-    except Exception:
-        return signals
-
-    if not markets or not pitcher_profile.era:
-        return signals
+    if not event_ticker or not pitcher_profile.era:
+        return []
 
     era = pitcher_profile.era
     est_over = _total_prob(era)
 
-    for m in markets:
-        price = _market_price(m)
-        if price <= 0 or price >= 100:
-            continue
+    def total_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
+        reason = f"Total runs: ERA {era:.1f} → over {est_over}% vs {price}¢"
+        return ModelResult(prob_pct=est_over, reason=reason)
 
-        title = m.get("title", "").lower()
-        # Only take OVER side
-        if "over" not in title:
-            continue
-
-        edge = est_over - price
-        record_signal(
-            config.log_dir, m["ticker"], "total_runs",
-            model_prob_pct=est_over, market_price_cents=price,
-            edge_cents=float(edge), traded=edge >= config.min_edge_cents,
-            reason=f"Total runs: ERA {era:.1f} → over {est_over}% vs {price}¢",
-        )
-        if edge >= config.min_edge_cents:
-            count = _kelly_count(edge, price, config.kelly_fraction, config.max_position_usd, config.max_contracts_per_trade)
-            if count > 0:
-                signals.append(TradeSignal(
-                    ticker=m["ticker"], action="buy", side="yes",
-                    count=count, price=price, strategy="total_runs",
-                    confidence=0.5, edge_cents=edge,
-                    reason=f"Total runs: ERA {era:.1f} → over {est_over}% vs {price}¢",
-                ))
-
-    return signals
+    spec = MarketSpec(
+        event_ticker=event_ticker,
+        strategy_name="total_runs",
+        title_keywords=["over"],
+        confidence_fn=lambda _: 0.5,
+    )
+    return evaluate_markets(spec, total_model, client, config)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  STRATEGY: Player Home Runs
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_HR_THRESHOLD_PATTERN = r'(\d+)\+\s*home\s*run'
 
 def strategy_player_hr(
     game_info: GameInfo,
@@ -779,48 +543,33 @@ def strategy_player_hr(
     client: KalshiClient,
     config: Config,
 ) -> List[TradeSignal]:
-    """Player home run prop.
-
-    Matches home run markets by slugger name in the title.
-    """
-    signals = []
+    """Player home run prop — Poisson model via signal pipeline."""
     event_ticker = _hr_event(game_info)
     if not event_ticker or not batter_profile:
-        return signals
+        return []
 
-    # ── Minimum sample size: skip batters with too few ABs ─────────────
     if batter_profile.ab < _HR_MIN_AB:
         log.debug(
             "player_hr | %s — only %d AB (need %d) — skipping",
             batter_profile.name, batter_profile.ab, _HR_MIN_AB,
         )
-        return signals
-
-    try:
-        markets = client.get_event_markets(event_ticker, min_liquidity=config.min_liquidity_dollars)
-    except Exception:
-        return signals
-
-    if not markets:
-        return signals
-
-    last_name = batter_profile.name.split()[-1].lower()
+        return []
 
     opp_hr_per_9 = pitcher_profile.hr_per_9 if pitcher_profile else 0.0
-    opp_ip       = pitcher_profile.innings_pitched if pitcher_profile else 0.0
-    opp_throws   = (pitcher_profile.throws if pitcher_profile else "") or ""
+    opp_ip = pitcher_profile.innings_pitched if pitcher_profile else 0.0
+    opp_throws = (pitcher_profile.throws if pitcher_profile else "") or ""
 
-    # ── Platoon: use hand-specific HR rate when pitcher handedness is known ──
+    # ── Platoon split selection ────────────────────────────────────────────
     if opp_throws == "L" and batter_profile.vs_lhp_ab >= 20:
         split_hr, split_ab, platoon_note = batter_profile.vs_lhp_hr, batter_profile.vs_lhp_ab, "vsL"
     elif opp_throws == "R" and batter_profile.vs_rhp_ab >= 20:
         split_hr, split_ab, platoon_note = batter_profile.vs_rhp_hr, batter_profile.vs_rhp_ab, "vsR"
     else:
-        split_hr  = batter_profile.hr
-        split_ab  = batter_profile.ab
+        split_hr = batter_profile.hr
+        split_ab = batter_profile.ab
         platoon_note = "overall" if not opp_throws else f"overall({opp_throws}_split<20AB)"
 
-    # ── Base λ: Bayesian shrinkage on the chosen split ─────────────────────
+    # ── Compute λ ──────────────────────────────────────────────────────────
     _, eff_rate, pitcher_adj = _hr_prob_poisson(
         hr=split_hr, ab=split_ab,
         opp_hr_per_9=opp_hr_per_9, opp_ip=opp_ip,
@@ -829,19 +578,14 @@ def strategy_player_hr(
     if pitcher_adj != 1.0:
         lam *= pitcher_adj
 
-    # ── Park factor ─────────────────────────────────────────────────────────
     home_kalshi = _kalshi_team(game_info.home_abbrev)
     park_factor = HR_PARK_FACTORS.get(home_kalshi, HR_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0))
     lam *= park_factor
 
-    # ── Statcast barrel rate adjustment ────────────────────────────────────
-    # Barrel rate is the strongest Statcast predictor of HR power.
-    # League-average barrel rate is ~6.5%. Only adjust when we have data.
     _LEAGUE_AVG_BARREL = 0.065
     barrel_adj = 1.0
     if batter_profile.barrel_rate > 0:
         raw_barrel = batter_profile.barrel_rate / _LEAGUE_AVG_BARREL
-        # Dampen: pull halfway toward 1.0 to avoid over-adjustment
         barrel_adj = 1.0 + 0.5 * (raw_barrel - 1.0)
         lam *= barrel_adj
 
@@ -854,33 +598,19 @@ def strategy_player_hr(
     )
 
     if lam <= 0:
-        return signals
+        return []
 
     pitcher_note = (
         f"  opp_{opp_throws}hr/9={opp_hr_per_9:.2f}({opp_ip:.0f}IP)"
         if opp_ip >= _MIN_PITCHER_IP else ""
     )
 
-    for m in markets:
-        title = m.get("title", "")
-        title_lower = title.lower()
-        if last_name not in title_lower:
-            continue
-
-        m_thr = re.search(r'(\d+)\+\s*home\s*run', title_lower)
-        if not m_thr:
-            log.debug("Could not parse HR threshold from %r — skipping", title)
-            continue
-        threshold = int(m_thr.group(1))
-
-        price = _market_price(m)
-        if price <= 0 or price >= 100:
-            continue
-
+    # ── Build model closure ────────────────────────────────────────────────
+    def hr_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
+        if threshold is None:
+            return None
         prob_pct = round(_poisson_ge(threshold, lam) * 100)
-        edge = prob_pct - price
-
-        sig_reason = (
+        reason = (
             f"{batter_profile.name}"
             f"  {split_hr}HR/{split_ab}AB({platoon_note})"
             f"  park={park_factor:.2f}"
@@ -889,40 +619,18 @@ def strategy_player_hr(
             f"  P({threshold}+HR)={prob_pct}%"
             f"{pitcher_note}"
         )
-        # HR-specific edge floor: require higher edge + minimum model prob
-        hr_edge_floor = max(config.min_edge_cents, _HR_MIN_EDGE_CENTS)
-        traded = edge >= hr_edge_floor and prob_pct >= _HR_MIN_MODEL_PROB
-        record_signal(
-            config.log_dir, m["ticker"], "player_hr",
-            model_prob_pct=prob_pct, market_price_cents=price,
-            edge_cents=float(edge), traded=traded, reason=sig_reason,
-        )
+        return ModelResult(prob_pct=prob_pct, reason=reason)
 
-        if edge >= hr_edge_floor and prob_pct >= _HR_MIN_MODEL_PROB:
-            count = _kelly_count(
-                edge, price,
-                config.kelly_fraction,
-                config.max_position_usd,
-                config.max_contracts_per_trade,
-            )
-            if count > 0:
-                reason = (
-                    f"{batter_profile.name}"
-                    f"  {split_hr}HR/{split_ab}AB({platoon_note})"
-                    f"  park={park_factor:.2f}"
-                    f"  λ={lam:.2f}"
-                    f"  P({threshold}+HR)={prob_pct}%"
-                    f"{pitcher_note}"
-                )
-                signals.append(TradeSignal(
-                    ticker=m["ticker"], action="buy", side="yes",
-                    count=count, price=price, strategy="player_hr",
-                    confidence=min(0.4 + edge / 100, 0.75),
-                    edge_cents=float(edge),
-                    reason=reason,
-                ))
-
-    return signals
+    spec = MarketSpec(
+        event_ticker=event_ticker,
+        strategy_name="player_hr",
+        player_name=batter_profile.name,
+        threshold_pattern=_HR_THRESHOLD_PATTERN,
+        min_model_prob=_HR_MIN_MODEL_PROB,
+        min_edge_cents=_HR_MIN_EDGE_CENTS,
+        confidence_fn=lambda e: min(0.4 + e / 100, 0.75),
+    )
+    return evaluate_markets(spec, hr_model, client, config)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -936,28 +644,13 @@ def strategy_player_hits_runs_rbis(
     client: KalshiClient,
     config: Config,
 ) -> List[TradeSignal]:
-    """Hits + Runs + RBIs prop.
-
-    Queries KXMLBHRR event markets. Bets on players with
-    strong recent offensive production.
-    """
-    signals = []
-    event_ticker = f"KXMLBHRR-{_kalshi_date(game_info)}" if _kalshi_date(game_info) else None
+    """Hits + Runs + RBIs prop — AVG bucket model via signal pipeline."""
+    d = _kalshi_date(game_info)
+    event_ticker = f"KXMLBHRR-{d}{_kalshi_team(game_info.away_abbrev)}{_kalshi_team(game_info.home_abbrev)}" if d else None
     if not event_ticker or not batter_profile:
-        return signals
+        return []
 
-    try:
-        markets = client.get_event_markets(event_ticker, min_liquidity=config.min_liquidity_dollars)
-    except Exception:
-        return signals
-
-    if not markets:
-        return signals
-
-    last_name = batter_profile.name.split()[-1].lower()
-    # Estimate probability based on recent form (use recent_avg as proxy)
     recent_avg = batter_profile.recent_avg if batter_profile.recent_avg > 0 else 0.220
-    # Rough model: recent_avg > .300 → ~55% chance of multi, < .250 → ~25%
     if recent_avg >= 0.300:
         est_prob = 55
     elif recent_avg >= 0.270:
@@ -967,31 +660,21 @@ def strategy_player_hits_runs_rbis(
     else:
         est_prob = 22
 
-    # Only consider 3+ or 4+ threshold markets
-    for m in markets:
-        title = m.get("title", "").lower()
-        if last_name not in title:
-            continue
-        # Skip low thresholds (1+, 2+) — focus on 3+ and up
-        if "1+" in title or "2+" in title:
-            continue
+    def hrr_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
+        # Skip low thresholds (1+, 2+)
+        title_lower = title.lower()
+        if "1+" in title_lower or "2+" in title_lower:
+            return None
+        reason = f"{batter_profile.name} avg={recent_avg:.3f} → est {est_prob}% vs {price}¢"
+        return ModelResult(prob_pct=est_prob, reason=reason)
 
-        price = _market_price(m)
-        if price <= 0 or price >= 100:
-            continue
-
-        edge = est_prob - price
-        if edge >= config.min_edge_cents:
-            count = _kelly_count(edge, price, config.kelly_fraction, config.max_position_usd, config.max_contracts_per_trade)
-            if count > 0:
-                signals.append(TradeSignal(
-                    ticker=m["ticker"], action="buy", side="yes",
-                    count=count, price=price, strategy="player_hr_rbis",
-                    confidence=0.45, edge_cents=edge,
-                    reason=f"{batter_profile.name} avg={recent_avg:.3f} → est {est_prob}% vs {price}¢",
-                ))
-
-    return signals
+    spec = MarketSpec(
+        event_ticker=event_ticker,
+        strategy_name="player_hr_rbis",
+        player_name=batter_profile.name,
+        confidence_fn=lambda _: 0.45,
+    )
+    return evaluate_markets(spec, hrr_model, client, config)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1095,6 +778,8 @@ def _parse_hit_threshold(title: str) -> Optional[int]:
     return None
 
 
+_HITS_THRESHOLD_PATTERN = r'(\d+)\s*\+\s*hit'
+
 def strategy_player_hits(
     game_info: GameInfo,
     pitcher_profile: PitcherProfile,
@@ -1102,85 +787,50 @@ def strategy_player_hits(
     client: KalshiClient,
     config: Config,
 ) -> List[TradeSignal]:
-    """Player hits prop — Poisson model with Bayesian shrinkage.
-
-    For each open hit-threshold market (e.g. "2+ hits"):
-      1. Compute expected hits per game (λ) from shrunk batting average,
-         platoon splits, Statcast xBA, opposing pitcher WHIP, and park factor.
-      2. Use Poisson CDF to get P(Hits ≥ threshold).
-      3. Buy YES when model probability exceeds market price by min edge.
-    """
-    signals: List[TradeSignal] = []
+    """Player hits prop — Poisson model via signal pipeline."""
     event_ticker = _hit_event(game_info)
     if not event_ticker or not batter_profile:
-        return signals
+        return []
 
-    # ── Minimum sample size ────────────────────────────────────────────────
     if batter_profile.ab < _HITS_MIN_AB:
         log.debug(
             "player_hits | %s — only %d AB (need %d) — skipping",
             batter_profile.name, batter_profile.ab, _HITS_MIN_AB,
         )
-        return signals
+        return []
 
-    try:
-        markets = client.get_event_markets(event_ticker, min_liquidity=config.min_liquidity_dollars)
-    except Exception:
-        return signals
+    opp_whip = pitcher_profile.whip if pitcher_profile else 0.0
+    opp_ip = pitcher_profile.innings_pitched if pitcher_profile else 0.0
+    opp_throws = (pitcher_profile.throws if pitcher_profile else "") or ""
 
-    if not markets:
-        return signals
-
-    last_name = batter_profile.name.split()[-1].lower()
-
-    opp_whip     = pitcher_profile.whip if pitcher_profile else 0.0
-    opp_ip       = pitcher_profile.innings_pitched if pitcher_profile else 0.0
-    opp_throws   = (pitcher_profile.throws if pitcher_profile else "") or ""
-
-    # ── Choose batting average split ───────────────────────────────────────
-    # Use platoon-specific AVG when opposing pitcher handedness is known
-    # and the batter has enough ABs against that hand.
+    # ── Platoon split selection ────────────────────────────────────────────
     if opp_throws == "L" and batter_profile.vs_lhp_ab >= 30:
-        split_h   = round(batter_profile.vs_lhp_avg * batter_profile.vs_lhp_ab)
-        split_ab  = batter_profile.vs_lhp_ab
+        split_h = round(batter_profile.vs_lhp_avg * batter_profile.vs_lhp_ab)
+        split_ab = batter_profile.vs_lhp_ab
         platoon_note = "vsL"
     elif opp_throws == "R" and batter_profile.vs_rhp_ab >= 30:
-        split_h   = round(batter_profile.vs_rhp_avg * batter_profile.vs_rhp_ab)
-        split_ab  = batter_profile.vs_rhp_ab
+        split_h = round(batter_profile.vs_rhp_avg * batter_profile.vs_rhp_ab)
+        split_ab = batter_profile.vs_rhp_ab
         platoon_note = "vsR"
     else:
-        split_h   = batter_profile.hits
-        split_ab  = batter_profile.ab
+        split_h = batter_profile.hits
+        split_ab = batter_profile.ab
         platoon_note = "overall"
 
-    # ── Base λ: Bayesian shrinkage on batting average ──────────────────────
+    # ── Compute λ ──────────────────────────────────────────────────────────
     eff_avg = _shrink_avg(split_h, split_ab)
     lam = eff_avg * _AVG_AB_PER_GAME
 
-    # ── Statcast xBA adjustment ────────────────────────────────────────────
-    # xBA (expected batting average based on exit velocity + launch angle)
-    # is a strong predictor of true talent. Blend it 30/70 with shrunk AVG
-    # to reduce noise while incorporating quality-of-contact signal.
-    xba_adj = 1.0
     if batter_profile.xba > 0:
-        # Blend: 70% shrunk AVG + 30% xBA
         blended_avg = 0.70 * eff_avg + 0.30 * batter_profile.xba
         lam = blended_avg * _AVG_AB_PER_GAME
-        xba_adj = batter_profile.xba / _LEAGUE_AVG_H_PER_AB if _LEAGUE_AVG_H_PER_AB > 0 else 1.0
 
-    # ── Opposing pitcher WHIP adjustment ───────────────────────────────────
-    # WHIP (walks + hits per inning pitched) directly measures how many
-    # baserunners a pitcher allows. Higher WHIP = more hits allowed.
-    # Only apply when pitcher has enough IP to be meaningful.
     pitcher_adj = 1.0
     if opp_whip > 0 and opp_ip >= _HITS_MIN_PITCHER_IP:
         raw_whip = opp_whip / _LEAGUE_AVG_WHIP
-        # Dampen: pull halfway toward 1.0
-        pitcher_adj = 1.0 + 0.5 * (raw_whip - 1.0)
-        pitcher_adj = min(pitcher_adj, _MAX_PITCHER_WHIP_ADJ)
+        pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), _MAX_PITCHER_WHIP_ADJ)
         lam *= pitcher_adj
 
-    # ── Park factor ────────────────────────────────────────────────────────
     home_kalshi = _kalshi_team(game_info.home_abbrev)
     park_factor = HIT_PARK_FACTORS.get(
         home_kalshi, HIT_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0),
@@ -1196,37 +846,19 @@ def strategy_player_hits(
     )
 
     if lam <= 0:
-        return signals
+        return []
 
     pitcher_note = (
         f"  opp_{opp_throws}whip={opp_whip:.2f}({opp_ip:.0f}IP)"
         if opp_ip >= _HITS_MIN_PITCHER_IP else ""
     )
 
-    # ── Score each market ──────────────────────────────────────────────────
-    for m in markets:
-        title = m.get("title", "")
-        title_lower = title.lower()
-
-        if last_name not in title_lower:
-            continue
-
-        if "hit" not in title_lower:
-            continue
-
-        threshold = _parse_hit_threshold(title)
+    # ── Build model closure ────────────────────────────────────────────────
+    def hits_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
         if threshold is None:
-            log.debug("Could not parse hit threshold from %r — skipping", title)
-            continue
-
-        price = _market_price(m)
-        if price <= 0 or price >= 100:
-            continue
-
+            return None
         prob_pct = round(_poisson_ge(threshold, lam) * 100)
-        edge = prob_pct - price
-
-        sig_reason = (
+        reason = (
             f"{batter_profile.name}"
             f"  {split_h}H/{split_ab}AB({platoon_note})"
             f"  eff_avg={eff_avg:.3f}"
@@ -1236,43 +868,20 @@ def strategy_player_hits(
             f"  P({threshold}+H)={prob_pct}%"
             f"{pitcher_note}"
         )
+        return ModelResult(prob_pct=prob_pct, reason=reason)
 
-        hits_edge_floor = max(config.min_edge_cents, _HITS_MIN_EDGE_CENTS)
-        traded = edge >= hits_edge_floor and prob_pct >= _HITS_MIN_MODEL_PROB
-        record_signal(
-            config.log_dir, m["ticker"], "player_hits",
-            model_prob_pct=prob_pct, market_price_cents=price,
-            edge_cents=float(edge), traded=traded, reason=sig_reason,
-        )
-
-        if traded:
-            count = _kelly_count(
-                edge, price,
-                config.kelly_fraction,
-                config.max_position_usd,
-                config.max_contracts_per_trade,
-            )
-            if count > 0:
-                signals.append(TradeSignal(
-                    ticker=m["ticker"], action="buy", side="yes",
-                    count=count, price=price, strategy="player_hits",
-                    confidence=min(0.4 + edge / 100, 0.80),
-                    edge_cents=float(edge),
-                    reason=sig_reason,
-                ))
-
-    # ── Limit to best 2 thresholds per batter ─────────────────────────────
-    if len(signals) > 2:
-        signals.sort(key=lambda s: s.edge_cents, reverse=True)
-        dropped = signals[2:]
-        signals = signals[:2]
-        log.info(
-            "  ✂️ player_hits | %s | kept top 2 of %d signals (dropped: %s)",
-            batter_profile.name, len(signals) + len(dropped),
-            ", ".join(f"{s.ticker.rsplit('-', 1)[-1]}" for s in dropped),
-        )
-
-    return signals
+    spec = MarketSpec(
+        event_ticker=event_ticker,
+        strategy_name="player_hits",
+        title_keywords=["hit"],
+        player_name=batter_profile.name,
+        threshold_pattern=_HITS_THRESHOLD_PATTERN,
+        min_model_prob=_HITS_MIN_MODEL_PROB,
+        min_edge_cents=_HITS_MIN_EDGE_CENTS,
+        max_signals=2,
+        confidence_fn=lambda e: min(0.4 + e / 100, 0.80),
+    )
+    return evaluate_markets(spec, hits_model, client, config)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1371,12 +980,30 @@ def _dedupe_legs(legs: List[ComboLeg]) -> List[ComboLeg]:
     return list(seen.values())
 
 
+def _player_slug(market_ticker: str) -> Optional[str]:
+    """Extract the player slug from a market ticker.
+
+    Market tickers follow: {EVENT}-{DATE_TEAMS}-{PLAYER_SLUG}-{THRESHOLD}
+    e.g.  KXMLBHIT-26MAY231605CLEPHI-PHIKSCHWARBER12-3
+          -> player slug = "PHIKSCHWARBER12"
+
+    Returns None for game-level markets that have no player slug.
+    """
+    parts = market_ticker.split("-")
+    if len(parts) >= 4:
+        return parts[2]
+    return None
+
+
 def _legs_are_valid_combo(legs: List[ComboLeg]) -> bool:
     """Check that a set of legs forms a valid combo.
 
     Rules:
       - At least 2 legs
-      - No two legs from the exact same market (different thresholds OK)
+      - No two legs from the exact same market ticker
+      - No two legs for the same player within the same event type
+        (e.g. Schwarber 2+ hits and 3+ hits are nested thresholds
+        and Kalshi rejects the combination)
       - Game-level events (GAME, SPREAD, TOTAL, RFI) limited to 1 per type
     """
     if len(legs) < 2:
@@ -1386,6 +1013,20 @@ def _legs_are_valid_combo(legs: List[ComboLeg]) -> bool:
     tickers = [leg.market_ticker for leg in legs]
     if len(set(tickers)) != len(tickers):
         return False
+
+    # No two legs for the same player in the same event type.
+    # The key is (event_type, player_slug) — if two legs share both,
+    # they are different thresholds for the same player prop and Kalshi
+    # will reject the combination.
+    player_event_keys: set = set()
+    for leg in legs:
+        event_type = leg.event_ticker.split("-")[0]
+        slug = _player_slug(leg.market_ticker)
+        if slug:
+            key = (event_type, slug)
+            if key in player_event_keys:
+                return False
+            player_event_keys.add(key)
 
     # Game-level events: max 1 per event type
     game_level_types = {"KXMLBGAME", "KXMLBSPREAD", "KXMLBTOTAL", "KXMLBRFI"}
@@ -1449,6 +1090,293 @@ def build_combo_legs(
     return _dedupe_legs(legs)
 
 
+# ── Direct leg sourcing for combos ────────────────────────────────────────────
+# These functions scan markets and build ComboLeg candidates using the same
+# probability models as the single-leg strategies, but with relaxed edge
+# thresholds.  A leg that isn't worth trading solo (e.g. game winner at 2c
+# edge) can still add value inside a combo.
+
+_COMBO_LEG_MIN_PROB = 20   # legs below 20% prob produce very low joint probs
+
+
+def _source_game_winner_leg(
+    game_info: GameInfo,
+    away_pitcher: Optional[PitcherProfile],
+    home_pitcher: Optional[PitcherProfile],
+    client: KalshiClient,
+    config: Config,
+) -> List[ComboLeg]:
+    """Source a game-winner leg by picking the favoured team.
+
+    Uses both pitchers' recent ERA to estimate each side's win probability,
+    then returns the side (home or away) with the higher model probability.
+    """
+    legs: List[ComboLeg] = []
+    event_ticker = _game_base(game_info)
+    if not event_ticker:
+        return legs
+
+    try:
+        markets = client.get_event_markets(event_ticker, min_liquidity=0)
+    except Exception:
+        return legs
+
+    if not markets:
+        return legs
+
+    # Estimate win probability from pitcher matchup
+    home_era = home_pitcher.recent_era if home_pitcher and home_pitcher.recent_era else 4.50
+    away_era = away_pitcher.recent_era if away_pitcher and away_pitcher.recent_era else 4.50
+
+    # Better (lower) ERA = higher win probability.  Scale relative to
+    # combined ERA with a home-field advantage baseline of 54%.
+    total_era = home_era + away_era
+    if total_era > 0:
+        # Fraction of "badness" belonging to the away pitcher
+        away_frac = away_era / total_era
+        # away_frac=0.6 means away pitcher is worse → home more likely to win
+        home_prob = round(40 + away_frac * 25)  # range ~45-60%
+    else:
+        home_prob = 54
+
+    # Cap to reasonable range
+    home_prob = max(40, min(65, home_prob))
+    away_prob = 100 - home_prob
+
+    home_kalshi = _kalshi_team(game_info.home_abbrev)
+    away_kalshi = _kalshi_team(game_info.away_abbrev)
+
+    for m in markets:
+        price = _market_price(m)
+        if price <= 0 or price >= 100:
+            continue
+        ticker = m.get("ticker", "")
+
+        if ticker.upper().endswith(f"-{home_kalshi}"):
+            model_prob = home_prob
+            label = f"{game_info.home_team} win"
+        elif ticker.upper().endswith(f"-{away_kalshi}"):
+            model_prob = away_prob
+            label = f"{game_info.away_team} win"
+        else:
+            continue
+
+        if model_prob < _COMBO_LEG_MIN_PROB:
+            continue
+
+        legs.append(ComboLeg(
+            market_ticker=ticker,
+            event_ticker=event_ticker,
+            side="yes",
+            model_prob_pct=model_prob,
+            market_price=price,
+            edge_cents=model_prob - price,
+            strategy="game_winner",
+            label=label,
+        ))
+
+    # Keep only the favoured side (highest model prob)
+    if legs:
+        legs.sort(key=lambda l: l.model_prob_pct, reverse=True)
+        legs = [legs[0]]
+
+    return legs
+
+
+def _source_pitcher_ks_legs(
+    game_info: GameInfo,
+    pitchers: List[PitcherProfile],
+    client: KalshiClient,
+    config: Config,
+) -> List[ComboLeg]:
+    """Source pitcher strikeout legs using the Poisson model.
+
+    Picks the single best K threshold per pitcher (highest edge).
+    """
+    legs: List[ComboLeg] = []
+    event_ticker = _ks_event(game_info)
+    if not event_ticker:
+        return legs
+
+    try:
+        markets = client.get_event_markets(event_ticker, min_liquidity=0)
+    except Exception:
+        return legs
+
+    if not markets:
+        return legs
+
+    for pitcher in pitchers:
+        if not pitcher or (pitcher.k_per_9 == 0 and pitcher.recent_k_per_start == 0):
+            continue
+
+        # Get opponent K rate
+        opp_k_rate = 0.0
+        try:
+            if pitcher.player_id == game_info.away_pitcher_id:
+                opp_abbrev = game_info.home_abbrev
+            else:
+                opp_abbrev = game_info.away_abbrev
+            opp_team = get_team_profile(opp_abbrev)
+            opp_k_rate = opp_team.k_rate
+        except Exception:
+            pass
+
+        lam = _expected_ks(pitcher, opp_k_rate)
+        if lam <= 0:
+            continue
+
+        pitcher_last = pitcher.name.split()[-1].lower() if pitcher.name else ""
+        best_leg: Optional[ComboLeg] = None
+
+        for m in markets:
+            title = m.get("title", "").lower()
+            if "strikeout" not in title and "k+" not in title and " ks" not in title:
+                continue
+            if pitcher_last and pitcher_last not in title:
+                continue
+
+            price = _market_price(m)
+            if price <= 0 or price >= 100:
+                continue
+
+            threshold = _parse_k_threshold(m.get("title", ""))
+            if threshold is None or threshold < _KS_MIN_THRESHOLD:
+                continue
+
+            prob_pct = round(_poisson_ge(threshold, lam) * 100)
+            if prob_pct < _COMBO_LEG_MIN_PROB:
+                continue
+
+            edge = prob_pct - price
+            ticker = m.get("ticker", "")
+
+            if best_leg is None or edge > best_leg.edge_cents:
+                best_leg = ComboLeg(
+                    market_ticker=ticker,
+                    event_ticker=event_ticker,
+                    side="yes",
+                    model_prob_pct=prob_pct,
+                    market_price=price,
+                    edge_cents=edge,
+                    strategy="pitcher_ks",
+                    label=f"{pitcher.name} {threshold}+ Ks",
+                )
+
+        if best_leg:
+            legs.append(best_leg)
+
+    return legs
+
+
+def _source_player_hits_legs(
+    game_info: GameInfo,
+    batter_pitcher_pairs: List[Tuple],
+    client: KalshiClient,
+    config: Config,
+) -> List[ComboLeg]:
+    """Source player hit legs using the Poisson model.
+
+    Picks the single best hit threshold per batter (highest edge).
+    Only considers batters with enough ABs and model probability.
+    """
+    legs: List[ComboLeg] = []
+    event_ticker = _hit_event(game_info)
+    if not event_ticker:
+        return legs
+
+    try:
+        markets = client.get_event_markets(event_ticker, min_liquidity=0)
+    except Exception:
+        return legs
+
+    if not markets:
+        return legs
+
+    for batter, opp_pitcher in batter_pitcher_pairs:
+        if not batter or batter.ab < _HITS_MIN_AB:
+            continue
+
+        opp_whip = opp_pitcher.whip if opp_pitcher else 0.0
+        opp_ip = opp_pitcher.innings_pitched if opp_pitcher else 0.0
+        opp_throws = (opp_pitcher.throws if opp_pitcher else "") or ""
+
+        # Choose split
+        if opp_throws == "L" and batter.vs_lhp_ab >= 30:
+            split_h = round(batter.vs_lhp_avg * batter.vs_lhp_ab)
+            split_ab = batter.vs_lhp_ab
+        elif opp_throws == "R" and batter.vs_rhp_ab >= 30:
+            split_h = round(batter.vs_rhp_avg * batter.vs_rhp_ab)
+            split_ab = batter.vs_rhp_ab
+        else:
+            split_h = batter.hits
+            split_ab = batter.ab
+
+        eff_avg = _shrink_avg(split_h, split_ab)
+        lam = eff_avg * _AVG_AB_PER_GAME
+
+        # xBA blend
+        if batter.xba > 0:
+            blended_avg = 0.70 * eff_avg + 0.30 * batter.xba
+            lam = blended_avg * _AVG_AB_PER_GAME
+
+        # Pitcher WHIP adjustment
+        if opp_whip > 0 and opp_ip >= _HITS_MIN_PITCHER_IP:
+            raw_whip = opp_whip / _LEAGUE_AVG_WHIP
+            pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), _MAX_PITCHER_WHIP_ADJ)
+            lam *= pitcher_adj
+
+        # Park factor
+        home_kalshi = _kalshi_team(game_info.home_abbrev)
+        park_factor = HIT_PARK_FACTORS.get(
+            home_kalshi, HIT_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0),
+        )
+        lam *= park_factor
+
+        if lam <= 0:
+            continue
+
+        last_name = batter.name.split()[-1].lower()
+        best_leg: Optional[ComboLeg] = None
+
+        for m in markets:
+            title = m.get("title", "").lower()
+            if last_name not in title or "hit" not in title:
+                continue
+
+            price = _market_price(m)
+            if price <= 0 or price >= 100:
+                continue
+
+            threshold = _parse_hit_threshold(m.get("title", ""))
+            if threshold is None:
+                continue
+
+            prob_pct = round(_poisson_ge(threshold, lam) * 100)
+            if prob_pct < _COMBO_LEG_MIN_PROB:
+                continue
+
+            edge = prob_pct - price
+            ticker = m.get("ticker", "")
+
+            if best_leg is None or edge > best_leg.edge_cents:
+                best_leg = ComboLeg(
+                    market_ticker=ticker,
+                    event_ticker=event_ticker,
+                    side="yes",
+                    model_prob_pct=prob_pct,
+                    market_price=price,
+                    edge_cents=edge,
+                    strategy="player_hits",
+                    label=f"{batter.name} {threshold}+ hits",
+                )
+
+        if best_leg:
+            legs.append(best_leg)
+
+    return legs
+
+
 def generate_combos(
     legs: List[ComboLeg],
     max_legs: int = _COMBO_MAX_LEGS,
@@ -1475,50 +1403,56 @@ def generate_combos(
 
 def strategy_combo(
     game_info: GameInfo,
-    single_leg_signals: List[TradeSignal],
     client: KalshiClient,
     config: Config,
+    away_pitcher: Optional[PitcherProfile] = None,
+    home_pitcher: Optional[PitcherProfile] = None,
+    batter_pitcher_pairs: Optional[List[Tuple]] = None,
+    single_leg_signals: Optional[List[TradeSignal]] = None,
 ) -> List[TradeSignal]:
     """Same-game combo (parlay) strategy.
 
-    Takes the single-leg signals already found for this game, selects the
-    best 2-3 leg combinations, creates the combo market on Kalshi via the
-    Multivariate Event Collection API, and returns TradeSignals if the
-    combo market price offers edge.
+    Sources legs directly from live markets across three prop types:
+      - Game winner (favoured team from pitcher ERA matchup)
+      - Pitcher strikeouts (Poisson model, best threshold per pitcher)
+      - Player hits (Poisson model, best threshold per batter)
 
-    This strategy does NOT use the standard strategy function signature
-    (it needs all signals, not one pitcher/batter at a time), so it is
-    called separately in process_game() rather than through the STRATEGIES
-    registry.
+    Also incorporates any existing single-leg signals from other strategies.
+    Builds 2-3 leg combos mixing different prop types, creates the combo
+    market on Kalshi via the MVE API, and returns TradeSignals if edge exists.
 
-    Args:
-        game_info: The game being processed
-        single_leg_signals: All TradeSignals generated by single-leg
-                            strategies for this game (pitcher + batter)
-        client: Kalshi API client
-        config: Bot configuration
-
-    Returns:
-        List of TradeSignals for combo markets to trade.
+    This strategy is called separately in process_game() rather than
+    through the STRATEGIES registry.
     """
     signals: List[TradeSignal] = []
 
-    if not single_leg_signals or len(single_leg_signals) < 2:
-        return signals
+    # ── Source legs from each prop type ─────────────────────────────────────
+    pitchers = [p for p in [away_pitcher, home_pitcher] if p]
 
-    # ── Build eligible legs from single-leg signals ────────────────────────
-    legs = build_combo_legs(game_info, single_leg_signals, client, config)
-    if len(legs) < 2:
+    gw_legs = _source_game_winner_leg(game_info, away_pitcher, home_pitcher, client, config)
+    ks_legs = _source_pitcher_ks_legs(game_info, pitchers, client, config) if pitchers else []
+    hit_legs = _source_player_hits_legs(game_info, batter_pitcher_pairs or [], client, config)
+
+    # Also pull in any single-leg signal candidates
+    signal_legs = build_combo_legs(game_info, single_leg_signals or [], client, config)
+
+    # Merge all legs, deduplicating by market_ticker (keep highest edge)
+    all_legs = _dedupe_legs(gw_legs + ks_legs + hit_legs + signal_legs)
+
+    if len(all_legs) < 2:
         log.debug("combo | %s@%s — only %d eligible legs, need 2+",
-                  game_info.away_abbrev, game_info.home_abbrev, len(legs))
+                  game_info.away_abbrev, game_info.home_abbrev, len(all_legs))
         return signals
 
-    log.info("  🎰 combo | %d eligible legs for %s@%s",
-             len(legs), game_info.away_abbrev, game_info.home_abbrev)
+    legs = all_legs
+
+    log.info("  🎰 combo | %d eligible legs for %s@%s  (GW:%d KS:%d HIT:%d SIG:%d)",
+             len(legs), game_info.away_abbrev, game_info.home_abbrev,
+             len(gw_legs), len(ks_legs), len(hit_legs), len(signal_legs))
     for leg in legs:
-        log.debug("    Leg: %s %s  prob=%d%%  edge=%+d¢  [%s]",
+        log.debug("    Leg: %s %s  prob=%d%%  edge=%+d¢  [%s] %s",
                   leg.side, leg.market_ticker, leg.model_prob_pct,
-                  leg.edge_cents, leg.strategy)
+                  leg.edge_cents, leg.strategy, leg.label)
 
     # ── Generate and score combo candidates ────────────────────────────────
     max_legs = min(_COMBO_MAX_LEGS, getattr(config, "combo_max_legs", _COMBO_MAX_LEGS))
@@ -1526,7 +1460,24 @@ def strategy_combo(
     if not combos:
         return signals
 
-    log.debug("  combo | Generated %d candidate combos", len(combos))
+    # Prefer combos that mix different strategy types (e.g. game_winner +
+    # pitcher_ks + player_hits) over same-type combos. Count distinct
+    # strategies in each combo and use that as the primary sort key.
+    def _combo_sort_key(combo: List[ComboLeg]) -> Tuple:
+        n_types = len(set(leg.strategy for leg in combo))
+        joint = _combo_joint_prob(combo)
+        return (n_types, joint)
+
+    combos.sort(key=_combo_sort_key, reverse=True)
+
+    # Cap total combos evaluated to avoid API spam on empty orderbooks.
+    # Cross-type combos are sorted first, so we'll always try those.
+    _MAX_COMBOS_TO_EVALUATE = 15
+    if len(combos) > _MAX_COMBOS_TO_EVALUATE:
+        combos = combos[:_MAX_COMBOS_TO_EVALUATE]
+
+    log.debug("  combo | Generated %d candidate combos (evaluating top %d)",
+              len(combos), min(len(combos), _MAX_COMBOS_TO_EVALUATE))
 
     combos_placed = 0
     for combo in combos:
@@ -1638,7 +1589,7 @@ def strategy_combo(
 
         # ── Size the position (reduced Kelly for higher-variance combos) ───
         combo_kelly = config.kelly_fraction * _COMBO_MAX_POSITION_SCALE
-        count = _kelly_count(
+        count = kelly_count(
             edge, trade_price,
             combo_kelly,
             config.max_position_usd,
