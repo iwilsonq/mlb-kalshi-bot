@@ -29,8 +29,8 @@ from slugger.tickers import (
     hr_event_ticker, total_event_ticker, hit_event_ticker, hrr_event_ticker,
 )
 from slugger.types import (
-    BatterProfile, GameInfo, MarketClient, MarketSpec, ModelResult,
-    PitcherProfile, TeamProfile, TradeSignal,
+    BatterProfile, GameContext, GameInfo, MarketClient, MarketSpec,
+    ModelResult, PitcherProfile, TeamProfile, TradeSignal,
 )
 
 log = logging.getLogger(__name__)
@@ -1151,11 +1151,124 @@ def strategy_combo(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  STRATEGY REGISTRY
+#  UNIFIED STRATEGY WRAPPERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Each wrapper has the uniform StrategyFn signature:
+#   (ctx: GameContext, client: MarketClient, config: Config,
+#    prior_signals: List[TradeSignal]) -> List[TradeSignal]
+#
+# Internally they delegate to the per-pitcher or per-batter functions above,
+# iterating over the relevant profiles from the GameContext.
+
+
+def _run_game_winner(
+    ctx: GameContext, client: MarketClient, config: Config,
+    prior_signals: List[TradeSignal],
+) -> List[TradeSignal]:
+    return strategy_game_winner(
+        ctx.game, client, config,
+        home_pitcher=ctx.home_pitcher,
+        away_pitcher=ctx.away_pitcher,
+        home_team=ctx.home_team,
+        away_team=ctx.away_team,
+    )
+
+
+def _run_per_pitcher(
+    fn,
+    ctx: GameContext, client: MarketClient, config: Config,
+) -> List[TradeSignal]:
+    """Call a pitcher-level strategy for each pitcher in the context."""
+    signals: List[TradeSignal] = []
+    for pitcher in [ctx.away_pitcher, ctx.home_pitcher]:
+        if pitcher:
+            signals.extend(fn(ctx.game, pitcher, None, client, config))
+    return signals
+
+
+def _run_per_batter(
+    fn,
+    ctx: GameContext, client: MarketClient, config: Config,
+) -> List[TradeSignal]:
+    """Call a batter-level strategy for each batter vs opposing pitcher."""
+    signals: List[TradeSignal] = []
+    # away batters face home pitcher; home batters face away pitcher
+    for batter in ctx.away_batters:
+        signals.extend(fn(ctx.game, ctx.home_pitcher, batter, client, config))
+    for batter in ctx.home_batters:
+        signals.extend(fn(ctx.game, ctx.away_pitcher, batter, client, config))
+    return signals
+
+
+def _run_pitcher_ks(
+    ctx: GameContext, client: MarketClient, config: Config,
+    prior_signals: List[TradeSignal],
+) -> List[TradeSignal]:
+    return _run_per_pitcher(strategy_pitcher_ks, ctx, client, config)
+
+
+def _run_total_runs(
+    ctx: GameContext, client: MarketClient, config: Config,
+    prior_signals: List[TradeSignal],
+) -> List[TradeSignal]:
+    return _run_per_pitcher(strategy_total_runs, ctx, client, config)
+
+
+def _run_player_hr(
+    ctx: GameContext, client: MarketClient, config: Config,
+    prior_signals: List[TradeSignal],
+) -> List[TradeSignal]:
+    return _run_per_batter(strategy_player_hr, ctx, client, config)
+
+
+def _run_player_hits(
+    ctx: GameContext, client: MarketClient, config: Config,
+    prior_signals: List[TradeSignal],
+) -> List[TradeSignal]:
+    return _run_per_batter(strategy_player_hits, ctx, client, config)
+
+
+def _run_player_hr_rbis(
+    ctx: GameContext, client: MarketClient, config: Config,
+    prior_signals: List[TradeSignal],
+) -> List[TradeSignal]:
+    return _run_per_batter(strategy_player_hits_runs_rbis, ctx, client, config)
+
+
+def _run_combo(
+    ctx: GameContext, client: MarketClient, config: Config,
+    prior_signals: List[TradeSignal],
+) -> List[TradeSignal]:
+    return strategy_combo(ctx.game, client, config, single_leg_signals=prior_signals)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  STRATEGY PIPELINE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Ordered list of (name, strategy_fn) pairs.  process_game() iterates through
+# this list in order, feeding each strategy's output into the next as
+# prior_signals.  Combo runs last so it can see all single-leg signals.
+#
+# To add a new strategy: define the function, write a wrapper, add it here.
+# No changes to game_processor.py needed.
+
+STRATEGY_PIPELINE: List[Tuple[str, Any]] = [
+    ("game_winner",   _run_game_winner),
+    ("pitcher_ks",    _run_pitcher_ks),
+    ("total_runs",    _run_total_runs),
+    ("player_hr",     _run_player_hr),
+    ("player_hits",   _run_player_hits),
+    ("player_hr_rbis", _run_player_hr_rbis),
+    ("combo",         _run_combo),
+]
+
+
+# ── Legacy exports (backward compatibility) ───────────────────────────────────
+# Kept so any code referencing the old registry or set still works.
 
 STRATEGIES = {
-    # game_winner is called directly by process_game (needs both pitchers + teams)
     "pitcher_ks":     strategy_pitcher_ks,
     "player_hr":      strategy_player_hr,
     "player_hits":    strategy_player_hits,
@@ -1163,6 +1276,4 @@ STRATEGIES = {
     "player_hr_rbis": strategy_player_hits_runs_rbis,
 }
 
-# Strategies that are called once per *batter* (require a BatterProfile).
-# All other strategies are called once per *game* (require a PitcherProfile).
 BATTER_STRATEGIES: set = {"player_hr", "player_hr_rbis", "player_hits"}

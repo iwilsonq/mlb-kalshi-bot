@@ -20,7 +20,7 @@ import requests
 from slugger.config import Config
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
 from slugger.signal_pipeline import load_calibration
-from slugger.strategies import BATTER_STRATEGIES, STRATEGIES, strategy_combo, strategy_game_winner
+from slugger.strategies import STRATEGY_PIPELINE
 from slugger.tickers import game_event_ticker
 from slugger.types import GameContext, GameInfo, MarketClient, TradeSignal
 import slugger.journal as journal
@@ -312,13 +312,16 @@ def process_game(
         log.info("  ⛔ Game has started (past scheduled time + buffer) — skipping entirely")
         return
 
-    away_pitch = ctx.away_pitcher
-    home_pitch = ctx.home_pitcher
     log.info(
         "  Pitchers: %s vs %s",
-        away_pitch.name if away_pitch else "TBD",
-        home_pitch.name if home_pitch else "TBD",
+        ctx.away_pitcher.name if ctx.away_pitcher else "TBD",
+        ctx.home_pitcher.name if ctx.home_pitcher else "TBD",
     )
+    if ctx.away_batters or ctx.home_batters:
+        log.info(
+            "  Lineups: %d away batters, %d home batters confirmed",
+            len(ctx.away_batters), len(ctx.home_batters),
+        )
 
     # Effective bankroll cap
     effective_bankroll = min(bankroll_usd, config.max_position_usd)
@@ -329,14 +332,6 @@ def process_game(
             bankroll_usd, config.max_position_usd, effective_bankroll,
         )
 
-    # game_winner has its own call path (needs both pitchers + teams)
-    _SPECIAL_STRATEGIES = {"game_winner", "combo"}
-    pitcher_strats = [
-        s for s in config.enabled_strategies
-        if s not in BATTER_STRATEGIES and s not in _SPECIAL_STRATEGIES
-    ]
-    batter_strats  = [s for s in config.enabled_strategies if s in BATTER_STRATEGIES]
-
     any_signals = False
 
     # ── Per-game risk budget ───────────────────────────────────────────────
@@ -345,94 +340,23 @@ def process_game(
         max_exposure_usd=config.max_exposure_per_game_usd,
     )
 
-    # Collect all single-leg signals for potential combo use later
-    all_single_leg_signals: List[TradeSignal] = []
+    # Accumulated signals from all prior strategies — fed to each subsequent
+    # strategy so combo (last in the pipeline) can see all single-leg signals.
+    all_prior_signals: List[TradeSignal] = []
 
-    # ── Game winner (full-game strategy, needs both pitchers + teams) ─────
-    if "game_winner" in config.enabled_strategies and not circuit.is_tripped():
-        gw_signals = strategy_game_winner(
-            game, client, config,
-            home_pitcher=home_pitch,
-            away_pitcher=away_pitch,
-            home_team=ctx.home_team,
-            away_team=ctx.away_team,
-        )
-        all_single_leg_signals.extend(gw_signals)
-        if execute_signals(
-            gw_signals, client, config, circuit,
-            effective_bankroll, held_tickers, placed_tickers,
-            budget=budget,
-        ):
-            any_signals = True
-
-    # ── Pitcher / game-level strategies (run once per pitcher) ────────────
-    pitchers = [p for p in [away_pitch, home_pitch] if p]
-
-    for strat_name in pitcher_strats:
+    # ── Run strategy pipeline in order ─────────────────────────────────────
+    enabled = set(config.enabled_strategies)
+    for strat_name, strat_fn in STRATEGY_PIPELINE:
+        if strat_name not in enabled:
+            continue
         if circuit.is_tripped():
             log.warning("⚡ Circuit breaker tripped — stopping")
             return
 
-        strategy = STRATEGIES.get(strat_name)
-        if not strategy:
-            log.warning("Unknown strategy: %s", strat_name)
-            continue
-
-        for pitcher in pitchers:
-            signals = strategy(game, pitcher, None, client, config)
-            all_single_leg_signals.extend(signals)
-            if execute_signals(
-                signals, client, config, circuit,
-                effective_bankroll, held_tickers, placed_tickers,
-                budget=budget,
-            ):
-                any_signals = True
-
-    # ── Batter / player-prop strategies (run once per batter) ─────────────
-    away_batters = ctx.away_batters
-    home_batters = ctx.home_batters
-    batter_pitcher_pairs: List[tuple] = []
-
-    if batter_strats:
-        # away batters face the home pitcher; home batters face the away pitcher
-        batter_pitcher_pairs = (
-            [(b, home_pitch) for b in away_batters]
-            + [(b, away_pitch) for b in home_batters]
-        )
-
-        if not batter_pitcher_pairs:
-            log.info("  Skipping batter strategies — lineups not yet posted")
-        else:
-            if away_batters or home_batters:
-                log.info(
-                    "  Lineups: %d away batters, %d home batters confirmed",
-                    len(away_batters), len(home_batters),
-                )
-            for batter, opp_pitcher in batter_pitcher_pairs:
-                if circuit.is_tripped():
-                    log.warning("⚡ Circuit breaker tripped — stopping")
-                    return
-                for strat_name in batter_strats:
-                    strategy = STRATEGIES.get(strat_name)
-                    if not strategy:
-                        continue
-                    signals = strategy(game, opp_pitcher, batter, client, config)
-                    all_single_leg_signals.extend(signals)
-                    if execute_signals(
-                        signals, client, config, circuit,
-                        effective_bankroll, held_tickers, placed_tickers,
-                        budget=budget,
-                    ):
-                        any_signals = True
-
-    # ── Combo / parlay strategy ───────────────────────────────────────────
-    if "combo" in config.enabled_strategies and not circuit.is_tripped():
-        combo_signals = strategy_combo(
-            game, client, config,
-            single_leg_signals=all_single_leg_signals,
-        )
+        signals = strat_fn(ctx, client, config, all_prior_signals)
+        all_prior_signals.extend(signals)
         if execute_signals(
-            combo_signals, client, config, circuit,
+            signals, client, config, circuit,
             effective_bankroll, held_tickers, placed_tickers,
             budget=budget,
         ):

@@ -331,3 +331,18 @@ class MarketSpec:
 #   (market_title, threshold_or_none, market_price_cents) -> ModelResult or None
 #   Return None to skip this market entirely.
 ModelFn = Callable[[str, Optional[int], int], Optional[ModelResult]]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  STRATEGY TYPES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Unified strategy callable type:
+#   (ctx: GameContext, client: MarketClient, config, prior_signals) -> List[TradeSignal]
+# Every strategy receives the full GameContext plus accumulated prior signals
+# (empty for the first strategy, growing as each strategy runs).
+# `config` is typed as Any here to avoid importing Config into the leaf types module.
+StrategyFn = Callable[
+    [GameContext, MarketClient, Any, List[TradeSignal]],
+    List[TradeSignal],
+]
