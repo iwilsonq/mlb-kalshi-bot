@@ -1169,9 +1169,45 @@ _COMBO_MIN_LEG_PROB       = 10     # each leg must have >= this model prob (%) t
 _COMBO_MIN_COMBO_EDGE     = 3      # minimum edge on the combo itself (cents)
 _COMBO_MIN_COMBO_PROB     = 3      # minimum joint model probability (%) to bother
 _COMBO_MAX_LEGS           = 3      # maximum number of legs per combo
-_COMBO_CORRELATION_PENALTY = 0.92  # multiply joint prob by this per extra leg (dampener)
 _COMBO_MAX_COMBOS_PER_GAME = 2     # don't flood with combo orders
 _COMBO_MAX_POSITION_SCALE  = 0.5   # use half normal Kelly for combos (higher variance)
+
+# ── Pairwise correlation adjustments ─────────────────────────────────────────
+# When two legs are correlated, the naive product P(A)*P(B) over- or under-
+# estimates the true joint probability.  These adjustments are applied per
+# pair of legs based on their relationship.
+#
+# Values > 1.0 = positive correlation (events reinforce each other, naive
+#   product UNDERESTIMATES joint prob, so we nudge UP)
+# Values < 1.0 = negative correlation (events oppose each other, naive
+#   product OVERESTIMATES joint prob, so we nudge DOWN)
+# Value = 1.0 = independent (no adjustment needed)
+#
+# These are empirical estimates from MLB game-level correlations.
+
+# Pitcher dominance + team win: strong positive correlation.
+# A pitcher who gets 8+ Ks is likely pitching well, helping his team win.
+_CORR_PITCHER_TEAM_WIN     = 1.08
+
+# Batter performance + team win: moderate positive correlation.
+# A batter who gets 2+ hits is contributing to offense = team more likely to win.
+_CORR_BATTER_TEAM_WIN      = 1.05
+
+# Pitcher Ks + opposing batter hits: negative correlation.
+# If the pitcher is dominating (high Ks), opposing batters struggle to get hits.
+_CORR_PITCHER_VS_OPP_BATTER = 0.88
+
+# Pitcher Ks + total runs over: moderate negative correlation.
+# High-K games tend to be lower-scoring (pitcher dominance suppresses runs).
+_CORR_PITCHER_KS_TOTAL_OVER = 0.90
+
+# Same-team batters: weak positive correlation.
+# Both benefit from the same game flow (rallies), but individual outcomes
+# are mostly independent given the game state.
+_CORR_SAME_TEAM_BATTERS     = 1.02
+
+# Default: mild negative adjustment (conservative, like original 0.92).
+_CORR_DEFAULT               = 0.95
 
 
 @dataclass
@@ -1201,25 +1237,130 @@ def _event_ticker_for_market(market_ticker: str) -> str:
     return market_ticker
 
 
+def _leg_team(leg: ComboLeg) -> Optional[str]:
+    """Extract the team abbreviation associated with a combo leg.
+
+    For game_winner legs, the team is in the market ticker suffix (e.g. "-LAD").
+    For player props, the team is encoded in the player slug portion
+    of the ticker (first 2-3 chars of the slug, e.g. "PHIKSCHWARBER12" → "PHI").
+
+    Returns None if team cannot be determined.
+    """
+    parts = leg.market_ticker.split("-")
+    if leg.strategy == "game_winner" and len(parts) >= 3:
+        # Game winner: last segment is the team (e.g. "LAD")
+        return parts[-1].upper()
+    if len(parts) >= 4:
+        # Player prop: slug is parts[2], team prefix is first 2-3 chars
+        # e.g. KXMLBKS-26MAY...-CHCCREA53-7 → slug "CHCCREA53" → team "CHC" or "CHW"
+        slug = parts[2].upper()
+        # Try 3-char then 2-char prefix (most teams are 2-3 chars)
+        for n in (3, 2):
+            if len(slug) > n:
+                return slug[:n]
+    return None
+
+
+def _event_type(leg: ComboLeg) -> str:
+    """Extract the event type prefix from a leg's event ticker.
+
+    e.g. "KXMLBKS-26MAY..." → "KXMLBKS"
+         "KXMLBGAME-26MAY..." → "KXMLBGAME"
+    """
+    return leg.event_ticker.split("-")[0] if leg.event_ticker else ""
+
+
+def _pairwise_correlation(leg_a: ComboLeg, leg_b: ComboLeg) -> float:
+    """Compute the correlation adjustment factor for a pair of legs.
+
+    Returns a multiplier to apply to the naive independence product:
+      > 1.0 = positive correlation (reinforce each other)
+      < 1.0 = negative correlation (conflict with each other)
+      = 1.0 = independent
+
+    Uses strategy types and team affiliations to determine the relationship.
+    """
+    type_a = _event_type(leg_a)
+    type_b = _event_type(leg_b)
+    team_a = _leg_team(leg_a)
+    team_b = _leg_team(leg_b)
+    strat_a = leg_a.strategy
+    strat_b = leg_b.strategy
+
+    # Determine if teams are the same, opposing, or unknown
+    same_team = team_a and team_b and team_a == team_b
+    # Can't reliably determine "opposing" without the full game context,
+    # but if both teams are known and different, they're on opposite sides
+    opposing = team_a and team_b and team_a != team_b
+
+    # ── Pitcher Ks + Game Winner ──────────────────────────────────────────
+    if {"pitcher_ks", "game_winner"} == {strat_a, strat_b}:
+        # Pitcher Ks and his team winning are positively correlated
+        # (dominant pitcher helps team win)
+        if same_team:
+            return _CORR_PITCHER_TEAM_WIN
+        # Pitcher Ks and opposing team winning are negatively correlated
+        if opposing:
+            return 1.0 / _CORR_PITCHER_TEAM_WIN  # inverse
+
+    # ── Batter Hits/HR + Game Winner ──────────────────────────────────────
+    batter_strats = {"player_hits", "player_hr", "player_hr_rbis"}
+    if strat_a in batter_strats and strat_b == "game_winner":
+        if same_team:
+            return _CORR_BATTER_TEAM_WIN
+        if opposing:
+            return 1.0 / _CORR_BATTER_TEAM_WIN
+    if strat_b in batter_strats and strat_a == "game_winner":
+        if same_team:
+            return _CORR_BATTER_TEAM_WIN
+        if opposing:
+            return 1.0 / _CORR_BATTER_TEAM_WIN
+
+    # ── Pitcher Ks + Opposing Batter Hits ─────────────────────────────────
+    if strat_a == "pitcher_ks" and strat_b in batter_strats and opposing:
+        return _CORR_PITCHER_VS_OPP_BATTER
+    if strat_b == "pitcher_ks" and strat_a in batter_strats and opposing:
+        return _CORR_PITCHER_VS_OPP_BATTER
+
+    # ── Pitcher Ks + Total Runs Over ──────────────────────────────────────
+    if {"pitcher_ks", "total_runs"} == {strat_a, strat_b}:
+        return _CORR_PITCHER_KS_TOTAL_OVER
+
+    # ── Same-team batters ─────────────────────────────────────────────────
+    if strat_a in batter_strats and strat_b in batter_strats and same_team:
+        return _CORR_SAME_TEAM_BATTERS
+
+    # ── Default ───────────────────────────────────────────────────────────
+    return _CORR_DEFAULT
+
+
 def _combo_joint_prob(legs: List[ComboLeg]) -> float:
-    """Compute joint probability for a combo.
+    """Compute joint probability for a combo using pairwise correlation.
 
     Starts with the product of individual leg probabilities (independence
-    assumption), then applies a correlation penalty for each leg beyond
-    the first.  Same-game legs are correlated (e.g. a pitcher who Ks a lot
-    tends to suppress hits on the other side), so the naive product
-    overstates the true joint probability.
+    assumption), then applies directional correlation adjustments for
+    each pair of legs based on their strategy types and team affiliations.
+
+    Positive correlations (e.g. pitcher Ks + team win) nudge the joint
+    probability UP from the naive product.  Negative correlations (e.g.
+    pitcher Ks + opposing batter hits) nudge it DOWN.
 
     Returns probability as a fraction (0.0 - 1.0).
     """
     if not legs:
         return 0.0
+
+    # Naive independence product
     prob = 1.0
     for leg in legs:
         prob *= leg.model_prob_pct / 100.0
-    # Apply dampener for each leg beyond the first
-    extra_legs = len(legs) - 1
-    prob *= _COMBO_CORRELATION_PENALTY ** extra_legs
+
+    # Apply pairwise correlation adjustments
+    for i in range(len(legs)):
+        for j in range(i + 1, len(legs)):
+            corr = _pairwise_correlation(legs[i], legs[j])
+            prob *= corr
+
     return max(0.001, min(0.99, prob))
 
 
