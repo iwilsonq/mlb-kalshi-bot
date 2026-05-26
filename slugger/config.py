@@ -40,7 +40,7 @@ class Config:
     cb_max_consecutive_losses: int = 3
     
     # Market selection
-    enabled_strategies: tuple = ("game_winner", "pitcher_ks", "player_hr", "total_runs")
+    enabled_strategies: tuple = ("game_winner", "pitcher_ks", "player_hr", "player_hits")
     min_liquidity_dollars: float = 5.0
     min_volume: int = 0
 
@@ -87,7 +87,7 @@ class Config:
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             cb_max_loss_usd=float(os.getenv("CIRCUIT_BREAKER_MAX_LOSS_USD", "10")),
             cb_max_consecutive_losses=int(os.getenv("CIRCUIT_BREAKER_MAX_CONSECUTIVE_LOSSES", "3")),
-            enabled_strategies=tuple(os.getenv("ENABLED_STRATEGIES", "game_winner,pitcher_ks,player_hr,total_runs").split(",")),
+            enabled_strategies=tuple(os.getenv("ENABLED_STRATEGIES", "game_winner,pitcher_ks,player_hr,player_hits").split(",")),
             min_liquidity_dollars=float(os.getenv("MIN_LIQUIDITY_DOLLARS", "5")),
             min_volume=int(os.getenv("MIN_VOLUME", "0")),
             combo_max_legs=int(os.getenv("COMBO_MAX_LEGS", "3")),
