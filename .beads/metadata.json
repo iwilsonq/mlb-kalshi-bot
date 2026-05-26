@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "mlb_kalshi_bot",
+  "project_id": "9b397f4c-27e5-475f-8fb7-303cb6b72f36"
+}
