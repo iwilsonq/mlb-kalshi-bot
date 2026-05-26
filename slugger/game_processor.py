@@ -142,6 +142,39 @@ def game_has_started(game: GameInfo, buffer_minutes: int = 5) -> bool:
         return True
 
 
+# ─── Per-Game Risk Budget ─────────────────────────────────────────────────────
+
+class GameBudget:
+    """Tracks per-game signal count and dollar exposure limits.
+
+    Passed through all execute_signals calls within a single game to
+    prevent over-concentration in correlated same-game positions.
+    """
+
+    def __init__(self, max_signals: int, max_exposure_usd: float):
+        self.max_signals = max_signals
+        self.max_exposure_usd = max_exposure_usd
+        self.signals_placed = 0
+        self.exposure_usd = 0.0
+
+    def can_place(self, cost_usd: float = 0.0) -> bool:
+        """Return True if the budget allows another signal."""
+        if self.signals_placed >= self.max_signals:
+            return False
+        if self.max_exposure_usd > 0 and self.exposure_usd + cost_usd > self.max_exposure_usd:
+            return False
+        return True
+
+    def record(self, cost_usd: float) -> None:
+        """Record a placed signal against the budget."""
+        self.signals_placed += 1
+        self.exposure_usd += cost_usd
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_signals - self.signals_placed)
+
+
 # ─── Signal Execution ─────────────────────────────────────────────────────────
 
 def execute_signals(
@@ -152,11 +185,20 @@ def execute_signals(
     effective_bankroll: float,
     held_tickers: Set[str],
     placed_tickers: Set[str],
+    budget: Optional["GameBudget"] = None,
 ) -> bool:
     """Place orders for a list of signals. Returns True if any signal was acted on."""
     any_acted = False
     for signal in signals:
         if circuit.is_tripped():
+            return any_acted
+
+        # ── Per-game budget check ──────────────────────────────────────────
+        if budget and not budget.can_place():
+            log.info(
+                "  🛑 Game budget exhausted (%d/%d signals) — skipping remaining",
+                budget.signals_placed, budget.max_signals,
+            )
             return any_acted
 
         any_acted = True
@@ -177,13 +219,25 @@ def execute_signals(
             signal.price, signal.edge_cents,
         )
 
+        cost_est = signal.count * signal.price / 100
+
+        # ── Dollar exposure check ──────────────────────────────────────────
+        if budget and not budget.can_place(cost_est):
+            log.info(
+                "  🛑 Game exposure limit ($%.2f/$%.2f) — skipping %s",
+                budget.exposure_usd, budget.max_exposure_usd, signal.ticker,
+            )
+            continue
+
         if config.dry_run:
             log.info(
                 "     [DRY RUN] Would BUY %s %s %d × %d¢ = $%.2f",
                 signal.side.upper(), signal.ticker, signal.count, signal.price,
-                signal.count * signal.price / 100,
+                cost_est,
             )
             held_tickers.add(signal.ticker)
+            if budget:
+                budget.record(cost_est)
         else:
             if signal.side == "no":
                 result = client.create_no_order(
@@ -206,6 +260,8 @@ def execute_signals(
                 held_tickers.add(signal.ticker)
                 placed_tickers.add(signal.ticker)
                 circuit.record_trade(cost_usd)
+                if budget:
+                    budget.record(cost_usd)
                 journal.record_trade(
                     log_dir=config.log_dir,
                     ticker=signal.ticker,
@@ -277,6 +333,12 @@ def process_game(
 
     any_signals = False
 
+    # ── Per-game risk budget ───────────────────────────────────────────────
+    budget = GameBudget(
+        max_signals=config.max_signals_per_game,
+        max_exposure_usd=config.max_exposure_per_game_usd,
+    )
+
     # Collect all single-leg signals for potential combo use later
     all_single_leg_signals: List[TradeSignal] = []
 
@@ -293,6 +355,7 @@ def process_game(
         if execute_signals(
             gw_signals, client, config, circuit,
             effective_bankroll, held_tickers, placed_tickers,
+            budget=budget,
         ):
             any_signals = True
 
@@ -315,6 +378,7 @@ def process_game(
             if execute_signals(
                 signals, client, config, circuit,
                 effective_bankroll, held_tickers, placed_tickers,
+                budget=budget,
             ):
                 any_signals = True
 
@@ -351,6 +415,7 @@ def process_game(
                     if execute_signals(
                         signals, client, config, circuit,
                         effective_bankroll, held_tickers, placed_tickers,
+                        budget=budget,
                     ):
                         any_signals = True
 
@@ -376,10 +441,16 @@ def process_game(
         if execute_signals(
             combo_signals, client, config, circuit,
             effective_bankroll, held_tickers, placed_tickers,
+            budget=budget,
         ):
             any_signals = True
 
-    if not any_signals:
+    if budget.signals_placed > 0:
+        log.info(
+            "  📋 Game budget: %d/%d signals placed, $%.2f exposed",
+            budget.signals_placed, budget.max_signals, budget.exposure_usd,
+        )
+    elif not any_signals:
         log.info("  No signals found for any strategy.")
 
 
