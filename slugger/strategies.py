@@ -289,6 +289,97 @@ def _total_prob(era: float) -> int:
         return 25
 
 
+def _game_winner_probability(
+    home_era: float,
+    away_era: float,
+) -> Tuple[int, int]:
+    """Estimate home and away win probabilities from pitcher ERA matchup.
+
+    Uses the relative ERA of both starting pitchers to model who is
+    more likely to win.  A lower ERA indicates a better pitcher.
+
+    The model scales linearly with the away pitcher's fraction of
+    the combined ERA total: if the away pitcher contributes more of
+    the "badness", the home team is more likely to win.
+
+    Returns:
+        (home_prob, away_prob) as integer percentages summing to 100.
+    """
+    total_era = home_era + away_era
+    if total_era > 0:
+        away_frac = away_era / total_era
+        home_prob = round(40 + away_frac * 25)  # range ~45-60%
+    else:
+        home_prob = 54  # slight home-field advantage default
+
+    home_prob = max(40, min(65, home_prob))
+    return home_prob, 100 - home_prob
+
+
+def _expected_hits_lambda(
+    batter: BatterProfile,
+    pitcher: Optional[PitcherProfile],
+    home_abbrev: str,
+) -> float:
+    """Compute expected hits (λ) for a batter in a single game.
+
+    Combines Bayesian-shrunk batting average, xBA Statcast data, opposing
+    pitcher WHIP adjustment, and park factor into a single Poisson rate.
+
+    This is the shared model used by both single-leg player_hits strategy
+    and combo leg sourcing.
+
+    Args:
+        batter:       Batter profile with season stats and Statcast data.
+        pitcher:      Opposing pitcher profile (for WHIP adjustment).
+        home_abbrev:  Home team abbreviation (for park factor lookup).
+
+    Returns:
+        Lambda (expected hits per game) for the Poisson model, or 0 if
+        insufficient data.
+    """
+    if batter.ab < _HITS_MIN_AB:
+        return 0.0
+
+    opp_whip = pitcher.whip if pitcher else 0.0
+    opp_ip = pitcher.innings_pitched if pitcher else 0.0
+    opp_throws = (pitcher.throws if pitcher else "") or ""
+
+    # ── Platoon split selection ────────────────────────────────────────────
+    if opp_throws == "L" and batter.vs_lhp_ab >= 30:
+        split_h = round(batter.vs_lhp_avg * batter.vs_lhp_ab)
+        split_ab = batter.vs_lhp_ab
+    elif opp_throws == "R" and batter.vs_rhp_ab >= 30:
+        split_h = round(batter.vs_rhp_avg * batter.vs_rhp_ab)
+        split_ab = batter.vs_rhp_ab
+    else:
+        split_h = batter.hits
+        split_ab = batter.ab
+
+    eff_avg = _shrink_avg(split_h, split_ab)
+    lam = eff_avg * _AVG_AB_PER_GAME
+
+    # xBA blend
+    if batter.xba > 0:
+        blended_avg = 0.70 * eff_avg + 0.30 * batter.xba
+        lam = blended_avg * _AVG_AB_PER_GAME
+
+    # Pitcher WHIP adjustment
+    if opp_whip > 0 and opp_ip >= _HITS_MIN_PITCHER_IP:
+        raw_whip = opp_whip / _LEAGUE_AVG_WHIP
+        pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), _MAX_PITCHER_WHIP_ADJ)
+        lam *= pitcher_adj
+
+    # Park factor
+    home_kalshi = kalshi_team(home_abbrev)
+    park_factor = HIT_PARK_FACTORS.get(
+        home_kalshi, HIT_PARK_FACTORS.get(home_abbrev.upper(), 1.0),
+    )
+    lam *= park_factor
+
+    return lam
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  STRATEGY: Strikeout Props
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -408,7 +499,13 @@ def strategy_game_winner(
     client: KalshiClient,
     config: Config,
 ) -> List[TradeSignal]:
-    """Game winner prop — ERA-based heuristic via signal pipeline."""
+    """Game winner prop — ERA-ratio model via signal pipeline.
+
+    Uses _game_winner_probability() which models both pitchers' ERA
+    relative to each other.  When the away pitcher's ERA is unavailable
+    (this strategy only receives the home pitcher), defaults to league
+    average (4.50).
+    """
     # Only run once per game: skip if this pitcher is NOT the home starter.
     if (
         pitcher_profile
@@ -422,12 +519,16 @@ def strategy_game_winner(
         return []
 
     home_abbrev = kalshi_team(game_info.home_abbrev)
-    recent_era = pitcher_profile.recent_era
+    home_era = pitcher_profile.recent_era
+    away_era = 4.50  # league average default (away pitcher not in scope)
+    home_prob, _ = _game_winner_probability(home_era, away_era)
 
     def gw_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
-        est = 55 if recent_era < 3.5 else (48 if recent_era > 5.0 else 50)
-        reason = f"Home win: recent ERA {recent_era:.1f} → {est}% vs {price}¢"
-        return ModelResult(prob_pct=est, reason=reason)
+        reason = (
+            f"Home win: home ERA {home_era:.1f} vs away ERA {away_era:.1f}"
+            f" → {home_prob}% vs {price}¢"
+        )
+        return ModelResult(prob_pct=home_prob, reason=reason)
 
     spec = MarketSpec(
         event_ticker=event_ticker,
@@ -1042,8 +1143,8 @@ def _source_game_winner_leg(
 ) -> List[ComboLeg]:
     """Source a game-winner leg by picking the favoured team.
 
-    Uses both pitchers' recent ERA to estimate each side's win probability,
-    then returns the side (home or away) with the higher model probability.
+    Uses _game_winner_probability() to estimate each side's win probability
+    from both pitchers' recent ERA, then returns the favoured side.
     """
     legs: List[ComboLeg] = []
     event_ticker = game_event_ticker(game_info)
@@ -1058,24 +1159,9 @@ def _source_game_winner_leg(
     if not markets:
         return legs
 
-    # Estimate win probability from pitcher matchup
     home_era = home_pitcher.recent_era if home_pitcher and home_pitcher.recent_era else 4.50
     away_era = away_pitcher.recent_era if away_pitcher and away_pitcher.recent_era else 4.50
-
-    # Better (lower) ERA = higher win probability.  Scale relative to
-    # combined ERA with a home-field advantage baseline of 54%.
-    total_era = home_era + away_era
-    if total_era > 0:
-        # Fraction of "badness" belonging to the away pitcher
-        away_frac = away_era / total_era
-        # away_frac=0.6 means away pitcher is worse → home more likely to win
-        home_prob = round(40 + away_frac * 25)  # range ~45-60%
-    else:
-        home_prob = 54
-
-    # Cap to reasonable range
-    home_prob = max(40, min(65, home_prob))
-    away_prob = 100 - home_prob
+    home_prob, away_prob = _game_winner_probability(home_era, away_era)
 
     home_kalshi = kalshi_team(game_info.home_abbrev)
     away_kalshi = kalshi_team(game_info.away_abbrev)
@@ -1209,10 +1295,10 @@ def _source_player_hits_legs(
     client: KalshiClient,
     config: Config,
 ) -> List[ComboLeg]:
-    """Source player hit legs using the Poisson model.
+    """Source player hit legs using the shared Poisson model.
 
+    Uses _expected_hits_lambda() — the same model as strategy_player_hits.
     Picks the single best hit threshold per batter (highest edge).
-    Only considers batters with enough ABs and model probability.
     """
     legs: List[ComboLeg] = []
     event_ticker = hit_event_ticker(game_info)
@@ -1228,45 +1314,10 @@ def _source_player_hits_legs(
         return legs
 
     for batter, opp_pitcher in batter_pitcher_pairs:
-        if not batter or batter.ab < _HITS_MIN_AB:
+        if not batter:
             continue
 
-        opp_whip = opp_pitcher.whip if opp_pitcher else 0.0
-        opp_ip = opp_pitcher.innings_pitched if opp_pitcher else 0.0
-        opp_throws = (opp_pitcher.throws if opp_pitcher else "") or ""
-
-        # Choose split
-        if opp_throws == "L" and batter.vs_lhp_ab >= 30:
-            split_h = round(batter.vs_lhp_avg * batter.vs_lhp_ab)
-            split_ab = batter.vs_lhp_ab
-        elif opp_throws == "R" and batter.vs_rhp_ab >= 30:
-            split_h = round(batter.vs_rhp_avg * batter.vs_rhp_ab)
-            split_ab = batter.vs_rhp_ab
-        else:
-            split_h = batter.hits
-            split_ab = batter.ab
-
-        eff_avg = _shrink_avg(split_h, split_ab)
-        lam = eff_avg * _AVG_AB_PER_GAME
-
-        # xBA blend
-        if batter.xba > 0:
-            blended_avg = 0.70 * eff_avg + 0.30 * batter.xba
-            lam = blended_avg * _AVG_AB_PER_GAME
-
-        # Pitcher WHIP adjustment
-        if opp_whip > 0 and opp_ip >= _HITS_MIN_PITCHER_IP:
-            raw_whip = opp_whip / _LEAGUE_AVG_WHIP
-            pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), _MAX_PITCHER_WHIP_ADJ)
-            lam *= pitcher_adj
-
-        # Park factor
-        home_kalshi = kalshi_team(game_info.home_abbrev)
-        park_factor = HIT_PARK_FACTORS.get(
-            home_kalshi, HIT_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0),
-        )
-        lam *= park_factor
-
+        lam = _expected_hits_lambda(batter, opp_pitcher, game_info.home_abbrev)
         if lam <= 0:
             continue
 
