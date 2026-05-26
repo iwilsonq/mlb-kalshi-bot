@@ -18,10 +18,11 @@ from slugger.kalshi_client import market_price
 from slugger.journal import record_signal
 from slugger.mlb_data import get_team_profile
 from slugger.models import (
-    HR_PARK_FACTORS, HIT_PARK_FACTORS,
+    HITS_MIN_PITCHER_IP, HR_PARK_FACTORS, HIT_PARK_FACTORS,
+    LEAGUE_AVG_WHIP, MAX_PITCHER_WHIP_ADJ, MIN_PITCHER_IP,
     expected_ab, expected_hits_lambda, expected_ks,
     game_winner_probability, hr_prob_poisson, parse_hit_threshold,
-    parse_k_threshold, poisson_ge, shrink_hr_rate, total_prob,
+    parse_k_threshold, poisson_ge, shrink_avg, shrink_hr_rate, total_prob,
 )
 from slugger.sizing import kelly_count
 from slugger.signal_pipeline import evaluate_markets
@@ -357,7 +358,7 @@ def strategy_player_hr(
     # Pitchers who allow more barrels give up more HRs.
     _LEAGUE_AVG_BRA = 0.065
     bra_adj = 1.0
-    if pitcher_profile and pitcher_profile.barrel_rate_against > 0 and opp_ip >= _MIN_PITCHER_IP:
+    if pitcher_profile and pitcher_profile.barrel_rate_against > 0 and opp_ip >= MIN_PITCHER_IP:
         raw_bra = pitcher_profile.barrel_rate_against / _LEAGUE_AVG_BRA
         bra_adj = 1.0 + 0.3 * (raw_bra - 1.0)
         lam *= bra_adj
@@ -391,7 +392,7 @@ def strategy_player_hr(
 
     pitcher_note = (
         f"  opp_{opp_throws}hr/9={opp_hr_per_9:.2f}({opp_ip:.0f}IP)"
-        if opp_ip >= _MIN_PITCHER_IP else ""
+        if opp_ip >= MIN_PITCHER_IP else ""
     )
 
     # ── Build model closure ────────────────────────────────────────────────
@@ -512,7 +513,7 @@ def strategy_player_hits(
 
     # ── Compute λ ──────────────────────────────────────────────────────────
     ab_est = expected_ab(batter_profile.batting_order)
-    eff_avg = _shrink_avg(split_h, split_ab)
+    eff_avg = shrink_avg(split_h, split_ab)
     lam = eff_avg * ab_est
 
     if batter_profile.xba > 0:
@@ -520,9 +521,9 @@ def strategy_player_hits(
         lam = blended_avg * ab_est
 
     pitcher_adj = 1.0
-    if opp_whip > 0 and opp_ip >= _HITS_MIN_PITCHER_IP:
-        raw_whip = opp_whip / _LEAGUE_AVG_WHIP
-        pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), _MAX_PITCHER_WHIP_ADJ)
+    if opp_whip > 0 and opp_ip >= HITS_MIN_PITCHER_IP:
+        raw_whip = opp_whip / LEAGUE_AVG_WHIP
+        pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), MAX_PITCHER_WHIP_ADJ)
         lam *= pitcher_adj
 
     # Hard hit rate adjustment (dampened)
@@ -553,7 +554,7 @@ def strategy_player_hits(
 
     pitcher_note = (
         f"  opp_{opp_throws}whip={opp_whip:.2f}({opp_ip:.0f}IP)"
-        if opp_ip >= _HITS_MIN_PITCHER_IP else ""
+        if opp_ip >= HITS_MIN_PITCHER_IP else ""
     )
 
     # ── Build model closure ────────────────────────────────────────────────
