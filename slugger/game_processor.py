@@ -23,48 +23,10 @@ from slugger.mlb_data import (
     GameContext, GameInfo, LiveMLBDataProvider, get_todays_games,
 )
 from slugger.strategies import BATTER_STRATEGIES, STRATEGIES, TradeSignal, strategy_combo
+from slugger.tickers import game_event_ticker
 import slugger.journal as journal
 
 log = logging.getLogger("slugger")
-
-
-# ─── Kalshi ticker mapping ────────────────────────────────────────────────────
-
-# Map MLB Stats API abbreviations → Kalshi codes where they differ.
-API_TO_KALSHI = {
-    "SFG": "SF",   "KCR": "KC",  "SDP": "SD",
-    "TBR": "TB",   "WSN": "WSH",
-    # Legacy fallbacks
-    "SAN": "SF",   "SFN": "SF",  "LAN": "LAD",
-    "SDN": "SD",   "SLN": "STL", "ANA": "LAA",
-    "TAM": "TB",   "NEW": "NYY", "LOS": "LAA",
-}
-
-
-def game_event_ticker(game: GameInfo) -> Optional[str]:
-    """Construct a Kalshi game event ticker from GameInfo.
-
-    Kalshi format: KXMLBGAME-{YYMONDDHHMM}{AWAY}{HOME}
-    Example:   KXMLBGAME-26MAY111810LAACLE
-
-    MLB API times are UTC; Kalshi tickers use ET times.
-    """
-    if not game.game_datetime:
-        return None
-
-    try:
-        dt = datetime.fromisoformat(game.game_datetime.replace("Z", "+00:00"))
-        et = timezone(timedelta(hours=-4))
-        dt_et = dt.astimezone(et)
-        date_str = dt_et.strftime("%y%b%d").upper()  # e.g. 26MAY11
-        time_str = dt_et.strftime("%H%M")             # e.g. 1810
-    except (ValueError, TypeError):
-        return None
-
-    away = API_TO_KALSHI.get(game.away_abbrev.upper(), game.away_abbrev.upper())
-    home = API_TO_KALSHI.get(game.home_abbrev.upper(), game.home_abbrev.upper())
-
-    return f"KXMLBGAME-{date_str}{time_str}{away}{home}"
 
 
 def game_markets(client: KalshiClient, game: GameInfo, config: Config) -> List[dict]:

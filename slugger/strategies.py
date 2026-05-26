@@ -18,6 +18,10 @@ from slugger.kalshi_client import KalshiClient, _market_price
 from slugger.journal import record_signal
 from slugger.sizing import kelly_count
 from slugger.signal_pipeline import MarketSpec, ModelResult, evaluate_markets
+from slugger.tickers import (
+    kalshi_team, kalshi_date, game_event_ticker, ks_event_ticker,
+    hr_event_ticker, total_event_ticker, hit_event_ticker, hrr_event_ticker,
+)
 
 log = logging.getLogger(__name__)
 
@@ -35,70 +39,6 @@ class TradeSignal:
     edge_cents: float     # expected edge in cents
     reason: str = ""      # human-readable rationale
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  KALSHI EVENT TICKER CONSTRUCTION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# Map MLB Stats API abbreviations → Kalshi codes where they differ.
-# Most MLB abbreviations already match Kalshi exactly (LAD, SF, NYY, etc.).
-# This table only covers the handful that don't.
-API_TO_KALSHI = {
-    "SFG": "SF",   # Giants: MLB uses "SFG" in some contexts, Kalshi uses "SF"
-    "KCR": "KC",   # Royals
-    "SDP": "SD",   # Padres
-    "TBR": "TB",   # Rays
-    "WSN": "WSH",  # Nationals
-    # Legacy fallbacks from old name-slice derivation (kept for safety)
-    "SAN": "SF",   "SFN": "SF",
-    "LAN": "LAD",  "SDN": "SD",
-    "SLN": "STL",  "ANA": "LAA",
-    "TAM": "TB",   "NEW": "NYY",
-}
-
-
-def _kalshi_date(game: GameInfo) -> Optional[str]:
-    """Format game datetime as Kalshi date string (YYMONDD) with ET offset."""
-    if not game.game_datetime:
-        return None
-    from datetime import timezone, timedelta
-    dt = __import__("datetime").datetime.fromisoformat(game.game_datetime.replace("Z", "+00:00"))
-    et = timezone(timedelta(hours=-4))
-    dt_et = dt.astimezone(et)
-    return dt_et.strftime("%y%b%d").upper() + dt_et.strftime("%H%M")
-
-
-def _kalshi_team(abbrev: str) -> str:
-    return API_TO_KALSHI.get(abbrev.upper(), abbrev.upper())
-
-
-def _game_base(game: GameInfo) -> Optional[str]:
-    """Build the base Kalshi game event ticker."""
-    d = _kalshi_date(game)
-    if not d:
-        return None
-    return f"KXMLBGAME-{d}{_kalshi_team(game.away_abbrev)}{_kalshi_team(game.home_abbrev)}"
-
-
-def _ks_event(game: GameInfo) -> Optional[str]:
-    d = _kalshi_date(game)
-    if not d:
-        return None
-    return f"KXMLBKS-{d}{_kalshi_team(game.away_abbrev)}{_kalshi_team(game.home_abbrev)}"
-
-
-def _hr_event(game: GameInfo) -> Optional[str]:
-    d = _kalshi_date(game)
-    if not d:
-        return None
-    return f"KXMLBHR-{d}{_kalshi_team(game.away_abbrev)}{_kalshi_team(game.home_abbrev)}"
-
-
-def _total_event(game: GameInfo) -> Optional[str]:
-    d = _kalshi_date(game)
-    if not d:
-        return None
-    return f"KXMLBTOTAL-{d}{_kalshi_team(game.away_abbrev)}{_kalshi_team(game.home_abbrev)}"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -361,7 +301,7 @@ def strategy_pitcher_ks(
     config: Config,
 ) -> List[TradeSignal]:
     """Strikeout prop bets — Poisson model via signal pipeline."""
-    event_ticker = _ks_event(game_info)
+    event_ticker = ks_event_ticker(game_info)
     if not event_ticker:
         return []
 
@@ -477,11 +417,11 @@ def strategy_game_winner(
     ):
         return []
 
-    event_ticker = _game_base(game_info)
+    event_ticker = game_event_ticker(game_info)
     if not event_ticker or not pitcher_profile.recent_era:
         return []
 
-    home_abbrev = _kalshi_team(game_info.home_abbrev)
+    home_abbrev = kalshi_team(game_info.home_abbrev)
     recent_era = pitcher_profile.recent_era
 
     def gw_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
@@ -510,7 +450,7 @@ def strategy_total_runs(
     config: Config,
 ) -> List[TradeSignal]:
     """Total runs (over/under) prop — ERA bucket model via signal pipeline."""
-    event_ticker = _total_event(game_info)
+    event_ticker = total_event_ticker(game_info)
     if not event_ticker or not pitcher_profile.era:
         return []
 
@@ -544,7 +484,7 @@ def strategy_player_hr(
     config: Config,
 ) -> List[TradeSignal]:
     """Player home run prop — Poisson model via signal pipeline."""
-    event_ticker = _hr_event(game_info)
+    event_ticker = hr_event_ticker(game_info)
     if not event_ticker or not batter_profile:
         return []
 
@@ -578,7 +518,7 @@ def strategy_player_hr(
     if pitcher_adj != 1.0:
         lam *= pitcher_adj
 
-    home_kalshi = _kalshi_team(game_info.home_abbrev)
+    home_kalshi = kalshi_team(game_info.home_abbrev)
     park_factor = HR_PARK_FACTORS.get(home_kalshi, HR_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0))
     lam *= park_factor
 
@@ -645,8 +585,7 @@ def strategy_player_hits_runs_rbis(
     config: Config,
 ) -> List[TradeSignal]:
     """Hits + Runs + RBIs prop — AVG bucket model via signal pipeline."""
-    d = _kalshi_date(game_info)
-    event_ticker = f"KXMLBHRR-{d}{_kalshi_team(game_info.away_abbrev)}{_kalshi_team(game_info.home_abbrev)}" if d else None
+    event_ticker = hrr_event_ticker(game_info)
     if not event_ticker or not batter_profile:
         return []
 
@@ -734,12 +673,7 @@ HIT_PARK_FACTORS: Dict[str, float] = {
 }
 
 
-def _hit_event(game: GameInfo) -> Optional[str]:
-    """Build Kalshi hit event ticker."""
-    d = _kalshi_date(game)
-    if not d:
-        return None
-    return f"KXMLBHIT-{d}{_kalshi_team(game.away_abbrev)}{_kalshi_team(game.home_abbrev)}"
+
 
 
 def _shrink_avg(hits: int, ab: int) -> float:
@@ -788,7 +722,7 @@ def strategy_player_hits(
     config: Config,
 ) -> List[TradeSignal]:
     """Player hits prop — Poisson model via signal pipeline."""
-    event_ticker = _hit_event(game_info)
+    event_ticker = hit_event_ticker(game_info)
     if not event_ticker or not batter_profile:
         return []
 
@@ -831,7 +765,7 @@ def strategy_player_hits(
         pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), _MAX_PITCHER_WHIP_ADJ)
         lam *= pitcher_adj
 
-    home_kalshi = _kalshi_team(game_info.home_abbrev)
+    home_kalshi = kalshi_team(game_info.home_abbrev)
     park_factor = HIT_PARK_FACTORS.get(
         home_kalshi, HIT_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0),
     )
@@ -1112,7 +1046,7 @@ def _source_game_winner_leg(
     then returns the side (home or away) with the higher model probability.
     """
     legs: List[ComboLeg] = []
-    event_ticker = _game_base(game_info)
+    event_ticker = game_event_ticker(game_info)
     if not event_ticker:
         return legs
 
@@ -1143,8 +1077,8 @@ def _source_game_winner_leg(
     home_prob = max(40, min(65, home_prob))
     away_prob = 100 - home_prob
 
-    home_kalshi = _kalshi_team(game_info.home_abbrev)
-    away_kalshi = _kalshi_team(game_info.away_abbrev)
+    home_kalshi = kalshi_team(game_info.home_abbrev)
+    away_kalshi = kalshi_team(game_info.away_abbrev)
 
     for m in markets:
         price = _market_price(m)
@@ -1194,7 +1128,7 @@ def _source_pitcher_ks_legs(
     Picks the single best K threshold per pitcher (highest edge).
     """
     legs: List[ComboLeg] = []
-    event_ticker = _ks_event(game_info)
+    event_ticker = ks_event_ticker(game_info)
     if not event_ticker:
         return legs
 
@@ -1281,7 +1215,7 @@ def _source_player_hits_legs(
     Only considers batters with enough ABs and model probability.
     """
     legs: List[ComboLeg] = []
-    event_ticker = _hit_event(game_info)
+    event_ticker = hit_event_ticker(game_info)
     if not event_ticker:
         return legs
 
@@ -1327,7 +1261,7 @@ def _source_player_hits_legs(
             lam *= pitcher_adj
 
         # Park factor
-        home_kalshi = _kalshi_team(game_info.home_abbrev)
+        home_kalshi = kalshi_team(game_info.home_abbrev)
         park_factor = HIT_PARK_FACTORS.get(
             home_kalshi, HIT_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0),
         )

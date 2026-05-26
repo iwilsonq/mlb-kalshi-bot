@@ -18,7 +18,6 @@ from slugger.config import Config
 from slugger.mlb_data import get_todays_games
 from slugger.game_processor import (
     CircuitBreaker,
-    game_event_ticker,
     game_markets,
     process_game,
     run as run_bot,

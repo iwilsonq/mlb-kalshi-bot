@@ -23,6 +23,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from slugger.tickers import parse_game_time_utc, extract_teams
+
 JOURNAL = Path("logs/journal.jsonl")
 
 # ── New model constants (Fix 5) ────────────────────────────────────────────────
@@ -39,46 +41,12 @@ KS_MIN_THRESHOLD = 6         # skip 4+ and 5+ K markets
 KS_MIN_MODEL_PROB = 15       # minimum model prob to trade YES
 
 
-def _parse_game_time_utc(ticker: str):
-    """Extract game start time (UTC) from the date+time embedded in a ticker."""
-    m = re.search(r"(\d{2})([A-Z]{3})(\d{2})(\d{4})", ticker)
-    if not m:
-        return None
-    year = int(m.group(1)) + 2000
-    months = {
-        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-        "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
-    }
-    month = months.get(m.group(2))
-    if not month:
-        return None
-    day = int(m.group(3))
-    hh, mm = int(m.group(4)[:2]), int(m.group(4)[2:])
-    et = timezone(timedelta(hours=-4))
-    return datetime(year, month, day, hh, mm, tzinfo=et).astimezone(timezone.utc)
 
-
-def _extract_teams(ticker: str):
-    """Extract (away, home) team abbreviations from ticker base."""
-    # e.g. KXMLBGAME-26MAY121940KCCWS-CWS -> teams_str=KCCWS, suffix=CWS
-    m = re.search(r"\d{4}([A-Z]+)$", ticker.rsplit("-", 1)[0])
-    if not m:
-        return None, None
-    teams_str = m.group(1)
-    suffix = ticker.rsplit("-", 1)[-1] if "-" in ticker else ""
-    # Determine home team: it's the LAST part of teams_str
-    # Try 3-char then 2-char suffix match
-    for n in (3, 2):
-        candidate_home = teams_str[-n:]
-        candidate_away = teams_str[:-n]
-        if candidate_away:  # must have something left for away
-            return candidate_away, candidate_home
-    return None, None
 
 
 def _is_away_bet(ticker: str) -> bool:
     """Return True if this game_winner ticker is betting on the away team."""
-    away, home = _extract_teams(ticker)
+    away, home = extract_teams(ticker)
     if not away or not home:
         return False
     suffix = ticker.rsplit("-", 1)[-1].upper()
@@ -165,7 +133,7 @@ def main():
         placed_str = t.get("placed_at", "")
 
         # ── Fix 1: Drop in-game trades ──────────────────────────────────
-        game_utc = _parse_game_time_utc(ticker)
+        game_utc = parse_game_time_utc(ticker)
         if game_utc and placed_str:
             placed_dt = datetime.fromisoformat(placed_str.replace("Z", "+00:00"))
             delay_min = (placed_dt - game_utc).total_seconds() / 60
