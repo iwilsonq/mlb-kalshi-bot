@@ -48,6 +48,8 @@ class TradeSignal:
 # League-average constants for normalisation
 _LEAGUE_AVG_K_RATE  = 0.225   # ~22.5% of PAs end in strikeout (2024 MLB avg)
 _LEAGUE_AVG_WHIFF   = 0.245   # ~24.5% whiff rate on swings (2024 MLB avg)
+_LEAGUE_AVG_CHASE   = 0.285   # ~28.5% chase rate (swing at pitches outside zone, 2024)
+_LEAGUE_AVG_FB_VELO = 93.5    # mph, average four-seam fastball velocity (2024)
 _DEFAULT_IP         = 5.5     # default expected IP when recent data is missing
 _KS_LAMBDA_DEFLATOR = 0.85    # calibration: model over-predicts by ~15-20%, deflate λ
 _KS_MIN_THRESHOLD   = 6       # skip 4+ and 5+ K markets (unprofitable historically)
@@ -125,6 +127,23 @@ def _expected_ks(
     if profile.whiff_rate > 0:
         raw_whiff = profile.whiff_rate / _LEAGUE_AVG_WHIFF
         lam *= 1.0 + 0.5 * (raw_whiff - 1.0)
+
+    # ── Statcast chase rate adjustment (dampened) ─────────────────────────
+    # Chase rate measures how often batters swing at pitches outside the zone.
+    # High chase rate = more whiffs on non-competitive pitches = more Ks.
+    # This is distinct from whiff rate (which includes in-zone swinging strikes).
+    if profile.chase_rate > 0:
+        raw_chase = profile.chase_rate / _LEAGUE_AVG_CHASE
+        lam *= 1.0 + 0.3 * (raw_chase - 1.0)  # lighter weight than whiff
+
+    # ── Fastball velocity adjustment ──────────────────────────────────────
+    # Velocity correlates with K rate: faster = more Ks.  Each mph above
+    # average adds ~0.5 K/9.  We use a dampened multiplicative adjustment
+    # so extreme values don't dominate.
+    if profile.avg_fastball_velo > 0:
+        velo_diff = profile.avg_fastball_velo - _LEAGUE_AVG_FB_VELO
+        # ~2% adjustment per mph, dampened by half
+        lam *= 1.0 + 0.01 * velo_diff
 
     # ── Hard ceiling: cap λ at max Ks observed + 1 ────────────────────────
     # A pitcher who has never exceeded 6 Ks should not have λ > 7.
@@ -484,6 +503,14 @@ def _expected_hits_lambda(
         pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), _MAX_PITCHER_WHIP_ADJ)
         lam *= pitcher_adj
 
+    # Hard hit rate adjustment (dampened)
+    # Hard-hit balls (95+ mph EV) become hits far more often than soft contact.
+    # League average hard-hit rate is ~37%.
+    _LEAGUE_AVG_HHR = 0.370
+    if batter.hard_hit_rate > 0:
+        raw_hhr = batter.hard_hit_rate / _LEAGUE_AVG_HHR
+        lam *= 1.0 + 0.25 * (raw_hhr - 1.0)  # lighter dampening
+
     # Park factor
     home_kalshi = kalshi_team(home_abbrev)
     park_factor = HIT_PARK_FACTORS.get(
@@ -758,6 +785,7 @@ def strategy_player_hr(
     park_factor = HR_PARK_FACTORS.get(home_kalshi, HR_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0))
     lam *= park_factor
 
+    # ── Barrel rate adjustment (batter, dampened) ────────────────────────
     _LEAGUE_AVG_BARREL = 0.065
     barrel_adj = 1.0
     if batter_profile.barrel_rate > 0:
@@ -765,12 +793,57 @@ def strategy_player_hr(
         barrel_adj = 1.0 + 0.5 * (raw_barrel - 1.0)
         lam *= barrel_adj
 
+    # ── Exit velocity adjustment (dampened) ────────────────────────────
+    # Average exit velo is the strongest single predictor of HR power.
+    # League average EV is ~88.5 mph; each mph above adds HR probability.
+    _LEAGUE_AVG_EV = 88.5
+    ev_adj = 1.0
+    if batter_profile.avg_exit_velo > 0:
+        ev_diff = batter_profile.avg_exit_velo - _LEAGUE_AVG_EV
+        ev_adj = 1.0 + 0.03 * ev_diff  # ~3% per mph, significant for power
+        lam *= ev_adj
+
+    # ── xSLG adjustment (dampened) ─────────────────────────────────────
+    # xSLG measures expected power production from contact quality (Statcast).
+    # Blends in when available to correct for BABIP luck on SLG.
+    _LEAGUE_AVG_XSLG = 0.400
+    xslg_adj = 1.0
+    if batter_profile.xslg > 0:
+        raw_xslg = batter_profile.xslg / _LEAGUE_AVG_XSLG
+        xslg_adj = 1.0 + 0.3 * (raw_xslg - 1.0)  # lighter dampening
+        lam *= xslg_adj
+
+    # ── Pitcher barrel rate against (dampened) ─────────────────────────
+    # Pitchers who allow more barrels give up more HRs.
+    _LEAGUE_AVG_BRA = 0.065
+    bra_adj = 1.0
+    if pitcher_profile and pitcher_profile.barrel_rate_against > 0 and opp_ip >= _MIN_PITCHER_IP:
+        raw_bra = pitcher_profile.barrel_rate_against / _LEAGUE_AVG_BRA
+        bra_adj = 1.0 + 0.3 * (raw_bra - 1.0)
+        lam *= bra_adj
+
+    # ── Temperature adjustment ─────────────────────────────────────────
+    # Higher temperature = more HRs. ~1.5% more HRs per degree F above 72°F.
+    temp_adj = 1.0
+    temp_str = game_info.weather.get("temp", "")
+    if temp_str:
+        try:
+            temp_f = float(temp_str.replace("°", "").replace("F", "").strip())
+            temp_adj = 1.0 + 0.015 * (temp_f - 72.0) / 10.0
+            temp_adj = max(0.85, min(1.15, temp_adj))  # cap at ±15%
+        except (ValueError, TypeError):
+            pass
+    if temp_adj != 1.0:
+        lam *= temp_adj
+
     log.debug(
-        "%s  split=%s %dHR/%dAB  eff=%.4f  park=%s(×%.2f)"
-        "  opp=%s(%.0fIP)  pitcher_adj=%.2f  barrel_adj=%.2f  λ=%.3f",
-        batter_profile.name, platoon_note, split_hr, split_ab, eff_rate,
+        "%s (#%d)  split=%s %dHR/%dAB  eff=%.4f  park=%s(×%.2f)"
+        "  opp=%s(%.0fIP)  pitcher_adj=%.2f  barrel=%.2f  ev=%.2f"
+        "  xslg=%.2f  bra=%.2f  temp=%.2f  λ=%.3f",
+        batter_profile.name, batter_profile.batting_order,
+        platoon_note, split_hr, split_ab, eff_rate,
         home_kalshi, park_factor, opp_throws or "?", opp_ip, pitcher_adj,
-        barrel_adj, lam,
+        barrel_adj, ev_adj, xslg_adj, bra_adj, temp_adj, lam,
     )
 
     if lam <= 0:
@@ -1002,6 +1075,14 @@ def strategy_player_hits(
         pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), _MAX_PITCHER_WHIP_ADJ)
         lam *= pitcher_adj
 
+    # Hard hit rate adjustment (dampened)
+    _LEAGUE_AVG_HHR = 0.370
+    hhr_adj = 1.0
+    if batter_profile.hard_hit_rate > 0:
+        raw_hhr = batter_profile.hard_hit_rate / _LEAGUE_AVG_HHR
+        hhr_adj = 1.0 + 0.25 * (raw_hhr - 1.0)
+        lam *= hhr_adj
+
     home_kalshi = kalshi_team(game_info.home_abbrev)
     park_factor = HIT_PARK_FACTORS.get(
         home_kalshi, HIT_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0),
@@ -1010,10 +1091,10 @@ def strategy_player_hits(
 
     log.debug(
         "%s (#%d)  split=%s %dH/%dAB  eff_avg=%.3f  xba=%.3f  ab_est=%.1f"
-        "  park=%s(×%.2f)  opp_whip=%.2f(%s,%.0fIP)  pitcher_adj=%.2f  λ=%.3f",
+        "  hhr=%.2f  park=%s(×%.2f)  opp_whip=%.2f(%s,%.0fIP)  pitcher_adj=%.2f  λ=%.3f",
         batter_profile.name, batter_profile.batting_order,
         platoon_note, split_h, split_ab, eff_avg,
-        batter_profile.xba, ab_est, home_kalshi, park_factor,
+        batter_profile.xba, ab_est, hhr_adj, home_kalshi, park_factor,
         opp_whip, opp_throws or "?", opp_ip, pitcher_adj, lam,
     )
 
