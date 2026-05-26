@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import slugger
+
 log = logging.getLogger(__name__)
 
 JOURNAL_FILENAME = "journal.jsonl"
@@ -39,6 +41,7 @@ class TradeRecord:
     edge_cents: float = 0.0
     reason: str = ""
     order_id: str = ""
+    model_version: str = ""    # stamped from slugger.__version__
 
 
 @dataclass
@@ -86,6 +89,7 @@ def record_trade(
         edge_cents=edge_cents,
         reason=reason,
         order_id=order_id,
+        model_version=slugger.__version__,
     )
     _append(log_dir, asdict(rec))
     log.debug("Journal: recorded trade %s %s", strategy, ticker)
@@ -148,6 +152,7 @@ def record_signal(
         "edge_cents": round(edge_cents, 1),
         "traded": traded,
         "reason": reason,
+        "model_version": slugger.__version__,
     }
     path = _signals_path(log_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
