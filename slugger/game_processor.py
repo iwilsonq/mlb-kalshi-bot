@@ -17,6 +17,7 @@ from typing import List, Optional, Set
 
 import requests
 
+from slugger.calibration import CalibrationLayer
 from slugger.config import Config
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
 from slugger.signal_pipeline import load_calibration
@@ -298,6 +299,7 @@ def process_game(
     bankroll_usd: float,
     held_tickers: Set[str],
     placed_tickers: Set[str],
+    calibration: Optional[CalibrationLayer] = None,
 ):
     """Run all strategies for a single game and execute trades.
 
@@ -353,7 +355,7 @@ def process_game(
             log.warning("⚡ Circuit breaker tripped — stopping")
             return
 
-        signals = strat_fn(ctx, client, config, all_prior_signals)
+        signals = strat_fn(ctx, client, config, all_prior_signals, calibration=calibration)
         all_prior_signals.extend(signals)
         if execute_signals(
             signals, client, config, circuit,
@@ -460,7 +462,7 @@ def run(config: Config, game_filter: Optional[str] = None):
 
     # Load calibration curves (if available) for probability adjustment
     cal_path = str(Path(config.log_dir) / "calibration.json")
-    load_calibration(cal_path)
+    calibration = load_calibration(cal_path)
 
     # Load today's ledger — persists placed tickers across invocations
     placed_tickers: Set[str] = load_ledger(config.log_dir)
@@ -547,6 +549,7 @@ def run(config: Config, game_filter: Optional[str] = None):
                     bankroll_usd=balance,
                     held_tickers=held_tickers,
                     placed_tickers=placed_tickers,
+                    calibration=calibration,
                 )
             except Exception as exc:
                 log.error("Error processing %s: %s", game.game_id, exc)

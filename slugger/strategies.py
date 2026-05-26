@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from slugger.calibration import CalibrationLayer
 from slugger.config import Config
 from slugger.kalshi_client import market_price
 from slugger.journal import record_signal
@@ -66,6 +67,7 @@ def strategy_pitcher_ks(
     batter_profile: Optional[BatterProfile],
     client: MarketClient,
     config: Config,
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     """Strikeout prop bets — Poisson model via signal pipeline."""
     event_ticker = ks_event_ticker(game_info)
@@ -161,7 +163,7 @@ def strategy_pitcher_ks(
         no_max_model_prob=_KS_NO_MAX_MODEL_PROB,
         no_min_edge_cents=_KS_NO_MIN_EDGE_CENTS,
     )
-    return evaluate_markets(spec, ks_model, client, config)
+    return evaluate_markets(spec, ks_model, client, config, calibration=calibration)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -176,6 +178,7 @@ def strategy_game_winner(
     away_pitcher: Optional[PitcherProfile] = None,
     home_team: Optional[TeamProfile] = None,
     away_team: Optional[TeamProfile] = None,
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     """Game winner prop — multi-factor model via signal pipeline.
 
@@ -231,7 +234,7 @@ def strategy_game_winner(
         ticker_suffix=home_abbrev,
         confidence_fn=lambda e: min(0.45 + e / 80, 0.75),
     )
-    return evaluate_markets(spec, gw_model, client, config)
+    return evaluate_markets(spec, gw_model, client, config, calibration=calibration)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -244,6 +247,7 @@ def strategy_total_runs(
     batter_profile: Optional[BatterProfile],
     client: MarketClient,
     config: Config,
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     """Total runs (over/under) prop — ERA bucket model via signal pipeline."""
     event_ticker = total_event_ticker(game_info)
@@ -263,7 +267,7 @@ def strategy_total_runs(
         title_keywords=["over"],
         confidence_fn=lambda _: 0.5,
     )
-    return evaluate_markets(spec, total_model, client, config)
+    return evaluate_markets(spec, total_model, client, config, calibration=calibration)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -278,6 +282,7 @@ def strategy_player_hr(
     batter_profile: Optional[BatterProfile],
     client: MarketClient,
     config: Config,
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     """Player home run prop — Poisson model via signal pipeline."""
     event_ticker = hr_event_ticker(game_info)
@@ -414,7 +419,7 @@ def strategy_player_hr(
         min_edge_cents=_HR_MIN_EDGE_CENTS,
         confidence_fn=lambda e: min(0.4 + e / 100, 0.75),
     )
-    return evaluate_markets(spec, hr_model, client, config)
+    return evaluate_markets(spec, hr_model, client, config, calibration=calibration)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -427,6 +432,7 @@ def strategy_player_hits_runs_rbis(
     batter_profile: Optional[BatterProfile],
     client: MarketClient,
     config: Config,
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     """Hits + Runs + RBIs prop — AVG bucket model via signal pipeline."""
     event_ticker = hrr_event_ticker(game_info)
@@ -457,7 +463,7 @@ def strategy_player_hits_runs_rbis(
         player_name=batter_profile.name,
         confidence_fn=lambda _: 0.45,
     )
-    return evaluate_markets(spec, hrr_model, client, config)
+    return evaluate_markets(spec, hrr_model, client, config, calibration=calibration)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -472,6 +478,7 @@ def strategy_player_hits(
     batter_profile: Optional[BatterProfile],
     client: MarketClient,
     config: Config,
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     """Player hits prop — Poisson model via signal pipeline."""
     event_ticker = hit_event_ticker(game_info)
@@ -577,7 +584,7 @@ def strategy_player_hits(
         max_signals=2,
         confidence_fn=lambda e: min(0.4 + e / 100, 0.80),
     )
-    return evaluate_markets(spec, hits_model, client, config)
+    return evaluate_markets(spec, hits_model, client, config, calibration=calibration)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1165,6 +1172,7 @@ def strategy_combo(
 def _run_game_winner(
     ctx: GameContext, client: MarketClient, config: Config,
     prior_signals: List[TradeSignal],
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     return strategy_game_winner(
         ctx.game, client, config,
@@ -1172,73 +1180,81 @@ def _run_game_winner(
         away_pitcher=ctx.away_pitcher,
         home_team=ctx.home_team,
         away_team=ctx.away_team,
+        calibration=calibration,
     )
 
 
 def _run_per_pitcher(
     fn,
     ctx: GameContext, client: MarketClient, config: Config,
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     """Call a pitcher-level strategy for each pitcher in the context."""
     signals: List[TradeSignal] = []
     for pitcher in [ctx.away_pitcher, ctx.home_pitcher]:
         if pitcher:
-            signals.extend(fn(ctx.game, pitcher, None, client, config))
+            signals.extend(fn(ctx.game, pitcher, None, client, config, calibration=calibration))
     return signals
 
 
 def _run_per_batter(
     fn,
     ctx: GameContext, client: MarketClient, config: Config,
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     """Call a batter-level strategy for each batter vs opposing pitcher."""
     signals: List[TradeSignal] = []
-    # away batters face home pitcher; home batters face away pitcher
     for batter in ctx.away_batters:
-        signals.extend(fn(ctx.game, ctx.home_pitcher, batter, client, config))
+        signals.extend(fn(ctx.game, ctx.home_pitcher, batter, client, config, calibration=calibration))
     for batter in ctx.home_batters:
-        signals.extend(fn(ctx.game, ctx.away_pitcher, batter, client, config))
+        signals.extend(fn(ctx.game, ctx.away_pitcher, batter, client, config, calibration=calibration))
     return signals
 
 
 def _run_pitcher_ks(
     ctx: GameContext, client: MarketClient, config: Config,
     prior_signals: List[TradeSignal],
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
-    return _run_per_pitcher(strategy_pitcher_ks, ctx, client, config)
+    return _run_per_pitcher(strategy_pitcher_ks, ctx, client, config, calibration=calibration)
 
 
 def _run_total_runs(
     ctx: GameContext, client: MarketClient, config: Config,
     prior_signals: List[TradeSignal],
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
-    return _run_per_pitcher(strategy_total_runs, ctx, client, config)
+    return _run_per_pitcher(strategy_total_runs, ctx, client, config, calibration=calibration)
 
 
 def _run_player_hr(
     ctx: GameContext, client: MarketClient, config: Config,
     prior_signals: List[TradeSignal],
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
-    return _run_per_batter(strategy_player_hr, ctx, client, config)
+    return _run_per_batter(strategy_player_hr, ctx, client, config, calibration=calibration)
 
 
 def _run_player_hits(
     ctx: GameContext, client: MarketClient, config: Config,
     prior_signals: List[TradeSignal],
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
-    return _run_per_batter(strategy_player_hits, ctx, client, config)
+    return _run_per_batter(strategy_player_hits, ctx, client, config, calibration=calibration)
 
 
 def _run_player_hr_rbis(
     ctx: GameContext, client: MarketClient, config: Config,
     prior_signals: List[TradeSignal],
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
-    return _run_per_batter(strategy_player_hits_runs_rbis, ctx, client, config)
+    return _run_per_batter(strategy_player_hits_runs_rbis, ctx, client, config, calibration=calibration)
 
 
 def _run_combo(
     ctx: GameContext, client: MarketClient, config: Config,
     prior_signals: List[TradeSignal],
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     return strategy_combo(ctx.game, client, config, single_leg_signals=prior_signals)
 

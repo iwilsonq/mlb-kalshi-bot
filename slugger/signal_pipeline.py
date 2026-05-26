@@ -29,9 +29,8 @@ from slugger.types import MarketClient, MarketSpec, ModelFn, ModelResult, TradeS
 
 log = logging.getLogger(__name__)
 
-# Module-level calibration layer — loaded once, shared across all calls.
-# Initialized as pass-through (identity) until load_calibration() is called.
-_calibration = CalibrationLayer()
+# Default identity calibration layer (pass-through, no adjustment).
+_IDENTITY_CALIBRATION = CalibrationLayer()
 
 
 # ─── Threshold parsing ───────────────────────────────────────────────────────
@@ -102,17 +101,14 @@ def parse_threshold_regex(title: str, pattern: str, ceil: bool = False) -> Optio
     return int(math.ceil(val)) if ceil else int(val)
 
 
-# ─── Calibration management ──────────────────────────────────────────────────
+# ─── Calibration loading ─────────────────────────────────────────────────────
 
-def load_calibration(path: str) -> None:
-    """Load calibration curves from disk into the module-level layer."""
-    global _calibration
-    _calibration = CalibrationLayer.load(path)
+def load_calibration(path: str) -> CalibrationLayer:
+    """Load calibration curves from disk and return the layer.
 
-
-def get_calibration() -> CalibrationLayer:
-    """Return the current calibration layer (for inspection/testing)."""
-    return _calibration
+    Returns an identity (pass-through) layer if the file is missing or invalid.
+    """
+    return CalibrationLayer.load(path)
 
 
 # ─── Default confidence function ─────────────────────────────────────────────
@@ -128,6 +124,7 @@ def evaluate_markets(
     model: ModelFn,
     client: MarketClient,
     config: Config,
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     """Run the full signal pipeline for a strategy.
 
@@ -139,12 +136,15 @@ def evaluate_markets(
         spec:   MarketSpec describing what to look for and strategy config.
         model:  Probability model callable. Takes (title, threshold, price)
                 and returns ModelResult or None.
-        client: KalshiClient for market queries.
+        client: MarketClient for market queries.
         config: Bot configuration.
+        calibration: CalibrationLayer for probability adjustment.
+                     Defaults to identity (no adjustment) if not provided.
 
     Returns:
         List of TradeSignal objects (may be empty).
     """
+    cal = calibration or _IDENTITY_CALIBRATION
     signals: List[TradeSignal] = []
 
     if not spec.event_ticker:
@@ -225,7 +225,7 @@ def evaluate_markets(
         # ── Apply calibration ──────────────────────────────────────────────
         # Record raw probability in signals.jsonl (for future recalibration),
         # then use calibrated probability for edge/trade decisions.
-        prob_pct = _calibration.calibrate(spec.strategy_name, raw_prob_pct)
+        prob_pct = cal.calibrate(spec.strategy_name, raw_prob_pct)
         edge = prob_pct - price
         evaluated.append((threshold, prob_pct, price, edge))
 
@@ -269,6 +269,7 @@ def evaluate_markets(
         yes_tickers: Set[str] = {s.ticker for s in signals}
         no_signals = _evaluate_no_side(
             markets, spec, model, config, edge_floor, confidence_fn, yes_tickers,
+            calibration=cal,
         )
         signals.extend(no_signals)
 
@@ -320,6 +321,7 @@ def _evaluate_no_side(
     edge_floor: int,
     confidence_fn: Callable[[float], float],
     yes_tickers: Set[str],
+    calibration: Optional[CalibrationLayer] = None,
 ) -> List[TradeSignal]:
     """Evaluate NO-side trades for markets where the model says YES is unlikely.
 
@@ -367,7 +369,8 @@ def _evaluate_no_side(
             continue
 
         raw_yes_pct = result.prob_pct
-        model_yes_pct = _calibration.calibrate(spec.strategy_name, raw_yes_pct)
+        cal = calibration or _IDENTITY_CALIBRATION
+        model_yes_pct = cal.calibrate(spec.strategy_name, raw_yes_pct)
 
         # Only consider NO when model is very confident YES won't happen
         if model_yes_pct > spec.no_max_model_prob:
