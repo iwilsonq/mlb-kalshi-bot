@@ -12,7 +12,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 import requests
 import statsapi
@@ -153,6 +153,42 @@ class Lineup:
     team: str
     batters: List[Dict[str, Any]]  # [{player_id, name, position, order}]
     confirmed: bool = False
+
+
+@dataclass
+class GameContext:
+    """Everything needed to evaluate a single game — no further API calls required.
+
+    Built once per game by an MLBDataProvider, then passed through the
+    processing pipeline.  Strategies receive this instead of calling
+    mlb_data functions directly.
+    """
+    game: GameInfo
+    away_pitcher: Optional[PitcherProfile] = None
+    home_pitcher: Optional[PitcherProfile] = None
+    away_batters: List[BatterProfile] = field(default_factory=list)
+    home_batters: List[BatterProfile] = field(default_factory=list)
+    away_team: Optional[TeamProfile] = None
+    home_team: Optional[TeamProfile] = None
+
+
+@runtime_checkable
+class MLBDataProvider(Protocol):
+    """Seam for MLB data sourcing.
+
+    Production adapter calls live APIs.  Test adapter returns fixtures.
+    """
+
+    def get_game_contexts(
+        self,
+        target_date: Optional[str] = None,
+    ) -> List[GameContext]:
+        """Fetch fully-hydrated game contexts for a date (default: today)."""
+        ...
+
+    def hydrate_game(self, game: GameInfo) -> GameContext:
+        """Hydrate a single GameInfo into a full GameContext."""
+        ...
 
 
 # ─── Team Lookup ─────────────────────────────────────────────────────────────
@@ -928,3 +964,153 @@ def _safe_float(val, default=0.0) -> float:
         return float(val)
     except (ValueError, TypeError):
         return default
+
+
+# ─── Live Data Provider ──────────────────────────────────────────────────────
+
+class LiveMLBDataProvider:
+    """Production adapter — fetches data from MLB Stats API + Statcast.
+
+    Wraps the existing module-level functions and returns fully-hydrated
+    GameContext objects so callers never need to call individual fetch
+    functions directly.
+    """
+
+    def get_game_contexts(
+        self,
+        target_date: Optional[str] = None,
+    ) -> List[GameContext]:
+        """Fetch today's games and hydrate each into a GameContext.
+
+        For each game, fetches (in parallel where possible):
+          - Both pitcher profiles
+          - Both team profiles
+          - Both lineups + batter profiles
+
+        Returns a list of GameContext objects ready for strategy evaluation.
+        """
+        games = get_todays_games(target_date)
+        if not games:
+            return []
+
+        contexts: List[GameContext] = []
+        for game in games:
+            ctx = self.hydrate_game(game)
+            contexts.append(ctx)
+        return contexts
+
+    def hydrate_game(self, game: GameInfo) -> GameContext:
+        """Build a complete GameContext for a single game.
+
+        Uses the shared thread pool (_POOL) for parallel I/O.
+        """
+        ctx = GameContext(game=game)
+
+        # ── Pitchers (parallel) ────────────────────────────────────────────
+        pitcher_futs = {}
+        if game.away_pitcher_id:
+            pitcher_futs["away"] = _POOL.submit(get_pitcher_profile, game.away_pitcher_id)
+        if game.home_pitcher_id:
+            pitcher_futs["home"] = _POOL.submit(get_pitcher_profile, game.home_pitcher_id)
+
+        if "away" in pitcher_futs:
+            try:
+                ctx.away_pitcher = pitcher_futs["away"].result()
+            except Exception as exc:
+                log.warning("Away pitcher profile failed for game %s: %s", game.game_id, exc)
+        if "home" in pitcher_futs:
+            try:
+                ctx.home_pitcher = pitcher_futs["home"].result()
+            except Exception as exc:
+                log.warning("Home pitcher profile failed for game %s: %s", game.game_id, exc)
+
+        # ── Teams (parallel) ──────────────────────────────────────────────
+        team_futs = {}
+        if game.away_abbrev:
+            team_futs["away"] = _POOL.submit(get_team_profile, game.away_abbrev)
+        if game.home_abbrev:
+            team_futs["home"] = _POOL.submit(get_team_profile, game.home_abbrev)
+
+        if "away" in team_futs:
+            try:
+                ctx.away_team = team_futs["away"].result()
+            except Exception as exc:
+                log.debug("Away team profile failed: %s", exc)
+        if "home" in team_futs:
+            try:
+                ctx.home_team = team_futs["home"].result()
+            except Exception as exc:
+                log.debug("Home team profile failed: %s", exc)
+
+        # ── Lineups + batter profiles ─────────────────────────────────────
+        if game.game_id:
+            ctx.away_batters, ctx.home_batters = self._fetch_batters(game)
+
+        return ctx
+
+    def _fetch_batters(self, game: GameInfo) -> Tuple[List[BatterProfile], List[BatterProfile]]:
+        """Fetch confirmed lineups and resolve batter profiles in parallel."""
+        away_batters: List[BatterProfile] = []
+        home_batters: List[BatterProfile] = []
+
+        try:
+            away_lineup = get_lineup(game.game_id, team="away")
+            home_lineup = get_lineup(game.game_id, team="home")
+        except Exception as exc:
+            log.warning("Lineup fetch failed for game %s: %s", game.game_id, exc)
+            return away_batters, home_batters
+
+        if not away_lineup.confirmed and not home_lineup.confirmed:
+            return away_batters, home_batters
+
+        # Collect all player IDs
+        away_pids = [b.get("player_id") for b in (away_lineup.batters or []) if b.get("player_id")]
+        home_pids = [b.get("player_id") for b in (home_lineup.batters or []) if b.get("player_id")]
+        all_pids = list(set(away_pids + home_pids))
+
+        # Fetch all profiles in parallel
+        profile_cache: Dict[int, BatterProfile] = {}
+        if all_pids:
+            futs = {_POOL.submit(get_batter_profile, pid): pid for pid in all_pids}
+            for fut in as_completed(futs):
+                pid = futs[fut]
+                try:
+                    profile_cache[pid] = fut.result()
+                except Exception as exc:
+                    log.debug("Could not fetch batter profile %d: %s", pid, exc)
+
+        # Reconstruct ordered lists
+        if away_lineup.confirmed:
+            for pid in away_pids:
+                if pid in profile_cache:
+                    away_batters.append(profile_cache[pid])
+        if home_lineup.confirmed:
+            for pid in home_pids:
+                if pid in profile_cache:
+                    home_batters.append(profile_cache[pid])
+
+        return away_batters, home_batters
+
+
+class FixtureMLBDataProvider:
+    """Test adapter — returns pre-built GameContext objects from fixture data.
+
+    Pass a list of GameContext objects at construction time; they're returned
+    verbatim by get_game_contexts() regardless of the requested date.
+    """
+
+    def __init__(self, contexts: List[GameContext]):
+        self._contexts = contexts
+        self._by_game_id = {ctx.game.game_id: ctx for ctx in contexts}
+
+    def get_game_contexts(
+        self,
+        target_date: Optional[str] = None,
+    ) -> List[GameContext]:
+        return list(self._contexts)
+
+    def hydrate_game(self, game: GameInfo) -> GameContext:
+        """Return the fixture context matching this game, or a bare context."""
+        if game.game_id in self._by_game_id:
+            return self._by_game_id[game.game_id]
+        return GameContext(game=game)

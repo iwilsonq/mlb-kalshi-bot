@@ -17,7 +17,6 @@ import os
 import requests
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional, Set
@@ -25,8 +24,7 @@ from typing import List, Optional, Set
 from slugger.config import Config
 from slugger.kalshi_client import KalshiClient
 from slugger.mlb_data import (
-    BatterProfile, get_batter_profile, get_lineup,
-    get_pitcher_profile, get_todays_games,
+    GameContext, LiveMLBDataProvider, get_todays_games,
 )
 from slugger.strategies import BATTER_STRATEGIES, STRATEGIES, TradeSignal, strategy_combo
 import slugger.journal as journal
@@ -181,74 +179,6 @@ def cmd_status(config: Config):
             )
 
 
-def _fetch_lineup_profiles(
-    game: "GameInfo",
-    config: Config,
-) -> tuple:
-    """Fetch BatterProfiles for both confirmed lineups.
-
-    Returns:
-        (away_batters, home_batters) — each a list of BatterProfile.
-        Either list may be empty if the lineup is not yet confirmed.
-
-    Batter profiles are fetched in parallel using a thread pool for
-    significant speedup (18 batters x 4 API calls each).
-    """
-    away_batters: List[BatterProfile] = []
-    home_batters: List[BatterProfile] = []
-
-    if not game.game_id:
-        return away_batters, home_batters
-
-    # Fetch both lineups (these are cheap — single API call each)
-    try:
-        away_lineup = get_lineup(game.game_id, team="away")
-        home_lineup = get_lineup(game.game_id, team="home")
-    except Exception as exc:
-        log.warning("Lineup fetch failed for game %s: %s", game.game_id, exc)
-        return away_batters, home_batters
-
-    if not away_lineup.confirmed and not home_lineup.confirmed:
-        log.info("  Lineups not yet posted — batter strategies will be skipped")
-        return away_batters, home_batters
-
-    # Collect all unique player IDs across both lineups
-    away_pids = [b.get("player_id") for b in (away_lineup.batters or []) if b.get("player_id")]
-    home_pids = [b.get("player_id") for b in (home_lineup.batters or []) if b.get("player_id")]
-    all_pids = list(set(away_pids + home_pids))
-
-    # ── Fetch all batter profiles in parallel ──────────────────────────────
-    profile_cache: dict = {}
-    if all_pids:
-        with ThreadPoolExecutor(max_workers=min(len(all_pids), 10)) as pool:
-            futures = {pool.submit(get_batter_profile, pid): pid for pid in all_pids}
-            for fut in as_completed(futures):
-                pid = futures[fut]
-                try:
-                    profile_cache[pid] = fut.result()
-                except Exception as exc:
-                    log.debug("Could not fetch batter profile %d: %s", pid, exc)
-
-    # Reconstruct ordered lists from the cache
-    if away_lineup.confirmed:
-        for pid in away_pids:
-            if pid in profile_cache:
-                away_batters.append(profile_cache[pid])
-    if home_lineup.confirmed:
-        for pid in home_pids:
-            if pid in profile_cache:
-                home_batters.append(profile_cache[pid])
-
-    if away_batters or home_batters:
-        log.info(
-            "  Lineups: %d away batters, %d home batters confirmed",
-            len(away_batters), len(home_batters),
-        )
-    else:
-        log.info("  Lineups not yet posted — batter strategies will be skipped")
-
-    return away_batters, home_batters
-
 
 def _game_matches(game: "GameInfo", pattern: str) -> bool:
     """Return True if the game involves a team matching the pattern.
@@ -287,6 +217,7 @@ def cmd_run(config: Config, game_filter: Optional[str] = None):
 
     client = config.create_kalshi_client()
     circuit = CircuitBreaker(config)
+    provider = LiveMLBDataProvider()
 
     # Load today's ledger — persists placed tickers across invocations
     placed_tickers: Set[str] = _load_ledger(config.log_dir)
@@ -367,8 +298,9 @@ def cmd_run(config: Config, game_filter: Optional[str] = None):
                 log.warning("⚡ Circuit breaker tripped mid-scan — stopping.")
                 break
             try:
+                ctx = provider.hydrate_game(game)
                 process_game(
-                    game, client, config, circuit,
+                    ctx, client, config, circuit,
                     bankroll_usd=balance,
                     held_tickers=held_tickers,
                     placed_tickers=placed_tickers,
@@ -503,7 +435,7 @@ def _game_has_started(game: "GameInfo", buffer_minutes: int = 5) -> bool:
 
 
 def process_game(
-    game: "GameInfo",
+    ctx: GameContext,
     client: KalshiClient,
     config: Config,
     circuit: "CircuitBreaker",
@@ -511,7 +443,12 @@ def process_game(
     held_tickers: Set[str],
     placed_tickers: Set[str],
 ):
-    """Run all strategies for a single game and execute trades."""
+    """Run all strategies for a single game and execute trades.
+
+    Accepts a fully-hydrated GameContext — pitcher profiles, batter profiles,
+    and team stats are already fetched.  No additional MLB API calls needed.
+    """
+    game = ctx.game
     log.info("\n🔍 %s @ %s [%s]", game.away_team, game.home_team, game.status)
 
     # ── Hard gate: refuse to trade if game has already started ──────────
@@ -519,25 +456,8 @@ def process_game(
         log.info("  ⛔ Game has started (past scheduled time + buffer) — skipping entirely")
         return
 
-    # ── Pitcher profiles (fetched in parallel) ────────────────────────────
-    away_pitch = None
-    home_pitch = None
-    with ThreadPoolExecutor(max_workers=2) as pitch_pool:
-        futures = {}
-        if game.away_pitcher_id:
-            futures["away"] = pitch_pool.submit(get_pitcher_profile, game.away_pitcher_id)
-        if game.home_pitcher_id:
-            futures["home"] = pitch_pool.submit(get_pitcher_profile, game.home_pitcher_id)
-        if "away" in futures:
-            try:
-                away_pitch = futures["away"].result()
-            except Exception as exc:
-                log.warning("Away pitcher profile failed: %s", exc)
-        if "home" in futures:
-            try:
-                home_pitch = futures["home"].result()
-            except Exception as exc:
-                log.warning("Home pitcher profile failed: %s", exc)
+    away_pitch = ctx.away_pitcher
+    home_pitch = ctx.home_pitcher
     log.info(
         "  Pitchers: %s vs %s",
         away_pitch.name if away_pitch else "TBD",
@@ -561,13 +481,7 @@ def process_game(
     # Collect all single-leg signals for potential combo use later
     all_single_leg_signals: List[TradeSignal] = []
 
-    # ── Pitcher / game-level strategies (run once per pitcher) ────────────────
-    # Run each strategy for both the away and home starter so markets for each
-    # pitcher are evaluated with that pitcher's own λ, not a shared one.
-    #
-    # When the game is in progress, check the live feed to skip any pitcher
-    # who has already been pulled — their K total is final and buying into
-    # an unmet threshold is a guaranteed loss.
+    # ── Pitcher / game-level strategies (run once per pitcher) ────────────
     pitchers = [p for p in [away_pitch, home_pitch] if p]
 
     for strat_name in pitcher_strats:
@@ -590,11 +504,13 @@ def process_game(
                 any_signals = True
 
     # ── Batter / player-prop strategies (run once per batter) ─────────────
-    if batter_strats:
-        away_batters, home_batters = _fetch_lineup_profiles(game, config)
+    away_batters = ctx.away_batters
+    home_batters = ctx.home_batters
+    batter_pitcher_pairs: List[tuple] = []
 
+    if batter_strats:
         # away batters face the home pitcher; home batters face the away pitcher
-        batter_pitcher_pairs: List[tuple] = (
+        batter_pitcher_pairs = (
             [(b, home_pitch) for b in away_batters] +
             [(b, away_pitch) for b in home_batters]
         )
@@ -602,6 +518,11 @@ def process_game(
         if not batter_pitcher_pairs:
             log.info("  Skipping batter strategies — lineups not yet posted")
         else:
+            if away_batters or home_batters:
+                log.info(
+                    "  Lineups: %d away batters, %d home batters confirmed",
+                    len(away_batters), len(home_batters),
+                )
             for batter, opp_pitcher in batter_pitcher_pairs:
                 if circuit.is_tripped():
                     log.warning("⚡ Circuit breaker tripped — stopping")
@@ -619,10 +540,22 @@ def process_game(
                         any_signals = True
 
     # ── Combo / parlay strategy ───────────────────────────────────────────
-    # Runs after all single-leg strategies so it can see every signal from
-    # this game and build the best multi-leg combinations.
     if "combo" in config.enabled_strategies and not circuit.is_tripped():
-        combo_signals = strategy_combo(game, all_single_leg_signals, client, config)
+        # Use batter data from context (already fetched by provider)
+        combo_bp_pairs = batter_pitcher_pairs
+        if not combo_bp_pairs:
+            combo_bp_pairs = (
+                [(b, home_pitch) for b in away_batters] +
+                [(b, away_pitch) for b in home_batters]
+            )
+
+        combo_signals = strategy_combo(
+            game, client, config,
+            away_pitcher=away_pitch,
+            home_pitcher=home_pitch,
+            batter_pitcher_pairs=combo_bp_pairs,
+            single_leg_signals=all_single_leg_signals,
+        )
         if _execute_signals(
             combo_signals, client, config, circuit,
             effective_bankroll, held_tickers, placed_tickers,
