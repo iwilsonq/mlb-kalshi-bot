@@ -16,6 +16,12 @@ from slugger.config import Config
 from slugger.kalshi_client import KalshiClient, market_price
 from slugger.journal import record_signal
 from slugger.mlb_data import get_team_profile
+from slugger.models import (
+    HR_PARK_FACTORS, HIT_PARK_FACTORS,
+    expected_ab, expected_hits_lambda, expected_ks,
+    game_winner_probability, hr_prob_poisson, parse_hit_threshold,
+    parse_k_threshold, poisson_ge, shrink_hr_rate, total_prob,
+)
 from slugger.sizing import kelly_count
 from slugger.signal_pipeline import evaluate_markets
 from slugger.tickers import (
@@ -29,19 +35,7 @@ from slugger.types import (
 
 log = logging.getLogger(__name__)
 
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PROBABILITY MODELS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# League-average constants for normalisation
-_LEAGUE_AVG_K_RATE  = 0.225   # ~22.5% of PAs end in strikeout (2024 MLB avg)
-_LEAGUE_AVG_WHIFF   = 0.245   # ~24.5% whiff rate on swings (2024 MLB avg)
-_LEAGUE_AVG_CHASE   = 0.285   # ~28.5% chase rate (swing at pitches outside zone, 2024)
-_LEAGUE_AVG_FB_VELO = 93.5    # mph, average four-seam fastball velocity (2024)
-_DEFAULT_IP         = 5.5     # default expected IP when recent data is missing
-_KS_LAMBDA_DEFLATOR = 0.85    # calibration: model over-predicts by ~15-20%, deflate λ
+# ── Strategy-specific constants (not model math — kept here) ──────────────────
 _KS_MIN_THRESHOLD   = 6       # skip 4+ and 5+ K markets (unprofitable historically)
 _KS_MIN_MODEL_PROB  = 15      # minimum model prob (%) to consider trading YES side
 _KS_NO_MAX_MODEL_PROB = 10    # buy NO when model says probability is at most this (%)
@@ -50,465 +44,16 @@ _KS_NO_MIN_EDGE_CENTS = 5     # minimum edge (market_yes_price - model_prob) to 
 # Threshold regex: matches "7+", "over 6.5", "at least 9" in any K-related title
 _KS_THRESHOLD_PATTERN = r'(\d+)\s*\+'
 
-
-def _poisson_ge(n: int, lam: float) -> float:
-    """P(X >= n) for a Poisson-distributed random variable with mean lam.
-
-    Uses the exact CDF: P(X >= n) = 1 - sum_{k=0}^{n-1} e^{-lam} * lam^k / k!
-
-    Clamped to [0.01, 0.99] to avoid degenerate edge prices.
-    """
-    if lam <= 0:
-        return 0.01
-    cumulative = 0.0
-    for k in range(n):
-        try:
-            cumulative += math.exp(-lam) * (lam ** k) / math.factorial(k)
-        except (OverflowError, ValueError):
-            break
-    return max(0.01, min(0.99, 1.0 - cumulative))
-
-
-def _expected_ks(
-    profile: PitcherProfile,
-    opp_k_rate: float = 0.0,
-) -> float:
-    """Estimate the expected number of strikeouts for a pitcher in today's start.
-
-    Combines:
-      - Recent K/start (last 5 starts) — weighted 70%
-      - Season K/9 × expected IP        — weighted 30%
-      - Opponent team K rate adjustment  (dampened — half-weight)
-      - Statcast whiff rate adjustment   (dampened — half-weight)
-      - Hard ceiling from demonstrated max Ks
-
-    The opponent and whiff adjustments are dampened toward 1.0 to prevent
-    the old problem of multiplicative compounding inflating λ beyond what
-    the pitcher has ever demonstrated.
-
-    Returns lambda for the Poisson model.
-    """
-    # ── Base: recent K/start ───────────────────────────────────────────────
-    recent_k  = profile.recent_k_per_start   # 0 if not populated
-    recent_ip = profile.recent_ip_per_start or _DEFAULT_IP
-
-    # Season rate: K/9 × expected IP
-    season_k_per_9 = profile.k_per_9 or 0.0
-    season_k = (season_k_per_9 / 9.0) * recent_ip
-
-    if recent_k > 0 and season_k > 0:
-        lam = 0.70 * recent_k + 0.30 * season_k
-    elif recent_k > 0:
-        lam = recent_k
-    elif season_k > 0:
-        lam = season_k
-    else:
-        return 0.0
-
-    # ── Opponent K rate adjustment (dampened) ──────────────────────────────
-    # Raw multiplier pulled halfway toward 1.0 to prevent over-adjustment.
-    # Example: opp_k_rate=0.26, league=0.225 → raw=1.156 → dampened=1.078
-    if opp_k_rate > 0:
-        raw_opp = opp_k_rate / _LEAGUE_AVG_K_RATE
-        lam *= 1.0 + 0.5 * (raw_opp - 1.0)
-
-    # ── Statcast whiff rate adjustment (dampened) ─────────────────────────
-    # Same half-weight dampening toward 1.0.
-    if profile.whiff_rate > 0:
-        raw_whiff = profile.whiff_rate / _LEAGUE_AVG_WHIFF
-        lam *= 1.0 + 0.5 * (raw_whiff - 1.0)
-
-    # ── Statcast chase rate adjustment (dampened) ─────────────────────────
-    # Chase rate measures how often batters swing at pitches outside the zone.
-    # High chase rate = more whiffs on non-competitive pitches = more Ks.
-    # This is distinct from whiff rate (which includes in-zone swinging strikes).
-    if profile.chase_rate > 0:
-        raw_chase = profile.chase_rate / _LEAGUE_AVG_CHASE
-        lam *= 1.0 + 0.3 * (raw_chase - 1.0)  # lighter weight than whiff
-
-    # ── Fastball velocity adjustment ──────────────────────────────────────
-    # Velocity correlates with K rate: faster = more Ks.  Each mph above
-    # average adds ~0.5 K/9.  We use a dampened multiplicative adjustment
-    # so extreme values don't dominate.
-    if profile.avg_fastball_velo > 0:
-        velo_diff = profile.avg_fastball_velo - _LEAGUE_AVG_FB_VELO
-        # ~2% adjustment per mph, dampened by half
-        lam *= 1.0 + 0.01 * velo_diff
-
-    # ── Hard ceiling: cap λ at max Ks observed + 1 ────────────────────────
-    # A pitcher who has never exceeded 6 Ks should not have λ > 7.
-    # The +1 buffer allows for a reasonable breakout but prevents the model
-    # from projecting far beyond demonstrated ability.
-    max_k = getattr(profile, "max_k_in_start", 0)
-    if max_k > 0:
-        ceiling = max_k + 1
-        if lam > ceiling:
-            log.debug(
-                "%s: capping λ from %.1f to %d (max K in any start: %d)",
-                profile.name, lam, ceiling, max_k,
-            )
-            lam = float(ceiling)
-
-    # ── Calibration deflation ──────────────────────────────────────────────
-    # Historical calibration shows the model over-predicts by ~15-20%
-    # across the 10-50% probability range. Apply a multiplicative correction.
-    lam *= _KS_LAMBDA_DEFLATOR
-
-    return max(0.0, lam)
-
-
-def _parse_k_threshold(title: str) -> Optional[int]:
-    """Extract the integer K threshold from a Kalshi market title.
-
-    Handles patterns like:
-      "7+ strikeouts"        → 7
-      "Pitcher records 8+ Ks" → 8
-      "over 6.5 strikeouts"  → 7  (rounds up)
-      "at least 9 strikeouts" → 9
-    Returns None if no threshold can be parsed.
-    """
-    t = title.lower()
-    # "N+" pattern — most common Kalshi format
-    m = re.search(r'(\d+)\s*\+', t)
-    if m:
-        return int(m.group(1))
-    # "over N.5" or "over N" pattern
-    m = re.search(r'over\s+(\d+(?:\.\d+)?)', t)
-    if m:
-        return int(math.ceil(float(m.group(1))))
-    # "at least N" pattern
-    m = re.search(r'at\s+least\s+(\d+)', t)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-_AVG_AB_PER_GAME      = 3.9    # MLB average ABs per player per game (fallback)
-
-# Expected plate appearances by batting order position.
-# Source: MLB averages (2022-2024).  PA includes AB + BB + HBP + SF + SH.
-# AB is slightly lower (~0.1-0.2 fewer per PA due to walks), but we use PA
-# as the opportunity count since walks can still produce runs/RBIs.
-_PA_BY_ORDER = {
-    1: 4.30,    # Leadoff — most PA
-    2: 4.15,
-    3: 4.10,
-    4: 4.05,    # Cleanup
-    5: 3.95,
-    6: 3.85,
-    7: 3.70,
-    8: 3.55,
-    9: 3.40,    # 9th hitter — fewest PA
-}
-
-
-def _expected_ab(batting_order: int) -> float:
-    """Return expected at-bats per game adjusted for lineup position.
-
-    Uses lineup-position PA estimates when the batting order is known
-    (1-9), falls back to league average (3.9) when unknown (0).
-    """
-    if batting_order < 1 or batting_order > 9:
-        return _AVG_AB_PER_GAME
-    return _PA_BY_ORDER[batting_order]
-_LEAGUE_AVG_HR_PER_9  = 1.1   # league-average HR allowed per 9 IP (2024)
-_LEAGUE_AVG_HR_PER_AB = 0.017  # calibrated to ~6.5% per-game HR rate (0.065 / 3.9 AB)
-_HR_PRIOR_AB          = 300    # prior weight in AB-equivalents for shrinkage (stronger pull to mean)
-_MIN_PITCHER_IP       = 40.0   # minimum IP before trusting a pitcher's HR/9 (~7 starts)
-_MAX_PITCHER_HR_ADJ   = 1.5    # cap pitcher HR/9 multiplier (prevent noise amplification)
+# Strategy-specific HR constants (not model math)
 _HR_MIN_MODEL_PROB    = 12     # minimum model probability (%) to even consider trading
 _HR_MIN_EDGE_CENTS    = 8      # HR-specific minimum edge (higher than global MIN_EDGE_CENTS)
 _HR_MIN_AB            = 80     # minimum AB before considering a batter (filter noise)
 
-# HR park factors by home team abbreviation (normalized: 1.0 = league average).
-# Source: multi-year (2022-2024) HR park factor data.
-# A value of 1.15 means 15% more HRs hit in that park than average.
-HR_PARK_FACTORS: Dict[str, float] = {
-    # Strongly pitcher-friendly
-    "SF":  0.82,   # Oracle Park — marine layer + wind + deep CF
-    "MIA": 0.85,   # loanDepot park
-    "OAK": 0.87,   # Oakland Coliseum
-    "NYM": 0.88,   # Citi Field
-    "SEA": 0.89,   # T-Mobile Park
-    "LAD": 0.90,   # Dodger Stadium
-    "PIT": 0.91,   # PNC Park
-    "SD":  0.93,   # Petco Park
-    "DET": 0.93,   # Comerica Park
-    "TB":  0.94,   # Tropicana Field
-    # Slightly pitcher-friendly / neutral
-    "STL": 0.96,   # Busch Stadium
-    "KC":  0.96,   # Kauffman Stadium
-    "WSH": 0.96,   # Nationals Park
-    "BOS": 0.97,   # Fenway Park
-    "CHC": 0.97,   # Wrigley Field
-    "TOR": 1.00,
-    "ATL": 1.00,   # Truist Park
-    "CHW": 1.00,   # Guaranteed Rate Field
-    "MIN": 1.02,   # Target Field
-    "LAA": 1.02,   # Angel Stadium
-    # Slightly hitter-friendly
-    "PHI": 1.03,   # Citizens Bank Park
-    "MIL": 1.06,   # American Family Field
-    "HOU": 1.08,   # Minute Maid Park (Crawford Boxes in LF)
-    "TEX": 1.10,   # Globe Life Field
-    "BAL": 1.10,   # Camden Yards
-    "CLE": 1.05,   # Progressive Field
-    "ARI": 1.05,   # Chase Field (altitude helps)
-    # Strongly hitter-friendly
-    "CIN": 1.14,   # Great American Ballpark
-    "NYY": 1.18,   # Yankee Stadium — short right-field porch
-    "COL": 1.38,   # Coors Field — altitude
-}
-
-
-def _shrink_hr_rate(hr: int, ab: int) -> float:
-    """Bayesian shrinkage of a batter's HR/AB rate toward league average.
-
-    Uses a Beta-Binomial conjugate prior equivalent to observing
-    _HR_PRIOR_AB at-bats at the league-average HR rate.  This means:
-      - A batter with 0 AB is assigned pure league average (~2.8%)
-      - A batter with 150 AB is weighted 50% actual / 50% prior
-      - A batter with 500+ AB is mostly driven by actual data
-
-    This prevents 1 HR in 17 AB (5.9%) from being treated as a
-    genuine signal vs. the league-average 2.8%.
-    """
-    prior_hr = _LEAGUE_AVG_HR_PER_AB * _HR_PRIOR_AB
-    return (hr + prior_hr) / (ab + _HR_PRIOR_AB)
-
-
-def _hr_prob_poisson(
-    hr: int,
-    ab: int,
-    opp_hr_per_9: float = 0.0,
-    opp_ip: float = 0.0,
-    batting_order: int = 0,
-) -> tuple:
-    """P(batter hits 1+ HR in a game) using a Poisson model with shrinkage.
-
-    Applies Bayesian shrinkage on the batter's HR/AB rate, then adjusts
-    for the opposing pitcher's HR/9 only when they have enough innings
-    to make that rate meaningful.
-
-    Args:
-        batting_order: 1-9 lineup position for PA adjustment (0 = use default).
-
-    Returns:
-        (probability, effective_hr_per_ab, applied_pitcher_adj)
-        so callers can log what drove the estimate.
-    """
-    effective_rate = _shrink_hr_rate(hr, ab)
-    lam = effective_rate * _expected_ab(batting_order)
-
-    # Only apply pitcher HR/9 adjustment if they have sufficient IP,
-    # and cap it so a small stretch of bad luck can't dominate the estimate.
-    pitcher_adj = 1.0
-    if opp_hr_per_9 > 0 and opp_ip >= _MIN_PITCHER_IP:
-        pitcher_adj = min(opp_hr_per_9 / _LEAGUE_AVG_HR_PER_9, _MAX_PITCHER_HR_ADJ)
-        lam *= pitcher_adj
-
-    prob = 1.0 - math.exp(-lam) if lam > 0 else 0.0
-    return prob, effective_rate, pitcher_adj
-
-
-def _total_prob(era: float) -> int:
-    """Estimate probability of Over based on combined starting ERA.
-    Returns estimated % chance of Over 8.5 runs.
-    """
-    if era >= 6.0:
-        return 75
-    elif era >= 5.0:
-        return 62
-    elif era >= 4.5:
-        return 52
-    elif era >= 4.0:
-        return 43
-    elif era >= 3.5:
-        return 33
-    else:
-        return 25
-
-
-# ── Game winner model constants ───────────────────────────────────────────────
-_LEAGUE_AVG_RPG = 4.50     # 2024 MLB average runs per game per team
-_LEAGUE_AVG_ERA = 4.10     # 2024 MLB league-average ERA
-_HOME_FIELD_ADV = 0.540    # MLB historical home win rate (~54%)
-_GW_PITCHING_WEIGHT = 0.40 # weight of pitching component in overall rating
-_GW_OFFENSE_WEIGHT  = 0.40 # weight of offensive component in overall rating
-_GW_BULLPEN_WEIGHT  = 0.10 # weight of bullpen component in overall rating
-_GW_RECORD_WEIGHT   = 0.10 # weight of team record / momentum
-
-
-def _pitcher_quality(pitcher: Optional[PitcherProfile]) -> float:
-    """Rate a pitcher relative to league average.
-
-    Returns a multiplier where 1.0 = league average.  Lower ERA means
-    a BETTER pitcher, so we invert: quality = league_avg / pitcher_era.
-
-    Prefers xERA > recent ERA > season ERA as the predictive metric.
-    """
-    if not pitcher:
-        return 1.0
-
-    # Pick best available metric (xERA > recent ERA > season ERA)
-    era = pitcher.xera or pitcher.recent_era or pitcher.era
-    if not era or era <= 0:
-        return 1.0
-
-    return _LEAGUE_AVG_ERA / era
-
-
-def _game_winner_probability(
-    home_pitcher: Optional[PitcherProfile],
-    away_pitcher: Optional[PitcherProfile],
-    home_team: Optional[TeamProfile] = None,
-    away_team: Optional[TeamProfile] = None,
-) -> Tuple[int, int]:
-    """Estimate home and away win probabilities using a multi-factor model.
-
-    Combines:
-      1. Starting pitcher quality (xERA / recent ERA / season ERA)
-      2. Team offensive strength (runs/game, OPS)
-      3. Bullpen quality (bullpen ERA)
-      4. Team record strength (win% from W/L)
-      5. Home field advantage (~54% baseline)
-
-    Uses a log5-inspired approach: each team gets a composite rating,
-    and the probability is derived from the ratio of ratings adjusted
-    for home field advantage.
-
-    Returns:
-        (home_prob, away_prob) as integer percentages summing to 100.
-    """
-    # ── Component 1: Starting pitcher quality ──────────────────────────────
-    home_pitch_q = _pitcher_quality(home_pitcher)
-    away_pitch_q = _pitcher_quality(away_pitcher)
-
-    # ── Component 2: Offensive strength ────────────────────────────────────
-    home_off_q = 1.0
-    away_off_q = 1.0
-    if home_team and home_team.runs_per_game > 0:
-        home_off_q = home_team.runs_per_game / _LEAGUE_AVG_RPG
-    if away_team and away_team.runs_per_game > 0:
-        away_off_q = away_team.runs_per_game / _LEAGUE_AVG_RPG
-
-    # ── Component 3: Bullpen quality ───────────────────────────────────────
-    home_bp_q = 1.0
-    away_bp_q = 1.0
-    if home_team and home_team.bullpen_era > 0:
-        home_bp_q = _LEAGUE_AVG_ERA / home_team.bullpen_era
-    if away_team and away_team.bullpen_era > 0:
-        away_bp_q = _LEAGUE_AVG_ERA / away_team.bullpen_era
-
-    # ── Component 4: Team record strength ──────────────────────────────────
-    home_rec_q = 1.0
-    away_rec_q = 1.0
-    if home_team and (home_team.wins + home_team.losses) >= 20:
-        home_rec_q = (home_team.wins / (home_team.wins + home_team.losses)) / 0.500
-    if away_team and (away_team.wins + away_team.losses) >= 20:
-        away_rec_q = (away_team.wins / (away_team.wins + away_team.losses)) / 0.500
-
-    # ── Composite rating (weighted) ────────────────────────────────────────
-    home_rating = (
-        _GW_PITCHING_WEIGHT * home_pitch_q
-        + _GW_OFFENSE_WEIGHT * home_off_q
-        + _GW_BULLPEN_WEIGHT * home_bp_q
-        + _GW_RECORD_WEIGHT  * home_rec_q
-    )
-    away_rating = (
-        _GW_PITCHING_WEIGHT * away_pitch_q
-        + _GW_OFFENSE_WEIGHT * away_off_q
-        + _GW_BULLPEN_WEIGHT * away_bp_q
-        + _GW_RECORD_WEIGHT  * away_rec_q
-    )
-
-    # ── Log5 probability with home field advantage ─────────────────────────
-    # log5 formula: P(home) = (home_rating * HFA) / (home_rating * HFA + away_rating * (1 - HFA))
-    # where HFA = home field advantage expressed as probability (~0.54)
-    if home_rating <= 0 or away_rating <= 0:
-        return 54, 46
-
-    home_raw = home_rating * _HOME_FIELD_ADV
-    away_raw = away_rating * (1.0 - _HOME_FIELD_ADV)
-    home_prob = home_raw / (home_raw + away_raw)
-
-    # Clamp to reasonable range (no team is >70% or <30% to win)
-    home_prob_pct = round(max(30, min(70, home_prob * 100)))
-    return home_prob_pct, 100 - home_prob_pct
-
-
-def _expected_hits_lambda(
-    batter: BatterProfile,
-    pitcher: Optional[PitcherProfile],
-    home_abbrev: str,
-) -> float:
-    """Compute expected hits (λ) for a batter in a single game.
-
-    Combines Bayesian-shrunk batting average, xBA Statcast data, opposing
-    pitcher WHIP adjustment, and park factor into a single Poisson rate.
-
-    This is the shared model used by both single-leg player_hits strategy
-    and combo leg sourcing.
-
-    Args:
-        batter:       Batter profile with season stats and Statcast data.
-        pitcher:      Opposing pitcher profile (for WHIP adjustment).
-        home_abbrev:  Home team abbreviation (for park factor lookup).
-
-    Returns:
-        Lambda (expected hits per game) for the Poisson model, or 0 if
-        insufficient data.
-    """
-    if batter.ab < _HITS_MIN_AB:
-        return 0.0
-
-    opp_whip = pitcher.whip if pitcher else 0.0
-    opp_ip = pitcher.innings_pitched if pitcher else 0.0
-    opp_throws = (pitcher.throws if pitcher else "") or ""
-
-    # ── Platoon split selection ────────────────────────────────────────────
-    if opp_throws == "L" and batter.vs_lhp_ab >= 30:
-        split_h = round(batter.vs_lhp_avg * batter.vs_lhp_ab)
-        split_ab = batter.vs_lhp_ab
-    elif opp_throws == "R" and batter.vs_rhp_ab >= 30:
-        split_h = round(batter.vs_rhp_avg * batter.vs_rhp_ab)
-        split_ab = batter.vs_rhp_ab
-    else:
-        split_h = batter.hits
-        split_ab = batter.ab
-
-    ab_est = _expected_ab(batter.batting_order)
-
-    eff_avg = _shrink_avg(split_h, split_ab)
-    lam = eff_avg * ab_est
-
-    # xBA blend
-    if batter.xba > 0:
-        blended_avg = 0.70 * eff_avg + 0.30 * batter.xba
-        lam = blended_avg * ab_est
-
-    # Pitcher WHIP adjustment
-    if opp_whip > 0 and opp_ip >= _HITS_MIN_PITCHER_IP:
-        raw_whip = opp_whip / _LEAGUE_AVG_WHIP
-        pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), _MAX_PITCHER_WHIP_ADJ)
-        lam *= pitcher_adj
-
-    # Hard hit rate adjustment (dampened)
-    # Hard-hit balls (95+ mph EV) become hits far more often than soft contact.
-    # League average hard-hit rate is ~37%.
-    _LEAGUE_AVG_HHR = 0.370
-    if batter.hard_hit_rate > 0:
-        raw_hhr = batter.hard_hit_rate / _LEAGUE_AVG_HHR
-        lam *= 1.0 + 0.25 * (raw_hhr - 1.0)  # lighter dampening
-
-    # Park factor
-    home_kalshi = kalshi_team(home_abbrev)
-    park_factor = HIT_PARK_FACTORS.get(
-        home_kalshi, HIT_PARK_FACTORS.get(home_abbrev.upper(), 1.0),
-    )
-    lam *= park_factor
-
-    return lam
+# Strategy-specific hits constants (not model math)
+_HITS_MIN_AB          = 60      # minimum AB before considering a batter
+_HITS_MIN_MODEL_PROB  = 12      # minimum model probability (%) to trade
+_HITS_MIN_EDGE_CENTS  = 4       # hits-specific minimum edge in cents
+_HITS_THRESHOLD_PATTERN = r'(\d+)\s*\+\s*hit'
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -543,13 +88,13 @@ def strategy_pitcher_ks(
         opp_k_rate = opp_team.k_rate
         log.debug(
             "Opponent %s K rate: %.1f%% (league avg %.1f%%)",
-            opp_abbrev, opp_k_rate * 100, _LEAGUE_AVG_K_RATE * 100,
+            opp_abbrev, opp_k_rate * 100, 22.5,
         )
     except Exception as exc:
         log.debug("Could not fetch opponent K rate: %s", exc)
 
     # ── Compute expected strikeouts (λ) ────────────────────────────────────
-    lam = _expected_ks(pitcher_profile, opp_k_rate)
+    lam = expected_ks(pitcher_profile, opp_k_rate)
     if lam <= 0:
         return []
 
@@ -559,7 +104,7 @@ def strategy_pitcher_ks(
     in_game = current_ks is not None and ip_today is not None
 
     if in_game:
-        expected_ip = pitcher_profile.recent_ip_per_start or _DEFAULT_IP
+        expected_ip = pitcher_profile.recent_ip_per_start or 5.5
         ip_remaining = max(0.0, expected_ip - ip_today)
         frac_remaining = ip_remaining / expected_ip if expected_ip > 0 else 0.0
         lam_remaining = lam * frac_remaining
@@ -590,9 +135,9 @@ def strategy_pitcher_ks(
                 prob_pct = 99
             else:
                 remaining_needed = threshold - current_ks
-                prob_pct = round(_poisson_ge(remaining_needed, lam) * 100)
+                prob_pct = round(poisson_ge(remaining_needed, lam) * 100)
         else:
-            prob_pct = round(_poisson_ge(threshold, lam) * 100)
+            prob_pct = round(poisson_ge(threshold, lam) * 100)
 
         reason = (
             f"λ={lam:.1f}Ks  P(≥{threshold})={prob_pct}%"
@@ -634,7 +179,7 @@ def strategy_game_winner(
 ) -> List[TradeSignal]:
     """Game winner prop — multi-factor model via signal pipeline.
 
-    Uses _game_winner_probability() which combines:
+    Uses game_winner_probability() which combines:
       - Both pitchers' quality (xERA preferred over ERA)
       - Team offensive strength (runs/game)
       - Bullpen quality
@@ -649,7 +194,7 @@ def strategy_game_winner(
         return []
 
     home_abbrev = kalshi_team(game_info.home_abbrev)
-    home_prob, away_prob = _game_winner_probability(
+    home_prob, away_prob = game_winner_probability(
         home_pitcher, away_pitcher, home_team, away_team,
     )
 
@@ -706,7 +251,7 @@ def strategy_total_runs(
         return []
 
     era = pitcher_profile.era
-    est_over = _total_prob(era)
+    est_over = total_prob(era)
 
     def total_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
         reason = f"Total runs: ERA {era:.1f} → over {est_over}% vs {price}¢"
@@ -761,8 +306,8 @@ def strategy_player_hr(
         platoon_note = "overall" if not opp_throws else f"overall({opp_throws}_split<20AB)"
 
     # ── Compute λ ──────────────────────────────────────────────────────────
-    ab_est = _expected_ab(batter_profile.batting_order)
-    _, eff_rate, pitcher_adj = _hr_prob_poisson(
+    ab_est = expected_ab(batter_profile.batting_order)
+    _, eff_rate, pitcher_adj = hr_prob_poisson(
         hr=split_hr, ab=split_ab,
         opp_hr_per_9=opp_hr_per_9, opp_ip=opp_ip,
         batting_order=batter_profile.batting_order,
@@ -848,7 +393,7 @@ def strategy_player_hr(
     def hr_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
         if threshold is None:
             return None
-        prob_pct = round(_poisson_ge(threshold, lam) * 100)
+        prob_pct = round(poisson_ge(threshold, lam) * 100)
         reason = (
             f"{batter_profile.name}"
             f"  {split_hr}HR/{split_ab}AB({platoon_note})"
@@ -919,99 +464,7 @@ def strategy_player_hits_runs_rbis(
 #  STRATEGY: Player Hits
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# ── Hits model constants ──────────────────────────────────────────────────────
 
-_LEAGUE_AVG_H_PER_AB  = 0.243   # 2024 MLB batting average
-_HITS_PRIOR_AB        = 250     # prior weight for Bayesian shrinkage on AVG
-_HITS_MIN_AB          = 60      # minimum AB before considering a batter
-_HITS_MIN_MODEL_PROB  = 12      # minimum model probability (%) to trade
-_HITS_MIN_EDGE_CENTS  = 4       # hits-specific minimum edge in cents
-_HITS_MIN_PITCHER_IP  = 30.0    # minimum IP to trust pitcher WHIP/BAA
-_LEAGUE_AVG_WHIP      = 1.28    # 2024 MLB league-average WHIP
-_MAX_PITCHER_WHIP_ADJ = 1.35    # cap pitcher WHIP multiplier
-
-# Hit park factors by home team abbreviation (normalized: 1.0 = league average).
-# Source: multi-year (2022-2024) hit park factor data.
-# A value of 1.05 means 5% more hits in that park than average.
-# These differ from HR park factors — e.g. Fenway inflates hits (doubles off the
-# wall) but not HR; Coors inflates both.
-HIT_PARK_FACTORS: Dict[str, float] = {
-    # Pitcher-friendly for hits
-    "OAK": 0.93,   # Oakland Coliseum — large foul territory
-    "SEA": 0.94,   # T-Mobile Park
-    "MIA": 0.95,   # loanDepot park
-    "SF":  0.95,   # Oracle Park — marine layer suppresses all contact
-    "TB":  0.96,   # Tropicana Field
-    "SD":  0.96,   # Petco Park
-    "NYM": 0.97,   # Citi Field
-    "DET": 0.97,   # Comerica Park
-    "PIT": 0.97,   # PNC Park
-    "LAD": 0.98,   # Dodger Stadium
-    # Neutral
-    "STL": 0.99,
-    "KC":  0.99,
-    "WSH": 1.00,
-    "ATL": 1.00,
-    "TOR": 1.00,
-    "CHW": 1.00,
-    "MIN": 1.00,
-    "LAA": 1.01,
-    "CLE": 1.01,
-    "PHI": 1.01,
-    "MIL": 1.01,
-    "HOU": 1.02,
-    "BAL": 1.02,
-    # Hitter-friendly for hits
-    "TEX": 1.03,   # Globe Life Field
-    "ARI": 1.03,   # Chase Field — altitude + dry air
-    "CHC": 1.04,   # Wrigley Field — wind out = hits galore
-    "CIN": 1.04,   # Great American Ballpark
-    "NYY": 1.04,   # Yankee Stadium — short porches = doubles too
-    "BOS": 1.06,   # Fenway Park — Green Monster = lots of doubles
-    "COL": 1.12,   # Coors Field — altitude king
-}
-
-
-
-
-
-def _shrink_avg(hits: int, ab: int) -> float:
-    """Bayesian shrinkage of a batter's batting average toward league average.
-
-    Uses a Beta-Binomial conjugate prior equivalent to observing
-    _HITS_PRIOR_AB at-bats at the league-average batting average.  This means:
-      - A batter with 0 AB is assigned pure league average (~.243)
-      - A batter with 250 AB is weighted ~50/50 actual vs prior
-      - A batter with 500+ AB is mostly driven by actual data
-
-    This prevents a .400 hitter in 50 AB from dominating the estimate.
-    """
-    prior_hits = _LEAGUE_AVG_H_PER_AB * _HITS_PRIOR_AB
-    return (hits + prior_hits) / (ab + _HITS_PRIOR_AB)
-
-
-def _parse_hit_threshold(title: str) -> Optional[int]:
-    """Extract the integer hit threshold from a Kalshi market title.
-
-    Handles patterns like:
-      "2+ hits"        → 2
-      "3+ hits?"       → 3
-    Returns None if no threshold can be parsed.
-    """
-    t = title.lower()
-    m = re.search(r'(\d+)\s*\+\s*hit', t)
-    if m:
-        return int(m.group(1))
-    m = re.search(r'over\s+(\d+(?:\.\d+)?)\s*hit', t)
-    if m:
-        return int(math.ceil(float(m.group(1))))
-    m = re.search(r'at\s+least\s+(\d+)\s*hit', t)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-_HITS_THRESHOLD_PATTERN = r'(\d+)\s*\+\s*hit'
 
 def strategy_player_hits(
     game_info: GameInfo,
@@ -1051,7 +504,7 @@ def strategy_player_hits(
         platoon_note = "overall"
 
     # ── Compute λ ──────────────────────────────────────────────────────────
-    ab_est = _expected_ab(batter_profile.batting_order)
+    ab_est = expected_ab(batter_profile.batting_order)
     eff_avg = _shrink_avg(split_h, split_ab)
     lam = eff_avg * ab_est
 
@@ -1100,7 +553,7 @@ def strategy_player_hits(
     def hits_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
         if threshold is None:
             return None
-        prob_pct = round(_poisson_ge(threshold, lam) * 100)
+        prob_pct = round(poisson_ge(threshold, lam) * 100)
         reason = (
             f"{batter_profile.name}"
             f"  {split_h}H/{split_ab}AB({platoon_note})"
@@ -1494,7 +947,7 @@ def _source_game_winner_leg(
 ) -> List[ComboLeg]:
     """Source a game-winner leg by picking the favoured team.
 
-    Uses _game_winner_probability() to estimate each side's win probability
+    Uses game_winner_probability() to estimate each side's win probability
     from the full multi-factor model, then returns the favoured side.
     """
     legs: List[ComboLeg] = []
@@ -1510,7 +963,7 @@ def _source_game_winner_leg(
     if not markets:
         return legs
 
-    home_prob, away_prob = _game_winner_probability(
+    home_prob, away_prob = game_winner_probability(
         home_pitcher, away_pitcher, home_team, away_team,
     )
 
@@ -1593,7 +1046,7 @@ def _source_pitcher_ks_legs(
         except Exception:
             pass
 
-        lam = _expected_ks(pitcher, opp_k_rate)
+        lam = expected_ks(pitcher, opp_k_rate)
         if lam <= 0:
             continue
 
@@ -1611,11 +1064,11 @@ def _source_pitcher_ks_legs(
             if price <= 0 or price >= 100:
                 continue
 
-            threshold = _parse_k_threshold(m.get("title", ""))
+            threshold = parse_k_threshold(m.get("title", ""))
             if threshold is None or threshold < _KS_MIN_THRESHOLD:
                 continue
 
-            prob_pct = round(_poisson_ge(threshold, lam) * 100)
+            prob_pct = round(poisson_ge(threshold, lam) * 100)
             if prob_pct < _COMBO_LEG_MIN_PROB:
                 continue
 
@@ -1648,7 +1101,7 @@ def _source_player_hits_legs(
 ) -> List[ComboLeg]:
     """Source player hit legs using the shared Poisson model.
 
-    Uses _expected_hits_lambda() — the same model as strategy_player_hits.
+    Uses expected_hits_lambda() — the same model as strategy_player_hits.
     Picks the single best hit threshold per batter (highest edge).
     """
     legs: List[ComboLeg] = []
@@ -1668,7 +1121,7 @@ def _source_player_hits_legs(
         if not batter:
             continue
 
-        lam = _expected_hits_lambda(batter, opp_pitcher, game_info.home_abbrev)
+        lam = expected_hits_lambda(batter, opp_pitcher, game_info.home_abbrev)
         if lam <= 0:
             continue
 
@@ -1684,11 +1137,11 @@ def _source_player_hits_legs(
             if price <= 0 or price >= 100:
                 continue
 
-            threshold = _parse_hit_threshold(m.get("title", ""))
+            threshold = parse_hit_threshold(m.get("title", ""))
             if threshold is None:
                 continue
 
-            prob_pct = round(_poisson_ge(threshold, lam) * 100)
+            prob_pct = round(poisson_ge(threshold, lam) * 100)
             if prob_pct < _COMBO_LEG_MIN_PROB:
                 continue
 
