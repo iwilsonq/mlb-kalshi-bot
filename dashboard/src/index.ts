@@ -10,15 +10,13 @@ import {
 } from "@opentui/core"
 import { loadConfig } from "./config.js"
 import { JournalReader } from "./journal.js"
-import { KalshiClient, type KalshiPosition } from "./kalshi.js"
 import {
-  enrichPositions,
   computeCircuitBreaker,
-  type PortfolioSummary,
   type CircuitBreakerState,
 } from "./positions.js"
 import { BotManager } from "./bot.js"
 import { CalibrationLayer } from "./calibration.js"
+import { LivePortfolio, type LivePortfolioSummary } from "./live-portfolio.js"
 import type { StrategyStats } from "./types.js"
 
 // ── Resolve paths and load config ────────────────────────────────────────
@@ -31,32 +29,18 @@ await journal.load()
 
 const calibration = CalibrationLayer.load(config.logsDir)
 
-let kalshiClient: KalshiClient | null = null
-let balance = 0
-let positions: KalshiPosition[] = []
-let apiConnected = false
-let portfolio: PortfolioSummary = {
-  totalExposureUsd: 0,
-  totalUnrealizedPnl: 0,
-  totalMarketValueUsd: 0,
-  positions: [],
-}
 let circuitBreaker: CircuitBreakerState = computeCircuitBreaker(
   journal,
   config.cbMaxConsecutiveLosses,
   config.cbMaxLossUsd,
 )
 
+// ── Live portfolio (WebSocket-driven) ────────────────────────────────────
+const livePortfolio = new LivePortfolio(config, journal)
 try {
-  kalshiClient = new KalshiClient(config)
-  apiConnected = await kalshiClient.healthCheck()
-  if (apiConnected) {
-    balance = await kalshiClient.getBalance()
-    positions = await kalshiClient.getPositions()
-    portfolio = await enrichPositions(positions, kalshiClient, journal)
-  }
+  await livePortfolio.start()
 } catch {
-  // API unavailable — dashboard still works with journal data
+  // WS will auto-reconnect; dashboard works with journal data meanwhile
 }
 
 // ── Bot manager ──────────────────────────────────────────────────────────
@@ -213,9 +197,26 @@ function Header() {
     month: "short",
     day: "numeric",
   })
-  const apiDot = apiConnected ? fg(c.green)("\u25CF") : fg(c.red)("\u25CF")
-  const balStr = apiConnected
-    ? fg(c.green)(`$${balance.toFixed(2)}`)
+  // WS connection status
+  const wsStatus = livePortfolio.wsStatus
+  let wsDot: string
+  let wsLabel: string
+  switch (wsStatus) {
+    case "connected":
+      wsDot = c.green
+      wsLabel = "WS"
+      break
+    case "connecting":
+    case "reconnecting":
+      wsDot = c.yellow
+      wsLabel = "WS"
+      break
+    default:
+      wsDot = c.red
+      wsLabel = "WS"
+  }
+  const balStr = livePortfolio.balance > 0
+    ? fg(c.green)(`$${livePortfolio.balance.toFixed(2)}`)
     : fg(c.muted)("--")
 
   // Bot status
@@ -256,7 +257,7 @@ function Header() {
       borderColor: c.border,
     },
     Text({
-      content: t`${bold(fg(c.blue)("Slugger"))} ${fg(c.muted)("v0.2.0")}  ${apiDot} ${balStr}  ${fg(botColor)(botText)}  ${fg(modeColor)(modeText)}`,
+      content: t`${bold(fg(c.blue)("Slugger"))} ${fg(c.muted)("v0.2.0")}  ${fg(wsDot)("\u25CF")} ${fg(c.muted)(wsLabel)}  ${balStr}  ${fg(botColor)(botText)}  ${fg(modeColor)(modeText)}`,
     }),
     Text({
       content: t`${fg(c.muted)(`${date}  ${time}`)}`,
@@ -310,30 +311,28 @@ function PortfolioPanel() {
   const { overall } = journal.computeStats()
   const todayStats = journal.computeStats(new Date().toISOString().slice(0, 10))
   const cb = circuitBreaker
+  const portfolio = livePortfolio.getPortfolio()
 
   const children: ReturnType<typeof Text>[] = []
 
-  if (apiConnected) {
+  const bal = livePortfolio.balance
+  children.push(
+    Text({ content: t`${fg(c.muted)("Balance:")}    ${bal > 0 ? fg(c.green)(`$${bal.toFixed(2)}`) : fg(c.muted)("--")}` }),
+  )
+  if (portfolio.positions.length > 0) {
     children.push(
-      Text({ content: t`${fg(c.muted)("Balance:")}    ${fg(c.green)(`$${balance.toFixed(2)}`)}` }),
+      Text({
+        content: t`${fg(c.muted)("Positions:")}  ${fg(c.text)(`${portfolio.positions.length} open`)}  ${fg(c.muted)("Exposure:")} ${fg(c.yellow)(`$${portfolio.totalExposureUsd.toFixed(2)}`)}`,
+      }),
     )
-    if (portfolio.positions.length > 0) {
-      children.push(
-        Text({
-          content: t`${fg(c.muted)("Positions:")}  ${fg(c.text)(`${portfolio.positions.length} open`)}  ${fg(c.muted)("Exposure:")} ${fg(c.yellow)(`$${portfolio.totalExposureUsd.toFixed(2)}`)}`,
-        }),
-      )
-      const upnlColor = portfolio.totalUnrealizedPnl >= 0 ? c.green : c.red
-      children.push(
-        Text({
-          content: t`${fg(c.muted)("Mkt Value:")}  ${fg(c.text)(`$${portfolio.totalMarketValueUsd.toFixed(2)}`)}  ${fg(c.muted)("Unreal P&L:")} ${fg(upnlColor)(fmtUsd(portfolio.totalUnrealizedPnl))}`,
-        }),
-      )
-    } else {
-      children.push(Text({ content: t`${fg(c.muted)("Positions:")}  ${fg(c.text)("none")}` }))
-    }
+    const upnlColor = portfolio.totalUnrealizedPnl >= 0 ? c.green : c.red
+    children.push(
+      Text({
+        content: t`${fg(c.muted)("Mkt Value:")}  ${fg(c.text)(`$${portfolio.totalMarketValueUsd.toFixed(2)}`)}  ${fg(c.muted)("Unreal P&L:")} ${fg(upnlColor)(fmtUsd(portfolio.totalUnrealizedPnl))}`,
+      }),
+    )
   } else {
-    children.push(Text({ content: t`${fg(c.red)("API: disconnected")}` }))
+    children.push(Text({ content: t`${fg(c.muted)("Positions:")}  ${fg(c.text)("none")}` }))
   }
 
   children.push(Text({ content: "" }))
@@ -382,8 +381,9 @@ function PortfolioPanel() {
 }
 
 function PositionsPanel() {
-  if (!apiConnected || portfolio.positions.length === 0) {
-    const msg = apiConnected ? "No open positions" : "API disconnected"
+  const portfolio = livePortfolio.getPortfolio()
+
+  if (portfolio.positions.length === 0) {
     return Box(
       {
         flexGrow: 1,
@@ -393,13 +393,11 @@ function PositionsPanel() {
         padding: 1,
         backgroundColor: c.bgPanel,
       },
-      Text({ content: t`${fg(c.muted)(msg)}` }),
+      Text({ content: t`${fg(c.muted)("No open positions")}` }),
     )
   }
 
   const rows = portfolio.positions.slice(0, 15).map((pos) => {
-    const side = pos.side.toUpperCase().padEnd(3)
-    const sideColor = pos.side === "yes" ? c.green : c.red
     const qty = String(pos.quantity).padStart(3)
     const entry = pos.entryCents > 0 ? `${pos.entryCents}\u00A2`.padStart(4) : "  --"
     const current = pos.currentCents > 0 ? `${pos.currentCents}\u00A2`.padStart(4) : "  --"
@@ -408,7 +406,7 @@ function PositionsPanel() {
     const strat = truncate(pos.strategy, 10).padEnd(10)
     const ticker = truncate(pos.ticker, 34)
     return Text({
-      content: t`${fg(sideColor)(side)} ${fg(c.text)(qty)} ${fg(c.text)(entry)} ${fg(c.cyan)(current)} ${fg(pnlColor)(pnl)} ${fg(c.purple)(strat)} ${fg(c.muted)(ticker)}`,
+      content: t`${fg(c.green)("YES")} ${fg(c.text)(qty)} ${fg(c.text)(entry)} ${fg(c.cyan)(current)} ${fg(pnlColor)(pnl)} ${fg(c.purple)(strat)} ${fg(c.muted)(ticker)}`,
     })
   })
 
@@ -946,18 +944,6 @@ async function refresh() {
     config.cbMaxConsecutiveLosses,
     config.cbMaxLossUsd,
   )
-
-  if (kalshiClient) {
-    try {
-      balance = await kalshiClient.getBalance()
-      positions = await kalshiClient.getPositions()
-      portfolio = await enrichPositions(positions, kalshiClient, journal)
-      apiConnected = true
-    } catch {
-      apiConnected = false
-    }
-  }
-
   render()
 }
 
@@ -983,6 +969,7 @@ function prevTab() {
 // ── Graceful shutdown ────────────────────────────────────────────────────
 async function shutdown() {
   journal.stopPolling()
+  livePortfolio.destroy()
   renderer.destroy()
   await bot.destroy()
   process.exit(0)
@@ -1054,8 +1041,11 @@ journal.onUpdate = () => {
 }
 journal.startPolling(5000)
 
-// Refresh API data every 15 seconds
-setInterval(() => refresh(), 15000)
+// ── LivePortfolio WS updates trigger debounced re-render ─────────────────
+livePortfolio.onChange = () => scheduleRender()
+
+// Refresh balance via REST every 60 seconds (balance isn't streamed via WS)
+setInterval(() => livePortfolio.refreshBalance(), 60000)
 
 // ── Initial render ───────────────────────────────────────────────────────
 render()
