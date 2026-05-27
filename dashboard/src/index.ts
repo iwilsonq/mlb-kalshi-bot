@@ -86,6 +86,50 @@ const TABS = ["Portfolio", "Trades", "Signals", "Stats", "Bot Log"] as const
 type TabName = (typeof TABS)[number]
 let activeTab: TabName = "Portfolio"
 
+// ── Render debounce ──────────────────────────────────────────────────────
+let renderPending = false
+let renderTimer: ReturnType<typeof setTimeout> | null = null
+const RENDER_DEBOUNCE_MS = 100
+
+function scheduleRender() {
+  if (renderPending) return
+  renderPending = true
+  if (renderTimer) clearTimeout(renderTimer)
+  renderTimer = setTimeout(() => {
+    renderPending = false
+    renderTimer = null
+    render()
+  }, RENDER_DEBOUNCE_MS)
+}
+
+// ── Data cache (invalidated on poll) ─────────────────────────────────────
+let cachedTodayDate = ""
+let cachedTodayTrades: ReturnType<typeof journal.todaysTrades> = []
+let cachedTodaySignals: ReturnType<typeof journal.todaysSignals> = []
+let cachedTodayTradedCount = 0
+let cacheGeneration = 0
+let lastCacheGeneration = -1
+
+function refreshCache() {
+  const today = new Date().toISOString().slice(0, 10)
+  cacheGeneration++
+  cachedTodayDate = today
+  cachedTodayTrades = journal.todaysTrades()
+  cachedTodaySignals = journal.todaysSignals()
+  cachedTodayTradedCount = cachedTodaySignals.filter((s) => s.traded).length
+  lastCacheGeneration = cacheGeneration
+}
+
+function ensureCache() {
+  const today = new Date().toISOString().slice(0, 10)
+  if (lastCacheGeneration !== cacheGeneration || cachedTodayDate !== today) {
+    refreshCache()
+  }
+}
+
+/** Max signals/trades to render in scrollable views */
+const MAX_SCROLL_ITEMS = 200
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 function fmtUsd(val: number): string {
   const sign = val >= 0 ? "+" : ""
@@ -346,7 +390,8 @@ function PositionsPanel() {
 }
 
 function TodaysTradesMini() {
-  const trades = journal.todaysTrades()
+  ensureCache()
+  const trades = cachedTodayTrades
   if (trades.length === 0) {
     return Box(
       {
@@ -392,7 +437,8 @@ function TodaysTradesMini() {
 }
 
 function SignalFeedMini() {
-  const signals = journal.todaysSignals()
+  ensureCache()
+  const signals = cachedTodaySignals
   if (signals.length === 0) {
     return Box(
       {
@@ -426,7 +472,7 @@ function SignalFeedMini() {
       flexGrow: 1,
       borderStyle: "rounded",
       borderColor: c.border,
-      title: ` Signals (${signals.length} today, ${signals.filter((s) => s.traded).length} traded) `,
+      title: ` Signals (${signals.length} today, ${cachedTodayTradedCount} traded) `,
       padding: 1,
       backgroundColor: c.bgPanel,
       flexDirection: "column",
@@ -461,7 +507,8 @@ function PortfolioView() {
 
 // ── Trades view (full-width scrollable) ──────────────────────────────────
 function TradesView() {
-  const trades = journal.todaysTrades()
+  ensureCache()
+  const trades = cachedTodayTrades
 
   if (trades.length === 0) {
     return Box(
@@ -527,7 +574,8 @@ function TradesView() {
 
 // ── Signals view (full-width scrollable) ─────────────────────────────────
 function SignalsView() {
-  const signals = journal.todaysSignals()
+  ensureCache()
+  const signals = cachedTodaySignals
 
   if (signals.length === 0) {
     return Box(
@@ -544,8 +592,9 @@ function SignalsView() {
     )
   }
 
-  const tradedCount = signals.filter((s) => s.traded).length
-  const recent = [...signals].reverse()
+  const tradedCount = cachedTodayTradedCount
+  // Window to most recent N signals to avoid creating thousands of VNodes
+  const recent = [...signals].reverse().slice(0, MAX_SCROLL_ITEMS)
   const rows = recent.map((sig) => {
     const time = fmtTime(sig.timestamp)
     const traded = sig.traded ? fg(c.green)("\u2713") : fg(c.muted)("\u00B7")
@@ -573,7 +622,7 @@ function SignalsView() {
         paddingX: 1,
       },
       Text({
-        content: t`${fg(c.muted)(`Signals (${signals.length} today, ${tradedCount} traded)`)}  ${fg(c.muted)("TIME  T  STRATEGY       MODEL  MKT   EDGE  REASON")}`,
+        content: t`${fg(c.muted)(`Signals (${signals.length} today, ${tradedCount} traded${recent.length < signals.length ? `, showing ${recent.length}` : ""})`)}  ${fg(c.muted)("TIME  T  STRATEGY       MODEL  MKT   EDGE  REASON")}`,
       }),
     ),
     ScrollBox(
@@ -922,11 +971,14 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
   }
 })
 
-// ── Bot log updates trigger re-render ────────────────────────────────────
-bot.onUpdate = () => render()
+// ── Bot log updates trigger debounced re-render ──────────────────────────
+bot.onUpdate = () => scheduleRender()
 
-// ── Auto-refresh on interval ─────────────────────────────────────────────
-journal.onUpdate = () => render()
+// ── Journal updates invalidate cache and trigger debounced re-render ─────
+journal.onUpdate = () => {
+  cacheGeneration++
+  scheduleRender()
+}
 journal.startPolling(5000)
 
 // Refresh API data every 15 seconds
