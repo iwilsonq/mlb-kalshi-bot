@@ -203,6 +203,22 @@ export class KalshiClient {
   }
 
   /**
+   * Get fill records (matched order legs).
+   */
+  async getFills(
+    limit: number = 200,
+    ticker?: string,
+  ): Promise<KalshiFill[]> {
+    const params: Record<string, string | number> = { limit }
+    if (ticker) params.ticker = ticker
+    const data = await this.get<{ fills: KalshiFill[] }>(
+      "/portfolio/fills",
+      params,
+    )
+    return data.fills ?? []
+  }
+
+  /**
    * Check API connectivity by fetching balance.
    * Returns true if successful, false otherwise.
    */
@@ -240,24 +256,45 @@ export interface KalshiMarketData {
   title: string
   subtitle?: string
   status: string
-  yes_ask?: number
-  yes_bid?: number
-  no_ask?: number
-  no_bid?: number
-  last_price?: number
-  volume?: number
-  open_interest?: number
-  /** Dollar string like "0.35" */
+  /** Dollar strings like "0.35" */
   yes_ask_dollars?: string
   yes_bid_dollars?: string
+  no_ask_dollars?: string
+  no_bid_dollars?: string
+  last_price_dollars?: string
+  volume_fp?: string
+  open_interest_fp?: string
+}
+
+export interface KalshiFill {
+  ticker: string
+  market_ticker: string
+  order_id: string
+  fill_id: string
+  side: string
+  action: string
+  book_side: string
+  /** Dollar strings */
+  yes_price_dollars: string
+  no_price_dollars: string
+  count_fp: string
+  fee_cost: string
+  created_time: string
+  ts: number
+  outcome_side?: string
+  is_taker?: boolean
 }
 
 export interface KalshiSettlement {
   ticker: string
   market_result: string
   revenue: number
-  yes_total_cost: number
-  no_total_cost?: number
-  fee_cost?: number
+  /** Dollar strings */
+  yes_total_cost_dollars?: string
+  no_total_cost_dollars?: string
+  fee_cost?: string
   settled_time?: string
+  yes_count_fp?: string
+  no_count_fp?: string
+  value?: number
 }

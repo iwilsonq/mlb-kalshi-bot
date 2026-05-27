@@ -11,6 +11,12 @@ import {
 import { loadConfig } from "./config.js"
 import { JournalReader } from "./journal.js"
 import { KalshiClient, type KalshiPosition } from "./kalshi.js"
+import {
+  enrichPositions,
+  computeCircuitBreaker,
+  type PortfolioSummary,
+  type CircuitBreakerState,
+} from "./positions.js"
 import type { StrategyStats } from "./types.js"
 
 // ── Resolve paths and load config ────────────────────────────────────────
@@ -25,6 +31,13 @@ let kalshiClient: KalshiClient | null = null
 let balance = 0
 let positions: KalshiPosition[] = []
 let apiConnected = false
+let portfolio: PortfolioSummary = {
+  totalExposureUsd: 0,
+  totalUnrealizedPnl: 0,
+  totalMarketValueUsd: 0,
+  positions: [],
+}
+let circuitBreaker: CircuitBreakerState = computeCircuitBreaker(journal)
 
 try {
   kalshiClient = new KalshiClient(config)
@@ -32,6 +45,7 @@ try {
   if (apiConnected) {
     balance = await kalshiClient.getBalance()
     positions = await kalshiClient.getPositions()
+    portfolio = await enrichPositions(positions, kalshiClient, journal)
   }
 } catch {
   // API unavailable — dashboard still works with journal data
@@ -172,23 +186,62 @@ function TabBar() {
 function PortfolioPanel() {
   const { overall } = journal.computeStats()
   const todayStats = journal.computeStats(new Date().toISOString().slice(0, 10))
+  const cb = circuitBreaker
 
-  const lines: string[] = []
+  const children: ReturnType<typeof Text>[] = []
+
   if (apiConnected) {
-    lines.push(`Balance:    $${balance.toFixed(2)}`)
-    lines.push(`Positions:  ${positions.length} open`)
+    children.push(
+      Text({ content: t`${fg(c.muted)("Balance:")}    ${fg(c.green)(`$${balance.toFixed(2)}`)}` }),
+    )
+    if (portfolio.positions.length > 0) {
+      children.push(
+        Text({
+          content: t`${fg(c.muted)("Positions:")}  ${fg(c.text)(`${portfolio.positions.length} open`)}  ${fg(c.muted)("Exposure:")} ${fg(c.yellow)(`$${portfolio.totalExposureUsd.toFixed(2)}`)}`,
+        }),
+      )
+      const upnlColor = portfolio.totalUnrealizedPnl >= 0 ? c.green : c.red
+      children.push(
+        Text({
+          content: t`${fg(c.muted)("Mkt Value:")}  ${fg(c.text)(`$${portfolio.totalMarketValueUsd.toFixed(2)}`)}  ${fg(c.muted)("Unreal P&L:")} ${fg(upnlColor)(fmtUsd(portfolio.totalUnrealizedPnl))}`,
+        }),
+      )
+    } else {
+      children.push(Text({ content: t`${fg(c.muted)("Positions:")}  ${fg(c.text)("none")}` }))
+    }
   } else {
-    lines.push("API: disconnected")
+    children.push(Text({ content: t`${fg(c.red)("API: disconnected")}` }))
   }
-  lines.push("")
-  lines.push(
-    `Today:  ${todayStats.overall.bets} trades  P&L ${fmtUsd(todayStats.overall.totalPnlUsd)}`,
+
+  children.push(Text({ content: "" }))
+
+  // Circuit breaker status
+  const cbIcon = cb.tripped ? fg(c.red)("\u26A0 TRIPPED") : fg(c.green)("\u2713 Armed")
+  children.push(
+    Text({
+      content: t`${fg(c.muted)("Breaker:")}   ${cbIcon}  ${fg(c.muted)("streak:")} ${fg(cb.consecutiveLosses >= cb.maxConsecutiveLosses ? c.red : c.text)(`${cb.consecutiveLosses}/${cb.maxConsecutiveLosses}`)}  ${fg(c.muted)("loss:")} ${fg(cb.todayLossUsd >= cb.maxLossUsd ? c.red : c.text)(`$${cb.todayLossUsd.toFixed(2)}/$${cb.maxLossUsd.toFixed(2)}`)}`,
+    }),
   )
-  lines.push(
-    `All:    ${overall.bets} trades  ${overall.settled} settled  ${overall.pending} pending`,
+
+  children.push(Text({ content: "" }))
+
+  // Today + overall stats
+  const todayPnlColor = todayStats.overall.totalPnlUsd >= 0 ? c.green : c.red
+  children.push(
+    Text({
+      content: t`${fg(c.muted)("Today:")}     ${fg(c.text)(`${todayStats.overall.bets} trades`)}  ${fg(c.muted)("P&L:")} ${fg(todayPnlColor)(fmtUsd(todayStats.overall.totalPnlUsd))}`,
+    }),
   )
-  lines.push(
-    `Win:    ${overall.winRate !== null ? (overall.winRate * 100).toFixed(1) + "%" : "--"}  ROI: ${fmtPct(overall.roiPct)}  P&L: ${fmtUsd(overall.totalPnlUsd)}`,
+  children.push(
+    Text({
+      content: t`${fg(c.muted)("All:")}       ${fg(c.text)(`${overall.bets} trades  ${overall.settled} settled  ${overall.pending} pending`)}`,
+    }),
+  )
+  const overallPnlColor = overall.totalPnlUsd >= 0 ? c.green : c.red
+  children.push(
+    Text({
+      content: t`${fg(c.muted)("Win:")}       ${fg(c.text)(overall.winRate !== null ? (overall.winRate * 100).toFixed(1) + "%" : "--")}  ${fg(c.muted)("ROI:")} ${fg(c.yellow)(fmtPct(overall.roiPct))}  ${fg(c.muted)("P&L:")} ${fg(overallPnlColor)(fmtUsd(overall.totalPnlUsd))}`,
+    }),
   )
 
   return Box(
@@ -201,12 +254,12 @@ function PortfolioPanel() {
       backgroundColor: c.bgPanel,
       flexDirection: "column",
     },
-    ...lines.map((line) => Text({ content: t`${fg(c.text)(line)}` })),
+    ...children,
   )
 }
 
 function PositionsPanel() {
-  if (!apiConnected || positions.length === 0) {
+  if (!apiConnected || portfolio.positions.length === 0) {
     const msg = apiConnected ? "No open positions" : "API disconnected"
     return Box(
       {
@@ -221,28 +274,41 @@ function PositionsPanel() {
     )
   }
 
-  const rows = positions.slice(0, 15).map((pos) => {
-    const ticker = truncate(pos.ticker, 40)
-    const qty = pos.position ?? 0
-    const side = qty > 0 ? "YES" : qty < 0 ? "NO" : "---"
-    const sideColor = qty > 0 ? c.green : qty < 0 ? c.red : c.muted
+  const rows = portfolio.positions.slice(0, 15).map((pos) => {
+    const side = pos.side.toUpperCase().padEnd(3)
+    const sideColor = pos.side === "yes" ? c.green : c.red
+    const qty = String(pos.quantity).padStart(3)
+    const entry = pos.entryCents > 0 ? `${pos.entryCents}\u00A2`.padStart(4) : "  --"
+    const current = pos.currentCents > 0 ? `${pos.currentCents}\u00A2`.padStart(4) : "  --"
+    const pnl = pos.unrealizedPnl !== 0 ? fmtUsd(pos.unrealizedPnl).padStart(7) : "     --"
+    const pnlColor = pos.unrealizedPnl > 0 ? c.green : pos.unrealizedPnl < 0 ? c.red : c.muted
+    const strat = truncate(pos.strategy, 10).padEnd(10)
+    const ticker = truncate(pos.ticker, 34)
     return Text({
-      content: t`${fg(sideColor)(side.padEnd(4))} ${fg(c.text)(String(Math.abs(qty)).padStart(3))} ${fg(c.muted)(ticker)}`,
+      content: t`${fg(sideColor)(side)} ${fg(c.text)(qty)} ${fg(c.text)(entry)} ${fg(c.cyan)(current)} ${fg(pnlColor)(pnl)} ${fg(c.purple)(strat)} ${fg(c.muted)(ticker)}`,
     })
   })
+
+  const upnlColor = portfolio.totalUnrealizedPnl >= 0 ? c.green : c.red
 
   return Box(
     {
       flexGrow: 1,
       borderStyle: "rounded",
       borderColor: c.border,
-      title: ` Open Positions (${positions.length}) `,
+      title: ` Open Positions (${portfolio.positions.length}) `,
       padding: 1,
       backgroundColor: c.bgPanel,
       flexDirection: "column",
     },
-    Text({ content: t`${fg(c.muted)("SIDE QTY TICKER")}` }),
+    Text({
+      content: t`${fg(c.muted)("SIDE QTY  BUY  NOW    P&L  STRATEGY   TICKER")}`,
+    }),
     ...rows,
+    Text({ content: "" }),
+    Text({
+      content: t`${fg(c.muted)("Total:")} ${fg(c.yellow)(`$${portfolio.totalExposureUsd.toFixed(2)} exposed`)}  ${fg(upnlColor)(fmtUsd(portfolio.totalUnrealizedPnl) + " unrealized")}`,
+    }),
   )
 }
 
@@ -634,11 +700,13 @@ function render() {
 // ── Refresh data and re-render ───────────────────────────────────────────
 async function refresh() {
   await journal.poll()
+  circuitBreaker = computeCircuitBreaker(journal)
 
   if (kalshiClient) {
     try {
       balance = await kalshiClient.getBalance()
       positions = await kalshiClient.getPositions()
+      portfolio = await enrichPositions(positions, kalshiClient, journal)
       apiConnected = true
     } catch {
       apiConnected = false
