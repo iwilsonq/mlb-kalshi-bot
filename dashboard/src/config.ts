@@ -14,6 +14,13 @@ export interface DashboardConfig {
   kalshiPrivateKeyPath: string
   useDemo: boolean
 
+  // Trading
+  dryRun: boolean
+
+  // Circuit breaker thresholds
+  cbMaxConsecutiveLosses: number
+  cbMaxLossUsd: number
+
   // Paths
   logsDir: string
   repoRoot: string
@@ -67,6 +74,9 @@ export function loadConfig(repoRoot?: string): DashboardConfig {
     kalshiApiKeyId: getEnv(vars, "KALSHI_API_KEY_ID", getEnv(vars, "KALSHI_KEY_ID")),
     kalshiPrivateKeyPath: keyPath,
     useDemo: getEnv(vars, "USE_DEMO", "false").toLowerCase() === "true",
+    dryRun: getEnv(vars, "DRY_RUN", "true").toLowerCase() === "true",
+    cbMaxConsecutiveLosses: parseInt(getEnv(vars, "CIRCUIT_BREAKER_MAX_CONSECUTIVE_LOSSES", "3")),
+    cbMaxLossUsd: parseFloat(getEnv(vars, "CIRCUIT_BREAKER_MAX_LOSS_USD", "10")),
     logsDir: resolve(root, getEnv(vars, "LOG_DIR", "logs")),
     repoRoot: root,
     pollIntervalMs: parseInt(getEnv(vars, "POLL_INTERVAL_SEC", "10")) * 1000,

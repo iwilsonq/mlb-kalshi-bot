@@ -17,6 +17,7 @@ import {
   type PortfolioSummary,
   type CircuitBreakerState,
 } from "./positions.js"
+import { BotManager } from "./bot.js"
 import type { StrategyStats } from "./types.js"
 
 // ── Resolve paths and load config ────────────────────────────────────────
@@ -37,7 +38,11 @@ let portfolio: PortfolioSummary = {
   totalMarketValueUsd: 0,
   positions: [],
 }
-let circuitBreaker: CircuitBreakerState = computeCircuitBreaker(journal)
+let circuitBreaker: CircuitBreakerState = computeCircuitBreaker(
+  journal,
+  config.cbMaxConsecutiveLosses,
+  config.cbMaxLossUsd,
+)
 
 try {
   kalshiClient = new KalshiClient(config)
@@ -50,6 +55,9 @@ try {
 } catch {
   // API unavailable — dashboard still works with journal data
 }
+
+// ── Bot manager ──────────────────────────────────────────────────────────
+const bot = new BotManager(config)
 
 // ── Bootstrap renderer ───────────────────────────────────────────────────
 const renderer = await createCliRenderer({
@@ -74,7 +82,7 @@ const c = {
 }
 
 // ── Tab state ────────────────────────────────────────────────────────────
-const TABS = ["Portfolio", "Trades", "Signals", "Stats"] as const
+const TABS = ["Portfolio", "Trades", "Signals", "Stats", "Bot Log"] as const
 type TabName = (typeof TABS)[number]
 let activeTab: TabName = "Portfolio"
 
@@ -115,10 +123,35 @@ function Header() {
     month: "short",
     day: "numeric",
   })
-  const statusDot = apiConnected ? fg(c.green)("\u25CF") : fg(c.red)("\u25CF")
+  const apiDot = apiConnected ? fg(c.green)("\u25CF") : fg(c.red)("\u25CF")
   const balStr = apiConnected
     ? fg(c.green)(`$${balance.toFixed(2)}`)
     : fg(c.muted)("--")
+
+  // Bot status
+  let botText: string
+  let botColor: string
+  switch (bot.status) {
+    case "running":
+      botText = `BOT \u25B6 ${bot.uptime}`
+      botColor = c.green
+      break
+    case "stopping":
+      botText = "BOT \u23F8"
+      botColor = c.yellow
+      break
+    case "crashed":
+      botText = `BOT \u2717 exit=${bot.exitCode ?? "?"}`
+      botColor = c.red
+      break
+    default:
+      botText = "BOT \u25A0"
+      botColor = c.muted
+  }
+
+  // Mode badge
+  const modeText = config.dryRun ? "[DRY RUN]" : "[LIVE]"
+  const modeColor = config.dryRun ? c.yellow : c.red
 
   return Box(
     {
@@ -133,7 +166,7 @@ function Header() {
       borderColor: c.border,
     },
     Text({
-      content: t`${bold(fg(c.blue)("Slugger"))} ${fg(c.muted)("v0.2.0")}  ${statusDot} ${balStr}`,
+      content: t`${bold(fg(c.blue)("Slugger"))} ${fg(c.muted)("v0.2.0")}  ${apiDot} ${balStr}  ${fg(botColor)(botText)}  ${fg(modeColor)(modeText)}`,
     }),
     Text({
       content: t`${fg(c.muted)(`${date}  ${time}`)}`,
@@ -642,6 +675,99 @@ function StatsView() {
   )
 }
 
+// ── Bot Log view ─────────────────────────────────────────────────────────
+function BotLogView() {
+  const lines = bot.logLines
+
+  if (lines.length === 0) {
+    const hint =
+      bot.status === "stopped"
+        ? 'Press "s" to start the bot'
+        : "Waiting for output..."
+    return Box(
+      {
+        flexGrow: 1,
+        padding: 1,
+        borderStyle: "rounded",
+        borderColor: c.border,
+        title: " Bot Log ",
+        backgroundColor: c.bgPanel,
+        margin: 1,
+      },
+      Text({ content: t`${fg(c.muted)(hint)}` }),
+    )
+  }
+
+  const rows = lines.map((line) => {
+    const time = line.timestamp.toLocaleTimeString("en-US", {
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    })
+    const streamColor = line.stream === "stderr" ? c.red : c.muted
+    const textColor = line.stream === "stderr" ? c.red : c.text
+    return Text({
+      content: t`${fg(streamColor)(time)} ${fg(textColor)(line.text)}`,
+    })
+  })
+
+  // Status bar at top
+  let statusLine: string
+  switch (bot.status) {
+    case "running":
+      statusLine = `\u25B6 Running (PID ${bot.pid}, uptime ${bot.uptime})`
+      break
+    case "stopping":
+      statusLine = "\u23F8 Stopping..."
+      break
+    case "crashed":
+      statusLine = `\u2717 Crashed (exit=${bot.exitCode ?? "?"})`
+      break
+    default:
+      statusLine = "\u25A0 Stopped"
+  }
+  const statusColor =
+    bot.status === "running"
+      ? c.green
+      : bot.status === "crashed"
+        ? c.red
+        : c.muted
+
+  return Box(
+    {
+      flexGrow: 1,
+      flexDirection: "column",
+      margin: 1,
+    },
+    Box(
+      {
+        width: "100%",
+        height: 1,
+        paddingX: 1,
+        flexDirection: "row",
+        justifyContent: "space-between",
+      },
+      Text({ content: t`${fg(statusColor)(statusLine)}` }),
+      Text({
+        content: t`${fg(c.muted)(`${lines.length} lines`)}  ${fg(c.blue)("s")} ${fg(c.muted)(bot.status === "running" ? "stop" : "start")}`,
+      }),
+    ),
+    ScrollBox(
+      {
+        flexGrow: 1,
+        borderStyle: "rounded",
+        borderColor: c.border,
+        backgroundColor: c.bgPanel,
+        stickyScroll: true,
+        stickyStart: "bottom",
+        viewportCulling: true,
+      },
+      ...rows,
+    ),
+  )
+}
+
 // ── Footer ───────────────────────────────────────────────────────────────
 function Footer() {
   return Box(
@@ -654,7 +780,7 @@ function Footer() {
       backgroundColor: c.bgPanel,
     },
     Text({
-      content: t`${fg(c.blue)("1-4")} ${fg(c.muted)("tabs")}  ${fg(c.blue)("tab")} ${fg(c.muted)("next")}  ${fg(c.blue)("r")} ${fg(c.muted)("refresh")}  ${fg(c.blue)("q")} ${fg(c.muted)("quit")}`,
+      content: t`${fg(c.blue)("1-5")} ${fg(c.muted)("tabs")}  ${fg(c.blue)("tab")} ${fg(c.muted)("next")}  ${fg(c.blue)("s")} ${fg(c.muted)("bot")}  ${fg(c.blue)("r")} ${fg(c.muted)("refresh")}  ${fg(c.blue)("q")} ${fg(c.muted)("quit")}`,
     }),
   )
 }
@@ -679,6 +805,9 @@ function render() {
     case "Stats":
       content = StatsView()
       break
+    case "Bot Log":
+      content = BotLogView()
+      break
   }
 
   renderer.root.add(
@@ -700,7 +829,11 @@ function render() {
 // ── Refresh data and re-render ───────────────────────────────────────────
 async function refresh() {
   await journal.poll()
-  circuitBreaker = computeCircuitBreaker(journal)
+  circuitBreaker = computeCircuitBreaker(
+    journal,
+    config.cbMaxConsecutiveLosses,
+    config.cbMaxLossUsd,
+  )
 
   if (kalshiClient) {
     try {
@@ -736,9 +869,10 @@ function prevTab() {
 
 // ── Keyboard handling ────────────────────────────────────────────────────
 renderer.keyInput.on("keypress", (key: KeyEvent) => {
-  // Quit
+  // Quit — kill bot child first
   if (key.name === "q" && !key.ctrl && !key.meta) {
     journal.stopPolling()
+    bot.destroy()
     renderer.destroy()
     return
   }
@@ -746,6 +880,12 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
   // Refresh
   if (key.name === "r" && !key.ctrl && !key.meta) {
     refresh()
+    return
+  }
+
+  // Bot toggle
+  if (key.name === "s" && !key.ctrl && !key.meta) {
+    bot.toggle()
     return
   }
 
@@ -766,6 +906,10 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     switchTab("Stats")
     return
   }
+  if (key.name === "5" && !key.ctrl && !key.meta) {
+    switchTab("Bot Log")
+    return
+  }
 
   // Tab / Shift+Tab
   if (key.name === "tab" && !key.shift) {
@@ -777,6 +921,9 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     return
   }
 })
+
+// ── Bot log updates trigger re-render ────────────────────────────────────
+bot.onUpdate = () => render()
 
 // ── Auto-refresh on interval ─────────────────────────────────────────────
 journal.onUpdate = () => render()
