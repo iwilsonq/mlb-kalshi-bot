@@ -525,19 +525,22 @@ function TradesView() {
     )
   }
 
+  // Column widths: time=5, side=3, strat=14, qty=3, price=4, edge=5, cost=7, ticker=rest
+  const COL_HDR_TRADES = "TIME  SIDE STRATEGY       QTY  PRC  EDGE    COST TICKER"
+
   const recent = [...trades].reverse()
   const rows = recent.map((tr) => {
-    const time = fmtTime(tr.placed_at)
-    const side = tr.side.toUpperCase().padEnd(3)
+    const time = fmtTime(tr.placed_at).padEnd(5)
+    const side = tr.side.toUpperCase().padEnd(4)
     const sideColor = tr.side === "yes" ? c.green : c.red
     const strat = truncate(tr.strategy, 14).padEnd(14)
     const cnt = String(tr.count).padStart(3)
     const price = `${tr.price_cents}\u00A2`.padStart(4)
-    const edge = `${tr.edge_cents > 0 ? "+" : ""}${tr.edge_cents.toFixed(0)}\u00A2`
+    const edge = `${tr.edge_cents > 0 ? "+" : ""}${tr.edge_cents.toFixed(0)}\u00A2`.padStart(5)
     const cost = `$${tr.cost_usd.toFixed(2)}`.padStart(7)
     const ticker = truncate(tr.ticker, 44)
     return Text({
-      content: t`${fg(c.muted)(time)} ${fg(sideColor)(side)} ${fg(c.purple)(strat)} ${fg(c.text)(cnt)} ${fg(c.text)(price)} ${fg(c.yellow)(edge.padStart(5))} ${fg(c.cyan)(cost)} ${fg(c.muted)(ticker)}`,
+      content: t`${fg(c.muted)(time)} ${fg(sideColor)(side)} ${fg(c.purple)(strat)} ${fg(c.text)(cnt)} ${fg(c.text)(price)} ${fg(c.yellow)(edge)} ${fg(c.cyan)(cost)} ${fg(c.muted)(ticker)}`,
     })
   })
 
@@ -546,23 +549,17 @@ function TradesView() {
       flexGrow: 1,
       flexDirection: "column",
       margin: 1,
+      borderStyle: "rounded",
+      borderColor: c.border,
+      title: ` Today's Trades (${trades.length}) `,
+      backgroundColor: c.bgPanel,
     },
-    Box(
-      {
-        width: "100%",
-        height: 1,
-        paddingX: 1,
-      },
-      Text({
-        content: t`${fg(c.muted)(`Today's Trades (${trades.length})`)}  ${fg(c.muted)("TIME  SIDE STRATEGY       QTY PRICE  EDGE    COST TICKER")}`,
-      }),
-    ),
+    Text({
+      content: t`${fg(c.muted)(COL_HDR_TRADES)}`,
+    }),
     ScrollBox(
       {
         flexGrow: 1,
-        borderStyle: "rounded",
-        borderColor: c.border,
-        backgroundColor: c.bgPanel,
         stickyScroll: true,
         stickyStart: "top",
         viewportCulling: true,
@@ -593,44 +590,43 @@ function SignalsView() {
   }
 
   const tradedCount = cachedTodayTradedCount
+  // Column widths: time=5, traded=1, strat=14, prob=4, mkt=4, edge=5, reason=rest
+  const COL_HDR_SIGNALS = "TIME  T STRATEGY       MODL  MKT  EDGE  REASON"
+
   // Window to most recent N signals to avoid creating thousands of VNodes
   const recent = [...signals].reverse().slice(0, MAX_SCROLL_ITEMS)
   const rows = recent.map((sig) => {
-    const time = fmtTime(sig.timestamp)
+    const time = fmtTime(sig.timestamp).padEnd(5)
     const traded = sig.traded ? fg(c.green)("\u2713") : fg(c.muted)("\u00B7")
     const strat = truncate(sig.strategy, 14).padEnd(14)
     const prob = `${sig.model_prob_pct}%`.padStart(4)
     const mkt = `${sig.market_price_cents}\u00A2`.padStart(4)
-    const edge = `${sig.edge_cents > 0 ? "+" : ""}${sig.edge_cents.toFixed(0)}\u00A2`
+    const edge = `${sig.edge_cents > 0 ? "+" : ""}${sig.edge_cents.toFixed(0)}\u00A2`.padStart(5)
     const edgeColor = sig.edge_cents > 0 ? c.green : c.red
     const reason = truncate(sig.reason, 50)
     return Text({
-      content: t`${fg(c.muted)(time)} ${traded} ${fg(c.purple)(strat)} ${fg(c.text)(prob)} ${fg(c.muted)(mkt)} ${fg(edgeColor)(edge.padStart(5))}  ${fg(c.muted)(reason)}`,
+      content: t`${fg(c.muted)(time)} ${traded} ${fg(c.purple)(strat)} ${fg(c.text)(prob)} ${fg(c.muted)(mkt)} ${fg(edgeColor)(edge)}  ${fg(c.muted)(reason)}`,
     })
   })
+
+  const showingNote = recent.length < signals.length ? `, showing ${recent.length}` : ""
 
   return Box(
     {
       flexGrow: 1,
       flexDirection: "column",
       margin: 1,
+      borderStyle: "rounded",
+      borderColor: c.border,
+      title: ` Signals (${signals.length} today, ${tradedCount} traded${showingNote}) `,
+      backgroundColor: c.bgPanel,
     },
-    Box(
-      {
-        width: "100%",
-        height: 1,
-        paddingX: 1,
-      },
-      Text({
-        content: t`${fg(c.muted)(`Signals (${signals.length} today, ${tradedCount} traded${recent.length < signals.length ? `, showing ${recent.length}` : ""})`)}  ${fg(c.muted)("TIME  T  STRATEGY       MODEL  MKT   EDGE  REASON")}`,
-      }),
-    ),
+    Text({
+      content: t`${fg(c.muted)(COL_HDR_SIGNALS)}`,
+    }),
     ScrollBox(
       {
         flexGrow: 1,
-        borderStyle: "rounded",
-        borderColor: c.border,
-        backgroundColor: c.bgPanel,
         stickyScroll: true,
         stickyStart: "top",
         viewportCulling: true,
