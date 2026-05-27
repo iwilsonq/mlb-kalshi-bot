@@ -188,12 +188,10 @@ export class KalshiClient {
    */
   async getEventMarkets(
     eventTicker: string,
-    status: string = "open",
   ): Promise<KalshiMarketData[]> {
     const data = await this.get<{ markets: KalshiMarketData[] }>("/markets", {
       event_ticker: eventTicker,
       limit: 100,
-      status,
     })
     return data.markets ?? []
   }

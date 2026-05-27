@@ -72,7 +72,12 @@ export async function enrichPositions(
   client: KalshiClient,
   journal: JournalReader,
 ): Promise<PortfolioSummary> {
-  if (rawPositions.length === 0) {
+  // Filter to MLB positions only (skip CPI, crypto, etc.)
+  const mlbPositions = rawPositions.filter((pos) =>
+    pos.ticker.startsWith("KXMLB"),
+  )
+
+  if (mlbPositions.length === 0) {
     return {
       totalExposureUsd: 0,
       totalUnrealizedPnl: 0,
@@ -87,19 +92,31 @@ export async function enrichPositions(
     tradeLookup.set(trade.ticker, trade)
   }
 
-  // Fetch current market prices for all position tickers (parallel, best-effort)
-  const marketPromises = rawPositions.map((pos) =>
-    client.getMarket(pos.ticker).catch(() => null),
-  )
-  const markets = await Promise.all(marketPromises)
+  // Group positions by event ticker (derived from market ticker).
+  // Kalshi market tickers follow: PREFIX-DATEINFOTEAMS-PLAYER-THRESHOLD
+  // The event ticker is everything up to the player segment.
+  // We use the event positions endpoint to get event tickers, then
+  // batch-fetch all markets per event instead of 80+ individual calls.
+  const eventPositions = await client.getEventPositions().catch(() => [])
+  const eventTickers = new Set(eventPositions.map((ep) => ep.event_ticker))
+
+  // Batch fetch: one getEventMarkets call per event (~20 calls vs ~80)
   const marketMap = new Map<string, KalshiMarketData>()
-  for (const m of markets) {
-    if (m) marketMap.set(m.ticker, m)
-  }
+  const eventPromises = [...eventTickers].map(async (eventTicker) => {
+    try {
+      const markets = await client.getEventMarkets(eventTicker)
+      for (const m of markets) {
+        marketMap.set(m.ticker, m)
+      }
+    } catch {
+      // Skip events that fail
+    }
+  })
+  await Promise.all(eventPromises)
 
   const enriched: EnrichedPosition[] = []
 
-  for (const pos of rawPositions) {
+  for (const pos of mlbPositions) {
     const qty = parseFloat(pos.position_fp ?? "0")
     if (qty === 0) continue
 
@@ -182,9 +199,14 @@ export async function enrichPositions(
   // Sort by absolute unrealized P&L descending (biggest movers first)
   enriched.sort((a, b) => Math.abs(b.unrealizedPnl) - Math.abs(a.unrealizedPnl))
 
+  // Only include positions with a valid market price in P&L totals.
+  // Positions where the market fetch failed (currentCents=0) would
+  // show as -100% loss and cause the total to fluctuate randomly.
+  const priced = enriched.filter((p) => p.currentCents > 0)
+
   const totalExposureUsd = enriched.reduce((sum, p) => sum + p.costUsd, 0)
-  const totalUnrealizedPnl = enriched.reduce((sum, p) => sum + p.unrealizedPnl, 0)
-  const totalMarketValueUsd = enriched.reduce((sum, p) => sum + p.marketValueUsd, 0)
+  const totalUnrealizedPnl = priced.reduce((sum, p) => sum + p.unrealizedPnl, 0)
+  const totalMarketValueUsd = priced.reduce((sum, p) => sum + p.marketValueUsd, 0)
 
   return {
     totalExposureUsd,
