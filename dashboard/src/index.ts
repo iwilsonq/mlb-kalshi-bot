@@ -19,7 +19,6 @@ import {
 } from "./positions.js"
 import { BotManager } from "./bot.js"
 import { CalibrationLayer } from "./calibration.js"
-import { describeTicker } from "./tickers.js"
 import type { StrategyStats } from "./types.js"
 
 // ── Resolve paths and load config ────────────────────────────────────────
@@ -504,7 +503,7 @@ function SignalFeedMini() {
   const rows = recent.map((sig) => {
     const time = fmtTime(sig.timestamp)
     const traded = sig.traded ? fg(c.green)("\u2713") : fg(c.muted)("\u00B7")
-    const desc = (describeTicker(sig.ticker) ?? sig.strategy).padEnd(22)
+    const strat = truncate(sig.strategy, 12).padEnd(12)
     const raw = `${sig.model_prob_pct}%`.padStart(4)
     const cal = calibration.hasCalibration(sig.strategy)
       ? `${calibration.calibrate(sig.strategy, sig.model_prob_pct)}%`.padStart(4)
@@ -513,7 +512,7 @@ function SignalFeedMini() {
     const edge = `${sig.edge_cents > 0 ? "+" : ""}${sig.edge_cents.toFixed(0)}\u00A2`
     const edgeColor = sig.edge_cents > 0 ? c.green : c.red
     return Text({
-      content: t`${fg(c.muted)(time)} ${traded} ${fg(c.text)(desc)} ${fg(c.text)(raw)} ${fg(c.cyan)(cal)} ${fg(c.muted)(mkt)} ${fg(edgeColor)(edge.padStart(5))}`,
+      content: t`${fg(c.muted)(time)} ${traded} ${fg(c.purple)(strat)} ${fg(c.text)(raw)} ${fg(c.cyan)(cal)} ${fg(c.muted)(mkt)} ${fg(edgeColor)(edge.padStart(5))} ${fg(c.muted)(sig.ticker)}`,
     })
   })
 
@@ -528,7 +527,7 @@ function SignalFeedMini() {
       flexDirection: "column",
     },
     Text({
-      content: t`${fg(c.muted)("TIME  T  MARKET                  RAW  CAL  MKT   EDGE")}`,
+      content: t`${fg(c.muted)("TIME  T  STRATEGY      RAW  CAL  MKT   EDGE TICKER")}`,
     }),
     ...rows,
   )
@@ -646,14 +645,14 @@ function SignalsView() {
   }
 
   const tradedCount = cachedTodayTradedCount
-  const COL_HDR_SIGNALS = "TIME  T MARKET                  RAW  CAL  MKT  EDGE  REASON"
+  const COL_HDR_SIGNALS = "TIME  T STRATEGY        RAW  CAL  MKT  EDGE  TICKER / REASON"
 
   // Window to most recent N signals to avoid creating thousands of VNodes
   const recent = [...signals].reverse().slice(0, MAX_SCROLL_ITEMS)
   const rows = recent.map((sig) => {
     const time = fmtTime(sig.timestamp).padEnd(5)
     const traded = sig.traded ? fg(c.green)("\u2713") : fg(c.muted)("\u00B7")
-    const desc = (describeTicker(sig.ticker) ?? sig.strategy).padEnd(22)
+    const strat = truncate(sig.strategy, 14).padEnd(14)
     const raw = `${sig.model_prob_pct}%`.padStart(4)
     const calVal = calibration.calibrate(sig.strategy, sig.model_prob_pct)
     const cal = calibration.hasCalibration(sig.strategy)
@@ -663,7 +662,7 @@ function SignalsView() {
     const edge = `${sig.edge_cents > 0 ? "+" : ""}${sig.edge_cents.toFixed(0)}\u00A2`.padStart(5)
     const edgeColor = sig.edge_cents > 0 ? c.green : c.red
     return Text({
-      content: t`${fg(c.muted)(time)} ${traded} ${fg(c.text)(desc)} ${fg(c.text)(raw)} ${fg(c.cyan)(cal)} ${fg(c.muted)(mkt)} ${fg(edgeColor)(edge)}  ${fg(c.muted)(sig.reason)}`,
+      content: t`${fg(c.muted)(time)} ${traded} ${fg(c.purple)(strat)} ${fg(c.text)(raw)} ${fg(c.cyan)(cal)} ${fg(c.muted)(mkt)} ${fg(edgeColor)(edge)}  ${fg(c.muted)(sig.ticker)}  ${fg(c.muted)(sig.reason)}`,
     })
   })
 
