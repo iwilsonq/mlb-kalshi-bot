@@ -183,16 +183,31 @@ export class BotManager {
 
   // ── Cleanup (called on dashboard quit) ────────────────────────────────
 
-  destroy(): void {
-    if (this.proc && !this.proc.killed) {
-      this.proc.kill("SIGTERM")
-      // Give it a moment, then force kill
+  /**
+   * Kill the bot child process and wait for it to exit.
+   * Returns a promise that resolves once the process is gone.
+   * Safe to call multiple times or when no process is running.
+   */
+  async destroy(): Promise<void> {
+    if (!this.proc || this.proc.killed) return
+
+    const proc = this.proc
+
+    return new Promise<void>((resolve) => {
+      // Resolve immediately if already exited
+      proc.once("exit", () => resolve())
+
+      proc.kill("SIGTERM")
+
+      // Escalate to SIGKILL after 2s if still alive
       setTimeout(() => {
-        if (this.proc && !this.proc.killed) {
-          this.proc.kill("SIGKILL")
+        if (!proc.killed) {
+          proc.kill("SIGKILL")
         }
+        // Resolve even if SIGKILL was needed -- don't hang forever
+        setTimeout(() => resolve(), 500)
       }, 2000)
-    }
+    })
   }
 
   // ── Internal ─────────────────────────────────────────────────────────

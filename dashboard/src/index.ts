@@ -913,12 +913,22 @@ function prevTab() {
 }
 
 // ── Keyboard handling ────────────────────────────────────────────────────
+// ── Graceful shutdown ────────────────────────────────────────────────────
+async function shutdown() {
+  journal.stopPolling()
+  renderer.destroy()
+  await bot.destroy()
+  process.exit(0)
+}
+
+// Catch signals so bot child doesn't become an orphan
+process.on("SIGTERM", () => shutdown())
+process.on("SIGHUP", () => shutdown())
+
 renderer.keyInput.on("keypress", (key: KeyEvent) => {
-  // Quit — kill bot child first
+  // Quit — kill bot child, then exit
   if (key.name === "q" && !key.ctrl && !key.meta) {
-    journal.stopPolling()
-    bot.destroy()
-    renderer.destroy()
+    shutdown()
     return
   }
 
