@@ -18,6 +18,7 @@ import {
   type CircuitBreakerState,
 } from "./positions.js"
 import { BotManager } from "./bot.js"
+import { CalibrationLayer } from "./calibration.js"
 import type { StrategyStats } from "./types.js"
 
 // ── Resolve paths and load config ────────────────────────────────────────
@@ -27,6 +28,8 @@ const config = loadConfig(REPO_ROOT)
 // ── Initialize data sources ──────────────────────────────────────────────
 const journal = new JournalReader(config.logsDir)
 await journal.load()
+
+const calibration = CalibrationLayer.load(config.logsDir)
 
 let kalshiClient: KalshiClient | null = null
 let balance = 0
@@ -458,12 +461,15 @@ function SignalFeedMini() {
     const time = fmtTime(sig.timestamp)
     const traded = sig.traded ? fg(c.green)("\u2713") : fg(c.muted)("\u00B7")
     const strat = truncate(sig.strategy, 12).padEnd(12)
-    const prob = `${sig.model_prob_pct}%`.padStart(4)
+    const raw = `${sig.model_prob_pct}%`.padStart(4)
+    const cal = calibration.hasCalibration(sig.strategy)
+      ? `${calibration.calibrate(sig.strategy, sig.model_prob_pct)}%`.padStart(4)
+      : raw
     const mkt = `${sig.market_price_cents}\u00A2`.padStart(4)
     const edge = `${sig.edge_cents > 0 ? "+" : ""}${sig.edge_cents.toFixed(0)}\u00A2`
     const edgeColor = sig.edge_cents > 0 ? c.green : c.red
     return Text({
-      content: t`${fg(c.muted)(time)} ${traded} ${fg(c.purple)(strat)} ${fg(c.text)(prob)} ${fg(c.muted)(mkt)} ${fg(edgeColor)(edge.padStart(5))}`,
+      content: t`${fg(c.muted)(time)} ${traded} ${fg(c.purple)(strat)} ${fg(c.text)(raw)} ${fg(c.cyan)(cal)} ${fg(c.muted)(mkt)} ${fg(edgeColor)(edge.padStart(5))}`,
     })
   })
 
@@ -478,7 +484,7 @@ function SignalFeedMini() {
       flexDirection: "column",
     },
     Text({
-      content: t`${fg(c.muted)("TIME  T  STRATEGY     MODEL  MKT   EDGE")}`,
+      content: t`${fg(c.muted)("TIME  T  STRATEGY      RAW  CAL  MKT   EDGE")}`,
     }),
     ...rows,
   )
@@ -595,8 +601,7 @@ function SignalsView() {
   }
 
   const tradedCount = cachedTodayTradedCount
-  // Column widths: time=5, traded=1, strat=14, prob=4, mkt=4, edge=5, reason=rest
-  const COL_HDR_SIGNALS = "TIME  T STRATEGY       MODL  MKT  EDGE  REASON"
+  const COL_HDR_SIGNALS = "TIME  T STRATEGY        RAW  CAL  MKT  EDGE  REASON"
 
   // Window to most recent N signals to avoid creating thousands of VNodes
   const recent = [...signals].reverse().slice(0, MAX_SCROLL_ITEMS)
@@ -604,13 +609,16 @@ function SignalsView() {
     const time = fmtTime(sig.timestamp).padEnd(5)
     const traded = sig.traded ? fg(c.green)("\u2713") : fg(c.muted)("\u00B7")
     const strat = truncate(sig.strategy, 14).padEnd(14)
-    const prob = `${sig.model_prob_pct}%`.padStart(4)
+    const raw = `${sig.model_prob_pct}%`.padStart(4)
+    const calVal = calibration.calibrate(sig.strategy, sig.model_prob_pct)
+    const cal = calibration.hasCalibration(sig.strategy)
+      ? `${calVal}%`.padStart(4)
+      : "  --"
     const mkt = `${sig.market_price_cents}\u00A2`.padStart(4)
     const edge = `${sig.edge_cents > 0 ? "+" : ""}${sig.edge_cents.toFixed(0)}\u00A2`.padStart(5)
     const edgeColor = sig.edge_cents > 0 ? c.green : c.red
-    const reason = truncate(sig.reason, 50)
     return Text({
-      content: t`${fg(c.muted)(time)} ${traded} ${fg(c.purple)(strat)} ${fg(c.text)(prob)} ${fg(c.muted)(mkt)} ${fg(edgeColor)(edge)}  ${fg(c.muted)(reason)}`,
+      content: t`${fg(c.muted)(time)} ${traded} ${fg(c.purple)(strat)} ${fg(c.text)(raw)} ${fg(c.cyan)(cal)} ${fg(c.muted)(mkt)} ${fg(edgeColor)(edge)}  ${fg(c.muted)(sig.reason)}`,
     })
   })
 
