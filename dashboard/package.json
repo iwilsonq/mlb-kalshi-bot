@@ -1,0 +1,17 @@
+{
+  "name": "slugger-dashboard",
+  "version": "0.1.0",
+  "description": "Terminal dashboard for the Slugger MLB trading bot",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "check": "bun x tsc --noEmit"
+  },
+  "dependencies": {
+    "@opentui/core": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8"
+  }
+}

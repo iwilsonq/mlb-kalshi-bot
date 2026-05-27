@@ -6,6 +6,16 @@
 # Runtime logs
 logs/
 
+# Dashboard (Bun/TypeScript)
+dashboard/node_modules/
+dashboard/dist/
+dashboard/bun.lock
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
