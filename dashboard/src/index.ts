@@ -554,9 +554,14 @@ function TradesView() {
       title: ` Today's Trades (${trades.length}) `,
       backgroundColor: c.bgPanel,
     },
-    Text({
-      content: t`${fg(c.muted)(COL_HDR_TRADES)}`,
-    }),
+    Box(
+      { width: "100%", height: 1, flexShrink: 0 },
+      Text({ content: t`${fg(c.muted)(COL_HDR_TRADES)}` }),
+    ),
+    Box(
+      { width: "100%", height: 1, flexShrink: 0 },
+      Text({ content: t`${fg(c.border)("\u2500".repeat(72))}` }),
+    ),
     ScrollBox(
       {
         flexGrow: 1,
@@ -621,9 +626,14 @@ function SignalsView() {
       title: ` Signals (${signals.length} today, ${tradedCount} traded${showingNote}) `,
       backgroundColor: c.bgPanel,
     },
-    Text({
-      content: t`${fg(c.muted)(COL_HDR_SIGNALS)}`,
-    }),
+    Box(
+      { width: "100%", height: 1, flexShrink: 0 },
+      Text({ content: t`${fg(c.muted)(COL_HDR_SIGNALS)}` }),
+    ),
+    Box(
+      { width: "100%", height: 1, flexShrink: 0 },
+      Text({ content: t`${fg(c.border)("\u2500".repeat(72))}` }),
+    ),
     ScrollBox(
       {
         flexGrow: 1,
