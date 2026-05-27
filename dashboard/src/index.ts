@@ -89,6 +89,49 @@ const TABS = ["Portfolio", "Trades", "Signals", "Stats", "Bot Log"] as const
 type TabName = (typeof TABS)[number]
 let activeTab: TabName = "Portfolio"
 
+// ── Scroll position persistence ──────────────────────────────────────────
+// Save scroll positions per tab so they survive re-renders.
+// The ScrollBox construct VNodes support property assignment (queued until
+// instantiation), so we set scrollTop on the new VNode after creation.
+const scrollPositions = new Map<string, number>()
+
+/**
+ * Find ScrollBox renderables by walking the tree, and save their scrollTop.
+ */
+function saveScrollPositions() {
+  for (const child of renderer.root.getChildren()) {
+    walkAndSaveScroll(child)
+  }
+}
+
+function walkAndSaveScroll(node: any) {
+  if (node.scrollTop !== undefined && node.id) {
+    scrollPositions.set(node.id, node.scrollTop)
+  }
+  if (typeof node.getChildren === "function") {
+    for (const child of node.getChildren()) {
+      walkAndSaveScroll(child)
+    }
+  }
+}
+
+/**
+ * Create a ScrollBox that restores its previous scroll position.
+ * VNode property assignments are queued until the renderable is instantiated.
+ */
+function PersistentScrollBox(
+  id: string,
+  props: Parameters<typeof ScrollBox>[0],
+  ...children: any[]
+) {
+  const scrollBox = ScrollBox({ ...props, id }, ...children)
+  const savedPos = scrollPositions.get(id)
+  if (savedPos !== undefined && savedPos > 0) {
+    scrollBox.scrollTop = savedPos
+  }
+  return scrollBox
+}
+
 // ── Render debounce ──────────────────────────────────────────────────────
 let renderPending = false
 let renderTimer: ReturnType<typeof setTimeout> | null = null
@@ -568,7 +611,8 @@ function TradesView() {
       { width: "100%", height: 1, flexShrink: 0 },
       Text({ content: t`${fg(c.border)("\u2500".repeat(72))}` }),
     ),
-    ScrollBox(
+    PersistentScrollBox(
+      "scroll-trades",
       {
         flexGrow: 1,
         stickyScroll: true,
@@ -642,7 +686,8 @@ function SignalsView() {
       { width: "100%", height: 1, flexShrink: 0 },
       Text({ content: t`${fg(c.border)("\u2500".repeat(72))}` }),
     ),
-    ScrollBox(
+    PersistentScrollBox(
+      "scroll-signals",
       {
         flexGrow: 1,
         stickyScroll: true,
@@ -816,7 +861,8 @@ function BotLogView() {
         content: t`${fg(c.muted)(`${lines.length} lines`)}  ${fg(c.blue)("s")} ${fg(c.muted)(bot.status === "running" ? "stop" : "start")}`,
       }),
     ),
-    ScrollBox(
+    PersistentScrollBox(
+      "scroll-botlog",
       {
         flexGrow: 1,
         borderStyle: "rounded",
@@ -850,6 +896,9 @@ function Footer() {
 
 // ── Main layout ──────────────────────────────────────────────────────────
 function render() {
+  // Save scroll positions before tearing down the tree
+  saveScrollPositions()
+
   for (const child of renderer.root.getChildren()) {
     child.destroy()
   }
