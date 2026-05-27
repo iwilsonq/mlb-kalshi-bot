@@ -113,12 +113,38 @@ def cmd_settle(config: Config):
     log.info("Recorded %d new settlement(s). Run 'stats' to see updated P&L.", found)
 
 
-def cmd_stats(config: Config):
-    """Print win rate and ROI per strategy from the trade journal."""
+def cmd_stats(config: Config, date_filter: Optional[str] = None):
+    """Print win rate and ROI per strategy from the trade journal.
+
+    Args:
+        date_filter: If set, only include trades placed on this date (YYYY-MM-DD).
+                     Use "today" for today's date.  Settlements are included
+                     if they match a filtered trade's ticker.
+    """
     records = journal.load_journal(config.log_dir)
     if not records:
         log.info("No journal records found at %s", config.log_dir)
         return
+
+    if date_filter:
+        if date_filter == "today":
+            from datetime import date
+            date_filter = date.today().isoformat()
+
+        # Keep trades matching the date + settlements for those tickers
+        trade_tickers = {
+            r["ticker"] for r in records
+            if r.get("type") == "trade" and r.get("date") == date_filter
+        }
+        records = [
+            r for r in records
+            if (r.get("type") == "trade" and r.get("date") == date_filter)
+            or (r.get("type") == "settlement" and r.get("ticker") in trade_tickers)
+        ]
+        if not records:
+            log.info("No trades found for %s", date_filter)
+            return
+        print(f"  Filtered to: {date_filter}")
 
     overall, per_strategy = journal.get_stats(records)
     print(journal.format_stats(overall, per_strategy))
@@ -253,6 +279,10 @@ def main():
         "--fit", action="store_true",
         help="(calibrate only) Fit isotonic regression curves and save to logs/calibration.json.",
     )
+    parser.add_argument(
+        "--date", metavar="YYYY-MM-DD",
+        help='(stats only) Filter to trades placed on this date. Use "today" for today.',
+    )
 
     args = parser.parse_args()
 
@@ -265,18 +295,18 @@ def main():
     log.info("Config loaded: %d strategies enabled", len(config.enabled_strategies))
     log.debug("Config: %s", config)
 
-    commands = {
-        "check": cmd_check,
-        "status": cmd_status,
-        "settle": cmd_settle,
-        "stats": cmd_stats,
-    }
     if args.command == "run":
         cmd_run(config, game_filter=args.game)
     elif args.command == "calibrate":
         cmd_calibrate(config, fit=args.fit)
-    else:
-        commands[args.command](config)
+    elif args.command == "stats":
+        cmd_stats(config, date_filter=args.date)
+    elif args.command == "check":
+        cmd_check(config)
+    elif args.command == "status":
+        cmd_status(config)
+    elif args.command == "settle":
+        cmd_settle(config)
 
 
 if __name__ == "__main__":
