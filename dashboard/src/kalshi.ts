@@ -145,13 +145,25 @@ export class KalshiClient {
   }
 
   /**
-   * Get all open positions.
+   * Get all open market positions.
    */
   async getPositions(): Promise<KalshiPosition[]> {
-    const data = await this.get<{ positions: KalshiPosition[] }>(
-      "/portfolio/positions",
-    )
-    return data.positions ?? []
+    const data = await this.get<{
+      market_positions: KalshiPosition[]
+      event_positions: KalshiEventPosition[]
+    }>("/portfolio/positions", { limit: 200 })
+    return data.market_positions ?? []
+  }
+
+  /**
+   * Get event-level position summaries.
+   */
+  async getEventPositions(): Promise<KalshiEventPosition[]> {
+    const data = await this.get<{
+      market_positions: KalshiPosition[]
+      event_positions: KalshiEventPosition[]
+    }>("/portfolio/positions", { limit: 200 })
+    return data.event_positions ?? []
   }
 
   // ── Market queries ───────────────────────────────────────────────────
@@ -236,18 +248,33 @@ export class KalshiClient {
 
 export interface KalshiPosition {
   ticker: string
-  event_ticker: string
-  market_result?: string
-  /** Number of resting bid contracts */
+  /** Dollar string: total cost of position */
+  total_traded_dollars?: string
+  /** Dollar string: current market exposure */
+  market_exposure_dollars?: string
+  /** Dollar string: realized P&L */
+  realized_pnl_dollars?: string
+  /** Dollar string: fees paid */
+  fees_paid_dollars?: string
+  /** Float string: number of contracts held (e.g. "10.00") */
+  position_fp?: string
+  /** Number of resting orders */
   resting_orders_count?: number
-  /** Total YES contracts held */
-  total_traded?: number
-  /** Current position quantity */
-  position?: number
-  /** Average execution price in cents */
-  market_exposure?: number
-  realized_pnl?: number
-  fees_paid?: number
+  last_updated_ts?: string
+}
+
+export interface KalshiEventPosition {
+  event_ticker: string
+  /** Dollar string: total cost across all markets in this event */
+  total_cost_dollars?: string
+  /** Dollar string: event-level exposure */
+  event_exposure_dollars?: string
+  /** Dollar string: realized P&L */
+  realized_pnl_dollars?: string
+  /** Dollar string: fees paid */
+  fees_paid_dollars?: string
+  /** Float string: total shares */
+  total_cost_shares_fp?: string
 }
 
 export interface KalshiMarketData {

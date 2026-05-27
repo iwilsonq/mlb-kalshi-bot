@@ -100,13 +100,16 @@ export async function enrichPositions(
   const enriched: EnrichedPosition[] = []
 
   for (const pos of rawPositions) {
-    const qty = pos.position ?? 0
+    const qty = parseFloat(pos.position_fp ?? "0")
     if (qty === 0) continue
 
-    const side: "yes" | "no" = qty > 0 ? "yes" : "no"
+    // Positions from Kalshi are always positive (count of contracts held).
+    // The side (YES/NO) is determined by how the order was placed.
+    // Since Slugger only buys YES contracts, we treat all positions as YES.
+    const side: "yes" | "no" = "yes"
     const absQty = Math.abs(qty)
 
-    // Entry price from journal trade
+    // Entry price from journal trade, or compute from API cost data
     const journalTrade = tradeLookup.get(pos.ticker)
     let entryCents = 0
     let strategy = "unknown"
@@ -114,6 +117,10 @@ export async function enrichPositions(
     if (journalTrade) {
       entryCents = journalTrade.price_cents
       strategy = journalTrade.strategy
+    } else if (pos.total_traded_dollars && absQty > 0) {
+      // Derive average entry price from total cost / quantity
+      const totalCost = parseFloat(pos.total_traded_dollars)
+      entryCents = Math.round((totalCost / absQty) * 100)
     }
 
     // Current market price
@@ -150,14 +157,16 @@ export async function enrichPositions(
       }
     }
 
-    // Compute P&L
-    const costUsd = (entryCents * absQty) / 100
+    // Compute P&L -- use API cost if available (more accurate than journal price * qty)
+    const costUsd = pos.total_traded_dollars
+      ? parseFloat(pos.total_traded_dollars)
+      : (entryCents * absQty) / 100
     const marketValueUsd = (currentCents * absQty) / 100
     const unrealizedPnl = marketValueUsd - costUsd
 
     enriched.push({
       ticker: pos.ticker,
-      eventTicker: pos.event_ticker,
+      eventTicker: market?.event_ticker ?? "",
       side,
       quantity: absQty,
       entryCents,
