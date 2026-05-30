@@ -259,11 +259,12 @@ def execute_signals(
                     count=signal.count,
                     yes_price=signal.price,
                 )
-            if result.status in ("accepted", "executed"):
+            if result.status in ("accepted", "executed", "resting", "partially_filled"):
                 cost_usd = signal.count * signal.price / 100
+                status_icon = "✅" if result.status == "executed" else "🕐"
                 log.info(
-                    "     ✅ Order placed: %s (status: %s) cost=$%.2f",
-                    result.order_id, result.status, cost_usd,
+                    "     %s Order placed: %s (status: %s) cost=$%.2f",
+                    status_icon, result.order_id, result.status, cost_usd,
                 )
                 held_tickers.add(signal.ticker)
                 placed_tickers.add(signal.ticker)
