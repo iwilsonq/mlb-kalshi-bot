@@ -84,14 +84,28 @@ def _isotonic_regression(x: List[float], y: List[float]) -> List[Tuple[float, fl
 def _interpolate(breakpoints: List[Tuple[float, float]], x: float) -> float:
     """Linearly interpolate a calibrated value from PAVA breakpoints.
 
-    Clamps to the range of the breakpoints (no extrapolation).
+    Below the curve's domain: linearly extrapolate from the first two
+    breakpoints toward the origin (0, 0).  This prevents low raw
+    probabilities from being inflated to the first breakpoint's y-value,
+    which was causing phantom edge on sub-5% signals.
+
+    Above the curve's domain: clamp to the last breakpoint (unchanged).
     """
     if not breakpoints:
         return x
 
-    # Clamp to endpoints
+    # Below the curve: extrapolate toward the origin.
+    # The calibration curve has no data below its first breakpoint, so we
+    # cannot trust it to be accurate there.  The safest assumption is a
+    # straight line from (0, 0) to the first breakpoint — a raw 0% should
+    # always calibrate to 0%, and values in between scale proportionally.
     if x <= breakpoints[0][0]:
-        return breakpoints[0][1]
+        x0, y0 = breakpoints[0]
+        if x0 <= 0:
+            return y0
+        return y0 * (x / x0)
+
+    # Above the curve: clamp to the last breakpoint.
     if x >= breakpoints[-1][0]:
         return breakpoints[-1][1]
 
