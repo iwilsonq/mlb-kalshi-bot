@@ -67,6 +67,8 @@ LEAGUE_AVG_HR_PER_AB = 0.017  # calibrated to ~6.5% per-game HR rate
 HR_PRIOR_AB          = 300    # prior weight in AB-equivalents for shrinkage
 MIN_PITCHER_IP       = 40.0   # minimum IP before trusting pitcher HR/9
 MAX_PITCHER_HR_ADJ   = 1.5    # cap pitcher HR/9 multiplier
+HR_MAX_TOTAL_ADJ     = 1.50   # cap on total multiplicative adjustment product
+HR_LAMBDA_DEFLATOR   = 0.60   # calibration: model over-predicts HR by ~2-3x
 
 # HR park factors by home team abbreviation (normalized: 1.0 = league average).
 # Source: multi-year (2022-2024) HR park factor data.
@@ -114,6 +116,7 @@ HITS_MIN_AB          = 60      # minimum AB before considering a batter
 HITS_MIN_PITCHER_IP  = 30.0    # minimum IP to trust pitcher WHIP/BAA
 LEAGUE_AVG_WHIP      = 1.28    # 2024 MLB league-average WHIP
 MAX_PITCHER_WHIP_ADJ = 1.35    # cap pitcher WHIP multiplier
+HITS_LAMBDA_DEFLATOR = 0.80    # calibration: model over-predicts hits by ~2:1
 
 # Hit park factors by home team abbreviation (normalized: 1.0 = league average).
 # Source: multi-year (2022-2024) hit park factor data.
@@ -347,6 +350,100 @@ def hr_prob_poisson(
     return prob, effective_rate, pitcher_adj
 
 
+def expected_hr_lambda(
+    batter: BatterProfile,
+    pitcher: Optional[PitcherProfile],
+    home_abbrev: str,
+) -> float:
+    """Compute expected HR lambda for a batter in a single game.
+
+    Combines Bayesian-shrunk HR rate, Statcast adjustments (barrel rate,
+    exit velocity, xSLG), opposing pitcher adjustments (HR/9, barrel rate
+    against), park factor, and a calibration deflator.
+
+    The total multiplicative adjustment from Statcast and pitcher factors
+    is capped at HR_MAX_TOTAL_ADJ to prevent compounding from inflating
+    lambda beyond realistic levels.
+
+    Args:
+        batter:       Batter profile with season stats and Statcast data.
+        pitcher:      Opposing pitcher profile.
+        home_abbrev:  Home team abbreviation (for park factor lookup).
+
+    Returns:
+        Lambda (expected HR per game) for the Poisson model, or 0 if
+        insufficient data.
+    """
+    if batter.ab < 80:
+        return 0.0
+
+    opp_hr_per_9 = pitcher.hr_per_9 if pitcher else 0.0
+    opp_ip = pitcher.innings_pitched if pitcher else 0.0
+    opp_throws = (pitcher.throws if pitcher else "") or ""
+
+    # Platoon split selection
+    if opp_throws == "L" and batter.vs_lhp_ab >= 20:
+        split_hr, split_ab = batter.vs_lhp_hr, batter.vs_lhp_ab
+    elif opp_throws == "R" and batter.vs_rhp_ab >= 20:
+        split_hr, split_ab = batter.vs_rhp_hr, batter.vs_rhp_ab
+    else:
+        split_hr, split_ab = batter.hr, batter.ab
+
+    # Base lambda: shrunk HR rate * expected AB
+    ab_est = expected_ab(batter.batting_order)
+    eff_rate = shrink_hr_rate(split_hr, split_ab)
+    lam = eff_rate * ab_est
+
+    # --- Collect adjustment factors (capped as a group) ---
+    adj = 1.0
+
+    # Pitcher HR/9 adjustment
+    if opp_hr_per_9 > 0 and opp_ip >= MIN_PITCHER_IP:
+        pitcher_adj = min(opp_hr_per_9 / LEAGUE_AVG_HR_PER_9, MAX_PITCHER_HR_ADJ)
+        adj *= pitcher_adj
+
+    # Park factor
+    home_kalshi = kalshi_team(home_abbrev)
+    park_factor = HR_PARK_FACTORS.get(
+        home_kalshi, HR_PARK_FACTORS.get(home_abbrev.upper(), 1.0),
+    )
+    adj *= park_factor
+
+    # Barrel rate adjustment (dampened)
+    _LEAGUE_AVG_BARREL = 0.065
+    if batter.barrel_rate > 0:
+        raw_barrel = batter.barrel_rate / _LEAGUE_AVG_BARREL
+        adj *= 1.0 + 0.5 * (raw_barrel - 1.0)
+
+    # Exit velocity adjustment
+    _LEAGUE_AVG_EV = 88.5
+    if batter.avg_exit_velo > 0:
+        ev_diff = batter.avg_exit_velo - _LEAGUE_AVG_EV
+        adj *= 1.0 + 0.03 * ev_diff
+
+    # xSLG adjustment (dampened)
+    _LEAGUE_AVG_XSLG = 0.400
+    if batter.xslg > 0:
+        raw_xslg = batter.xslg / _LEAGUE_AVG_XSLG
+        adj *= 1.0 + 0.3 * (raw_xslg - 1.0)
+
+    # Pitcher barrel rate against (dampened)
+    _LEAGUE_AVG_BRA = 0.065
+    if pitcher and pitcher.barrel_rate_against > 0 and opp_ip >= MIN_PITCHER_IP:
+        raw_bra = pitcher.barrel_rate_against / _LEAGUE_AVG_BRA
+        adj *= 1.0 + 0.3 * (raw_bra - 1.0)
+
+    # Cap total adjustment to prevent multiplicative blowup
+    adj = min(adj, HR_MAX_TOTAL_ADJ)
+
+    lam *= adj
+
+    # Calibration deflation
+    lam *= HR_LAMBDA_DEFLATOR
+
+    return max(0.0, lam)
+
+
 def total_prob(era: float) -> int:
     """Estimate probability of Over based on combined starting ERA.
     Returns estimated % chance of Over 8.5 runs.
@@ -532,12 +629,20 @@ def expected_hits_lambda(
     ab_est = expected_ab(batter.batting_order)
 
     eff_avg = shrink_avg(split_h, split_ab)
-    lam = eff_avg * ab_est
 
-    # xBA blend
-    if batter.xba > 0:
+    # Blend shrunk average with xBA and recent form.
+    # Recent form (last 10 games) captures hot/cold streaks that
+    # season stats and Statcast miss.
+    if batter.xba > 0 and batter.recent_avg > 0:
+        blended_avg = 0.50 * eff_avg + 0.30 * batter.xba + 0.20 * batter.recent_avg
+    elif batter.xba > 0:
         blended_avg = 0.70 * eff_avg + 0.30 * batter.xba
-        lam = blended_avg * ab_est
+    elif batter.recent_avg > 0:
+        blended_avg = 0.80 * eff_avg + 0.20 * batter.recent_avg
+    else:
+        blended_avg = eff_avg
+
+    lam = blended_avg * ab_est
 
     # Pitcher WHIP adjustment
     if opp_whip > 0 and opp_ip >= HITS_MIN_PITCHER_IP:
@@ -557,5 +662,8 @@ def expected_hits_lambda(
         home_kalshi, HIT_PARK_FACTORS.get(home_abbrev.upper(), 1.0),
     )
     lam *= park_factor
+
+    # Calibration deflation — model over-predicts hit probability
+    lam *= HITS_LAMBDA_DEFLATOR
 
     return lam

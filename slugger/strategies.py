@@ -18,9 +18,10 @@ from slugger.kalshi_client import market_price
 from slugger.journal import record_signal
 from slugger.mlb_data import get_team_profile
 from slugger.models import (
-    HITS_MIN_PITCHER_IP, HR_PARK_FACTORS, HIT_PARK_FACTORS,
+    HITS_LAMBDA_DEFLATOR, HITS_MIN_PITCHER_IP,
+    HR_PARK_FACTORS, HIT_PARK_FACTORS,
     LEAGUE_AVG_WHIP, MAX_PITCHER_WHIP_ADJ, MIN_PITCHER_IP,
-    expected_ab, expected_hits_lambda, expected_ks,
+    expected_ab, expected_hits_lambda, expected_hr_lambda, expected_ks,
     game_winner_probability, hr_prob_poisson, parse_hit_threshold,
     parse_k_threshold, poisson_ge, shrink_avg, shrink_hr_rate, total_prob,
 )
@@ -297,11 +298,9 @@ def strategy_player_hr(
         )
         return []
 
-    opp_hr_per_9 = pitcher_profile.hr_per_9 if pitcher_profile else 0.0
-    opp_ip = pitcher_profile.innings_pitched if pitcher_profile else 0.0
     opp_throws = (pitcher_profile.throws if pitcher_profile else "") or ""
 
-    # ── Platoon split selection ────────────────────────────────────────────
+    # ── Platoon info for reason string ─────────────────────────────────────
     if opp_throws == "L" and batter_profile.vs_lhp_ab >= 20:
         split_hr, split_ab, platoon_note = batter_profile.vs_lhp_hr, batter_profile.vs_lhp_ab, "vsL"
     elif opp_throws == "R" and batter_profile.vs_rhp_ab >= 20:
@@ -311,85 +310,24 @@ def strategy_player_hr(
         split_ab = batter_profile.ab
         platoon_note = "overall" if not opp_throws else f"overall({opp_throws}_split<20AB)"
 
-    # ── Compute λ ──────────────────────────────────────────────────────────
-    ab_est = expected_ab(batter_profile.batting_order)
-    _, eff_rate, pitcher_adj = hr_prob_poisson(
-        hr=split_hr, ab=split_ab,
-        opp_hr_per_9=opp_hr_per_9, opp_ip=opp_ip,
-        batting_order=batter_profile.batting_order,
-    )
-    lam = eff_rate * ab_est
-    if pitcher_adj != 1.0:
-        lam *= pitcher_adj
+    # ── Compute λ via model function (capped + deflated) ───────────────────
+    lam = expected_hr_lambda(batter_profile, pitcher_profile, game_info.home_abbrev)
 
     home_kalshi = kalshi_team(game_info.home_abbrev)
     park_factor = HR_PARK_FACTORS.get(home_kalshi, HR_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0))
-    lam *= park_factor
-
-    # ── Barrel rate adjustment (batter, dampened) ────────────────────────
-    _LEAGUE_AVG_BARREL = 0.065
-    barrel_adj = 1.0
-    if batter_profile.barrel_rate > 0:
-        raw_barrel = batter_profile.barrel_rate / _LEAGUE_AVG_BARREL
-        barrel_adj = 1.0 + 0.5 * (raw_barrel - 1.0)
-        lam *= barrel_adj
-
-    # ── Exit velocity adjustment (dampened) ────────────────────────────
-    # Average exit velo is the strongest single predictor of HR power.
-    # League average EV is ~88.5 mph; each mph above adds HR probability.
-    _LEAGUE_AVG_EV = 88.5
-    ev_adj = 1.0
-    if batter_profile.avg_exit_velo > 0:
-        ev_diff = batter_profile.avg_exit_velo - _LEAGUE_AVG_EV
-        ev_adj = 1.0 + 0.03 * ev_diff  # ~3% per mph, significant for power
-        lam *= ev_adj
-
-    # ── xSLG adjustment (dampened) ─────────────────────────────────────
-    # xSLG measures expected power production from contact quality (Statcast).
-    # Blends in when available to correct for BABIP luck on SLG.
-    _LEAGUE_AVG_XSLG = 0.400
-    xslg_adj = 1.0
-    if batter_profile.xslg > 0:
-        raw_xslg = batter_profile.xslg / _LEAGUE_AVG_XSLG
-        xslg_adj = 1.0 + 0.3 * (raw_xslg - 1.0)  # lighter dampening
-        lam *= xslg_adj
-
-    # ── Pitcher barrel rate against (dampened) ─────────────────────────
-    # Pitchers who allow more barrels give up more HRs.
-    _LEAGUE_AVG_BRA = 0.065
-    bra_adj = 1.0
-    if pitcher_profile and pitcher_profile.barrel_rate_against > 0 and opp_ip >= MIN_PITCHER_IP:
-        raw_bra = pitcher_profile.barrel_rate_against / _LEAGUE_AVG_BRA
-        bra_adj = 1.0 + 0.3 * (raw_bra - 1.0)
-        lam *= bra_adj
-
-    # ── Temperature adjustment ─────────────────────────────────────────
-    # Higher temperature = more HRs. ~1.5% more HRs per degree F above 72°F.
-    temp_adj = 1.0
-    temp_str = game_info.weather.get("temp", "")
-    if temp_str:
-        try:
-            temp_f = float(temp_str.replace("°", "").replace("F", "").strip())
-            temp_adj = 1.0 + 0.015 * (temp_f - 72.0) / 10.0
-            temp_adj = max(0.85, min(1.15, temp_adj))  # cap at ±15%
-        except (ValueError, TypeError):
-            pass
-    if temp_adj != 1.0:
-        lam *= temp_adj
 
     log.debug(
-        "%s (#%d)  split=%s %dHR/%dAB  eff=%.4f  park=%s(×%.2f)"
-        "  opp=%s(%.0fIP)  pitcher_adj=%.2f  barrel=%.2f  ev=%.2f"
-        "  xslg=%.2f  bra=%.2f  temp=%.2f  λ=%.3f",
+        "%s (#%d)  split=%s %dHR/%dAB  park=%s(×%.2f)  λ=%.3f",
         batter_profile.name, batter_profile.batting_order,
-        platoon_note, split_hr, split_ab, eff_rate,
-        home_kalshi, park_factor, opp_throws or "?", opp_ip, pitcher_adj,
-        barrel_adj, ev_adj, xslg_adj, bra_adj, temp_adj, lam,
+        platoon_note, split_hr, split_ab,
+        home_kalshi, park_factor, lam,
     )
 
     if lam <= 0:
         return []
 
+    opp_hr_per_9 = pitcher_profile.hr_per_9 if pitcher_profile else 0.0
+    opp_ip = pitcher_profile.innings_pitched if pitcher_profile else 0.0
     pitcher_note = (
         f"  opp_{opp_throws}hr/9={opp_hr_per_9:.2f}({opp_ip:.0f}IP)"
         if opp_ip >= MIN_PITCHER_IP else ""
@@ -404,7 +342,6 @@ def strategy_player_hr(
             f"{batter_profile.name}"
             f"  {split_hr}HR/{split_ab}AB({platoon_note})"
             f"  park={park_factor:.2f}"
-            f"  barrel_adj={barrel_adj:.2f}"
             f"  λ={lam:.2f}"
             f"  P({threshold}+HR)={prob_pct}%"
             f"{pitcher_note}"
@@ -514,11 +451,18 @@ def strategy_player_hits(
     # ── Compute λ ──────────────────────────────────────────────────────────
     ab_est = expected_ab(batter_profile.batting_order)
     eff_avg = shrink_avg(split_h, split_ab)
-    lam = eff_avg * ab_est
 
-    if batter_profile.xba > 0:
+    # Blend shrunk average with xBA and recent form
+    if batter_profile.xba > 0 and batter_profile.recent_avg > 0:
+        blended_avg = 0.50 * eff_avg + 0.30 * batter_profile.xba + 0.20 * batter_profile.recent_avg
+    elif batter_profile.xba > 0:
         blended_avg = 0.70 * eff_avg + 0.30 * batter_profile.xba
-        lam = blended_avg * ab_est
+    elif batter_profile.recent_avg > 0:
+        blended_avg = 0.80 * eff_avg + 0.20 * batter_profile.recent_avg
+    else:
+        blended_avg = eff_avg
+
+    lam = blended_avg * ab_est
 
     pitcher_adj = 1.0
     if opp_whip > 0 and opp_ip >= HITS_MIN_PITCHER_IP:
@@ -539,6 +483,9 @@ def strategy_player_hits(
         home_kalshi, HIT_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0),
     )
     lam *= park_factor
+
+    # Calibration deflation — model over-predicts hit probability
+    lam *= HITS_LAMBDA_DEFLATOR
 
     log.debug(
         "%s (#%d)  split=%s %dH/%dAB  eff_avg=%.3f  xba=%.3f  ab_est=%.1f"
