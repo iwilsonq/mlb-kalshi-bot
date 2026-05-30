@@ -38,8 +38,8 @@ from slugger.types import (
 log = logging.getLogger(__name__)
 
 # ── Strategy-specific constants (not model math — kept here) ──────────────────
-_KS_MIN_THRESHOLD   = 6       # skip 4+ and 5+ K markets (unprofitable historically)
-_KS_MIN_MODEL_PROB  = 15      # minimum model prob (%) to consider trading YES side
+_KS_MIN_THRESHOLD   = 5       # skip 4+ and below; 5+ markets now included
+_KS_MIN_MODEL_PROB  = 12      # minimum model prob (%) to consider trading YES side
 _KS_NO_MAX_MODEL_PROB = 10    # buy NO when model says probability is at most this (%)
 _KS_NO_MIN_EDGE_CENTS = 5     # minimum edge (market_yes_price - model_prob) to buy NO
 
