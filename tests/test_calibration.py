@@ -123,3 +123,81 @@ class TestInterpolateExtrapolatesBelowCurve:
     def test_above_curve_clamps_to_last(self):
         bp = [(20.0, 15.0), (50.0, 40.0)]
         assert _interpolate(bp, 80.0) == 40.0
+
+
+class TestFitDeduplicatesByTicker:
+    """fit() must deduplicate signals by ticker before computing bin
+    win rates.  The signal pipeline records a signal on every poll
+    cycle (~60s), so the same market can have 100+ duplicate signals.
+    Without dedup, a single winning ticker inflates the bin win rate
+    by contributing 100+ "wins" instead of 1.
+    """
+
+    def test_duplicate_signals_not_counted(self):
+        """If the same ticker appears 100 times and wins, it should
+        only count as 1 win in the sample_counts, not 100.
+        """
+        signals = []
+        settlements = {}
+
+        # Low bin (0-5%): 1 ticker duplicated 100 times (won) + 9 unique losers
+        # Without dedup: 109 samples
+        # With dedup: 10 samples
+        for i in range(100):
+            signals.append({"ticker": "DUPE-WIN", "strategy": "test_strat", "model_prob_pct": 3})
+        settlements["DUPE-WIN"] = {"market_result": "yes"}
+        for i in range(9):
+            ticker = f"LOW-LOSS-{i}"
+            signals.append({"ticker": ticker, "strategy": "test_strat", "model_prob_pct": 3})
+            settlements[ticker] = {"market_result": "no"}
+
+        # High bin (60-65%): 35 unique winners + 15 unique losers (70% rate)
+        for i in range(35):
+            ticker = f"HIGH-WIN-{i}"
+            signals.append({"ticker": ticker, "strategy": "test_strat", "model_prob_pct": 62})
+            settlements[ticker] = {"market_result": "yes"}
+        for i in range(15):
+            ticker = f"HIGH-LOSS-{i}"
+            signals.append({"ticker": ticker, "strategy": "test_strat", "model_prob_pct": 62})
+            settlements[ticker] = {"market_result": "no"}
+
+        cal = CalibrationLayer.fit(signals, settlements, min_samples=5)
+
+        # With dedup: 10 unique low + 50 unique high = 60 samples
+        # Without dedup: 109 low + 50 high = 159 samples
+        assert cal.sample_counts.get("test_strat", 0) == 60, (
+            f"Expected 60 unique samples after dedup, "
+            f"got {cal.sample_counts.get('test_strat', 0)}"
+        )
+
+    def test_dedup_preserves_unique_signals(self):
+        """Unique signals (different tickers) should all count normally."""
+        signals = []
+        settlements = {}
+
+        # 50 unique tickers in 0-5% bin, 5 winners (10% rate)
+        for i in range(45):
+            ticker = f"LOSS-{i}"
+            signals.append({"ticker": ticker, "strategy": "s", "model_prob_pct": 3})
+            settlements[ticker] = {"market_result": "no"}
+        for i in range(5):
+            ticker = f"WIN-{i}"
+            signals.append({"ticker": ticker, "strategy": "s", "model_prob_pct": 3})
+            settlements[ticker] = {"market_result": "yes"}
+
+        # 50 unique tickers in 60-65% bin, 35 winners (70% rate)
+        for i in range(15):
+            ticker = f"HIGH-LOSS-{i}"
+            signals.append({"ticker": ticker, "strategy": "s", "model_prob_pct": 62})
+            settlements[ticker] = {"market_result": "no"}
+        for i in range(35):
+            ticker = f"HIGH-WIN-{i}"
+            signals.append({"ticker": ticker, "strategy": "s", "model_prob_pct": 62})
+            settlements[ticker] = {"market_result": "yes"}
+
+        cal = CalibrationLayer.fit(signals, settlements, min_samples=5)
+        low = cal.calibrate("s", 3)
+        high = cal.calibrate("s", 62)
+
+        assert low <= 15, f"Low bin calibrated to {low}%, expected ~10%"
+        assert high >= 60, f"High bin calibrated to {high}%, expected ~70%"

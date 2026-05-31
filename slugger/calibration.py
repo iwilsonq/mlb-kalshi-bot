@@ -214,13 +214,24 @@ class CalibrationLayer:
         Returns:
             CalibrationLayer with per-strategy isotonic regression curves.
         """
-        # Group (model_prob, outcome) pairs by strategy
+        # Group (model_prob, outcome) pairs by strategy.
+        # DEDUP by (strategy, ticker): the signal pipeline records a signal
+        # on every poll cycle, so the same market can appear 100+ times.
+        # Without dedup, one winning ticker inflates the bin win rate by
+        # contributing 100+ "wins" instead of 1.
         strategy_data: Dict[str, List[Tuple[float, int]]] = {}
+        seen: set = set()  # (strategy, ticker) pairs already processed
 
         for sig in signals:
             ticker = sig.get("ticker", "")
             strategy = sig.get("strategy", "")
             prob = sig.get("model_prob_pct", 0)
+
+            # Skip duplicate signals for the same market
+            dedup_key = (strategy, ticker)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
 
             settlement = settlements.get(ticker)
             if not settlement:

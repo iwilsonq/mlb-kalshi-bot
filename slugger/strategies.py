@@ -43,6 +43,11 @@ _KS_MIN_THRESHOLD   = 5       # skip 4+ and below; 5+ markets now included
 _KS_MIN_MODEL_PROB  = 12      # minimum model prob (%) to consider trading YES side
 _KS_NO_MAX_MODEL_PROB = 10    # buy NO when model says probability is at most this (%)
 _KS_NO_MIN_EDGE_CENTS = 5     # minimum edge (market_yes_price - model_prob) to buy NO
+# NOTE: NO-side is disabled below (no_side=False). Market-price analysis
+# shows actual win rates at 10-30¢ match market pricing (12-29%),
+# while our model says 1-8%. The model underpredicts in this range,
+# creating phantom NO-side edge. Re-enable only when model calibration
+# is accurate enough to reliably identify overpriced YES markets.
 
 # Threshold regex: matches "7+", "over 6.5", "at least 9" in any K-related title
 _KS_THRESHOLD_PATTERN = r'(\d+)\s*\+'
@@ -161,7 +166,7 @@ def strategy_pitcher_ks(
         min_threshold=_KS_MIN_THRESHOLD,
         min_model_prob=_KS_MIN_MODEL_PROB,
         max_signals=2,
-        no_side=True,
+        no_side=False,
         no_max_model_prob=_KS_NO_MAX_MODEL_PROB,
         no_min_edge_cents=_KS_NO_MIN_EDGE_CENTS,
     )
