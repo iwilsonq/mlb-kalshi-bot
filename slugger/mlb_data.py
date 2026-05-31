@@ -632,6 +632,19 @@ def get_team_profile(team_name_or_id, season: int = None) -> TeamProfile:
             log.debug("Team pitching stats failed: %s", e)
             return {}
 
+    def _fetch_bullpen() -> dict:
+        """Fetch relief-pitcher-only pitching stats via sitCodes=rp."""
+        try:
+            url = (
+                f"{MLB_API}/teams/{team_id}/stats"
+                f"?stats=statSplits&group=pitching&season={season}&sitCodes=rp"
+            )
+            resp = requests.get(url, timeout=10)
+            return resp.json()
+        except Exception as e:
+            log.debug("Team bullpen stats failed: %s", e)
+            return {}
+
     def _fetch_standings() -> dict:
         try:
             return statsapi.standings_data(season=season)
@@ -640,10 +653,11 @@ def get_team_profile(team_name_or_id, season: int = None) -> TeamProfile:
 
     # ── Fire all sub-fetches in parallel (dedicated pool to avoid deadlock
     #    with the shared _POOL used by hydrate_game) ────────────────────────
-    with ThreadPoolExecutor(max_workers=4) as local_pool:
+    with ThreadPoolExecutor(max_workers=5) as local_pool:
         fut_info      = local_pool.submit(_fetch_team_info)
         fut_batting   = local_pool.submit(_fetch_batting)
         fut_pitching  = local_pool.submit(_fetch_pitching)
+        fut_bullpen   = local_pool.submit(_fetch_bullpen)
         fut_standings = local_pool.submit(_fetch_standings)
 
         # ── Collect results ────────────────────────────────────────────────
@@ -672,6 +686,17 @@ def get_team_profile(team_name_or_id, season: int = None) -> TeamProfile:
             s = stats[0]["splits"][0].get("stat", {})
             profile.team_era = _safe_float(s.get("era"))
             profile.team_whip = _safe_float(s.get("whip"))
+
+        bullpen_data = fut_bullpen.result()
+        bp_stats = bullpen_data.get("stats", [{}])
+        if bp_stats and bp_stats[0].get("splits"):
+            for split in bp_stats[0]["splits"]:
+                # Look for the relief pitcher split (sitCode "rp")
+                s = split.get("stat", {})
+                bp_era = _safe_float(s.get("era"))
+                if bp_era > 0:
+                    profile.bullpen_era = bp_era
+                    break
 
         standings = fut_standings.result()
         for div_id, div_data in standings.items():

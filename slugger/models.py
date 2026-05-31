@@ -160,6 +160,7 @@ HIT_PARK_FACTORS: Dict[str, float] = {
 LEAGUE_AVG_RPG = 4.50     # 2024 MLB average runs per game per team
 LEAGUE_AVG_ERA = 4.10     # 2024 MLB league-average ERA
 HOME_FIELD_ADV = 0.540    # MLB historical home win rate (~54%)
+PYTH_EXPONENT  = 1.83     # Pythagorean exponent (PythagPat)
 GW_PITCHING_WEIGHT = 0.40
 GW_OFFENSE_WEIGHT  = 0.40
 GW_BULLPEN_WEIGHT  = 0.10
@@ -491,6 +492,22 @@ def pitcher_quality(pitcher: Optional[PitcherProfile]) -> float:
     return LEAGUE_AVG_ERA / era
 
 
+def pythagorean_win_pct(runs_scored: float, runs_allowed: float) -> float:
+    """Pythagorean expected win percentage from runs scored/allowed per game.
+
+    Uses the PythagPat exponent of 1.83 (empirically optimal for MLB).
+    A team that scores more than it allows has a Pythagorean win% above .500,
+    regardless of its actual W-L record.
+
+    Returns 0.500 if either input is zero or invalid.
+    """
+    if runs_scored <= 0 or runs_allowed <= 0:
+        return 0.500
+    rs_exp = runs_scored ** PYTH_EXPONENT
+    ra_exp = runs_allowed ** PYTH_EXPONENT
+    return rs_exp / (rs_exp + ra_exp)
+
+
 def game_winner_probability(
     home_pitcher: Optional[PitcherProfile],
     away_pitcher: Optional[PitcherProfile],
@@ -533,9 +550,23 @@ def game_winner_probability(
     home_rec_q = 1.0
     away_rec_q = 1.0
     if home_team and (home_team.wins + home_team.losses) >= 20:
-        home_rec_q = (home_team.wins / (home_team.wins + home_team.losses)) / 0.500
+        games = home_team.wins + home_team.losses
+        # Use Pythagorean win% when run differential is available — it's a
+        # better predictor of true quality than actual W-L record.
+        if home_team.run_diff != 0 and home_team.runs_per_game > 0:
+            runs_allowed = home_team.runs_per_game - (home_team.run_diff / games)
+            pyth_pct = pythagorean_win_pct(home_team.runs_per_game, runs_allowed)
+            home_rec_q = pyth_pct / 0.500
+        else:
+            home_rec_q = (home_team.wins / games) / 0.500
     if away_team and (away_team.wins + away_team.losses) >= 20:
-        away_rec_q = (away_team.wins / (away_team.wins + away_team.losses)) / 0.500
+        games = away_team.wins + away_team.losses
+        if away_team.run_diff != 0 and away_team.runs_per_game > 0:
+            runs_allowed = away_team.runs_per_game - (away_team.run_diff / games)
+            pyth_pct = pythagorean_win_pct(away_team.runs_per_game, runs_allowed)
+            away_rec_q = pyth_pct / 0.500
+        else:
+            away_rec_q = (away_team.wins / games) / 0.500
 
     home_rating = (
         GW_PITCHING_WEIGHT * home_pitch_q
