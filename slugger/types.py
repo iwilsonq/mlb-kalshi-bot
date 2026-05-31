@@ -89,7 +89,7 @@ class BatterProfile:
     k_rate: float = 0.0          # K%
     bb_rate: float = 0.0         # BB%
     hr_per_ab: float = 0.0
-    # Recent form (last 10 games)
+    # Recent form (last 7 games)
     recent_avg: float = 0.0
     recent_ops: float = 0.0
     recent_hr: int = 0

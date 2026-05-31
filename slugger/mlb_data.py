@@ -480,7 +480,7 @@ def get_batter_profile(player_id: int, season: int = None) -> BatterProfile:
 
         splits = fut_gamelog.result()
         if splits:
-            recent = splits[-10:] if len(splits) >= 10 else splits
+            recent = splits[-7:] if len(splits) >= 7 else splits
             if recent:
                 total_h = sum(int(g["stat"].get("hits", 0)) for g in recent)
                 total_ab = sum(int(g["stat"].get("atBats", 0)) for g in recent)

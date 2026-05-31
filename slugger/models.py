@@ -389,9 +389,17 @@ def expected_hr_lambda(
     else:
         split_hr, split_ab = batter.hr, batter.ab
 
-    # Base lambda: shrunk HR rate * expected AB
+    # Base lambda: shrunk HR rate * expected AB, blended with recent form
     ab_est = expected_ab(batter.batting_order)
     eff_rate = shrink_hr_rate(split_hr, split_ab)
+
+    # Blend in recent HR rate (last 7 games) to capture hot streaks.
+    # Recent AB is estimated as 7 games * expected AB per game.
+    if batter.recent_hr > 0:
+        recent_ab_est = 7 * AVG_AB_PER_GAME  # ~27 AB over 7 games
+        recent_hr_rate = batter.recent_hr / recent_ab_est
+        eff_rate = 0.70 * eff_rate + 0.30 * recent_hr_rate
+
     lam = eff_rate * ab_est
 
     # --- Collect adjustment factors (capped as a group) ---
@@ -631,14 +639,14 @@ def expected_hits_lambda(
     eff_avg = shrink_avg(split_h, split_ab)
 
     # Blend shrunk average with xBA and recent form.
-    # Recent form (last 10 games) captures hot/cold streaks that
+    # Recent form (last 7 games) captures hot/cold streaks that
     # season stats and Statcast miss.
     if batter.xba > 0 and batter.recent_avg > 0:
-        blended_avg = 0.50 * eff_avg + 0.30 * batter.xba + 0.20 * batter.recent_avg
+        blended_avg = 0.40 * eff_avg + 0.30 * batter.xba + 0.30 * batter.recent_avg
     elif batter.xba > 0:
         blended_avg = 0.70 * eff_avg + 0.30 * batter.xba
     elif batter.recent_avg > 0:
-        blended_avg = 0.80 * eff_avg + 0.20 * batter.recent_avg
+        blended_avg = 0.70 * eff_avg + 0.30 * batter.recent_avg
     else:
         blended_avg = eff_avg
 

@@ -454,11 +454,11 @@ def strategy_player_hits(
 
     # Blend shrunk average with xBA and recent form
     if batter_profile.xba > 0 and batter_profile.recent_avg > 0:
-        blended_avg = 0.50 * eff_avg + 0.30 * batter_profile.xba + 0.20 * batter_profile.recent_avg
+        blended_avg = 0.40 * eff_avg + 0.30 * batter_profile.xba + 0.30 * batter_profile.recent_avg
     elif batter_profile.xba > 0:
         blended_avg = 0.70 * eff_avg + 0.30 * batter_profile.xba
     elif batter_profile.recent_avg > 0:
-        blended_avg = 0.80 * eff_avg + 0.20 * batter_profile.recent_avg
+        blended_avg = 0.70 * eff_avg + 0.30 * batter_profile.recent_avg
     else:
         blended_avg = eff_avg
 

@@ -120,8 +120,9 @@ class TestHRLambdaAdjustmentCap:
         ~26% HR probability), which is absurd — even the best power
         hitters only homer ~7-8% of the time per game.
 
-        With a cap, lambda should stay below 0.15 (~14% per-game HR
-        probability, which is high but plausible for elite hitters).
+        With a cap, lambda should stay below 0.20 (~18% per-game HR
+        probability, which is high but plausible for elite hitters on
+        a hot streak at Coors).
         """
         batter = _avg_batter(
             hr=30, ab=400, hr_per_ab=0.075,  # 30 HR pace
@@ -138,25 +139,41 @@ class TestHRLambdaAdjustmentCap:
         lam = expected_hr_lambda(batter, pitcher, "COL")  # Coors, park=1.38
         prob = poisson_ge(1, lam) * 100
 
-        assert lam < 0.15, (
-            f"Power hitter at Coors lambda={lam:.3f}; expected <0.15 "
+        assert lam < 0.20, (
+            f"Power hitter at Coors lambda={lam:.3f}; expected <0.20 "
             f"(cap should prevent multiplicative blowup)"
         )
-        assert prob < 15, (
-            f"P(1+ HR)={prob:.1f}%; expected <15% even for elite matchup"
+        assert prob < 20, (
+            f"P(1+ HR)={prob:.1f}%; expected <20% even for elite matchup"
         )
 
     def test_league_avg_matchup_realistic(self):
-        """A league-average batter in a neutral matchup should have
-        a HR probability around 3-5%.
+        """A league-average batter with no recent HR in a neutral matchup
+        should have a HR probability around 3-5%.
         """
-        batter = _avg_batter()
+        batter = _avg_batter(recent_hr=0)
         pitcher = _avg_pitcher()
         lam = expected_hr_lambda(batter, pitcher, "ATL")
         prob = poisson_ge(1, lam) * 100
 
         assert 1 < prob < 8, (
             f"P(1+ HR)={prob:.1f}%; expected 1-8% for league-avg matchup"
+        )
+
+    def test_recent_hr_boosts_lambda(self):
+        """A batter who hit 3 HR in his last 7 games should have a
+        higher lambda than one with 0 recent HR.
+        """
+        hot = _avg_batter(recent_hr=3)
+        cold = _avg_batter(recent_hr=0)
+        pitcher = _avg_pitcher()
+
+        lam_hot = expected_hr_lambda(hot, pitcher, "ATL")
+        lam_cold = expected_hr_lambda(cold, pitcher, "ATL")
+
+        assert lam_hot > lam_cold, (
+            f"Hot HR hitter lambda={lam_hot:.3f} should be > "
+            f"cold hitter lambda={lam_cold:.3f}"
         )
 
 
