@@ -282,12 +282,15 @@ def get_stats(records: List[dict]) -> Tuple[StrategyStats, Dict[str, StrategySta
             overall.total_fee_usd += fee
             overall.total_pnl_usd += pnl
 
-            if result == "yes":
-                s.wins += 1
-                overall.wins += 1
-            elif result == "void":
+            if result == "void":
                 s.voids += 1
                 overall.voids += 1
+            elif pnl > 0:
+                # Win = positive P&L, regardless of side.
+                # YES bets win when market_result=="yes".
+                # NO bets win when market_result=="no".
+                s.wins += 1
+                overall.wins += 1
 
     overall.strategy = "overall"
     return overall, per_strategy
