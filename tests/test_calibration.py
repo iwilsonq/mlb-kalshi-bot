@@ -1,5 +1,219 @@
 """Tests for CalibrationLayer — fit, interpolate, and calibrate."""
-from slugger.calibration import CalibrationLayer, _interpolate
+from slugger.calibration import (
+    CalibrationLayer, _interpolate, _parse_ks_signal, backfill_outcomes,
+)
+
+
+class TestParseKsSignal:
+    """_parse_ks_signal extracts (pitcher_name, date, threshold, model_prob)
+    from a pitcher_ks signal record, using the ticker and reason fields.
+    """
+
+    def test_standard_ticker(self):
+        sig = {
+            "ticker": "KXMLBKS-26JUN032010PITHOU-PITPSKENES30-7",
+            "strategy": "pitcher_ks",
+            "model_prob_pct": 42,
+            "date": "2026-06-03",
+            "reason": "λ=6.1Ks  P(≥7)=42%",
+        }
+        result = _parse_ks_signal(sig)
+        assert result is not None
+        name, date, threshold, prob = result
+        assert name == "P Skenes"
+        assert date == "2026-06-03"
+        assert threshold == 7
+        assert prob == 42
+
+    def test_multi_word_last_name(self):
+        sig = {
+            "ticker": "KXMLBKS-26MAY131845PHIBOS-BOSCEARLY71-6",
+            "strategy": "pitcher_ks",
+            "model_prob_pct": 15,
+            "date": "2026-05-13",
+            "reason": "λ=4.0Ks",
+        }
+        result = _parse_ks_signal(sig)
+        assert result is not None
+        name, date, threshold, prob = result
+        # The name should have first initial + rest as last name
+        assert name == "C Early"
+        assert threshold == 6
+
+    def test_non_ks_signal_returns_none(self):
+        sig = {
+            "ticker": "KXMLBHIT-26JUN042140LADAZ-LADMBETTS50-2",
+            "strategy": "player_hits",
+            "model_prob_pct": 16,
+            "date": "2026-06-04",
+            "reason": "",
+        }
+        assert _parse_ks_signal(sig) is None
+
+
+class TestBackfillOutcomes:
+    """backfill_outcomes matches signals to MLB game log data to produce
+    (model_prob, outcome) pairs without depending on Kalshi settlements.
+    """
+
+    def test_matches_signal_to_game_log(self):
+        """Given a signal for 7+ Ks and a game log showing 8 Ks on that
+        date, the outcome should be 1 (yes).
+        """
+        signals = [{
+            "ticker": "KXMLBKS-26JUN032010PITHOU-PITPSKENES30-7",
+            "strategy": "pitcher_ks",
+            "model_prob_pct": 42,
+            "date": "2026-06-03",
+            "reason": "λ=6.1Ks",
+        }]
+        # Fake game log: Skenes threw 8 Ks on June 3
+        game_logs = {
+            "Paul Skenes": [
+                {"date": "2026-06-03", "strikeouts": 8},
+            ]
+        }
+        result = backfill_outcomes(signals, game_logs=game_logs)
+        assert "pitcher_ks" in result
+        assert len(result["pitcher_ks"]) == 1
+        prob, outcome = result["pitcher_ks"][0]
+        assert prob == 42.0
+        assert outcome == 1  # 8 >= 7
+
+    def test_threshold_not_met(self):
+        """If actual Ks < threshold, outcome is 0."""
+        signals = [{
+            "ticker": "KXMLBKS-26JUN032010PITHOU-PITPSKENES30-9",
+            "strategy": "pitcher_ks",
+            "model_prob_pct": 18,
+            "date": "2026-06-03",
+            "reason": "λ=6.1Ks",
+        }]
+        game_logs = {
+            "Paul Skenes": [
+                {"date": "2026-06-03", "strikeouts": 8},
+            ]
+        }
+        result = backfill_outcomes(signals, game_logs=game_logs)
+        prob, outcome = result["pitcher_ks"][0]
+        assert prob == 18.0
+        assert outcome == 0  # 8 < 9
+
+    def test_deduplicates_by_ticker(self):
+        """Same ticker appearing multiple times (poll cycles) counts once."""
+        sig = {
+            "ticker": "KXMLBKS-26JUN032010PITHOU-PITPSKENES30-7",
+            "strategy": "pitcher_ks",
+            "model_prob_pct": 42,
+            "date": "2026-06-03",
+            "reason": "λ=6.1Ks",
+        }
+        signals = [sig, sig, sig]  # 3 poll cycles
+        game_logs = {
+            "Paul Skenes": [
+                {"date": "2026-06-03", "strikeouts": 10},
+            ]
+        }
+        result = backfill_outcomes(signals, game_logs=game_logs)
+        assert len(result["pitcher_ks"]) == 1
+
+    def test_multiple_thresholds_same_game(self):
+        """Multiple thresholds for the same pitcher/game each get resolved."""
+        signals = [
+            {
+                "ticker": "KXMLBKS-26JUN032010PITHOU-PITPSKENES30-5",
+                "strategy": "pitcher_ks",
+                "model_prob_pct": 73,
+                "date": "2026-06-03",
+                "reason": "",
+            },
+            {
+                "ticker": "KXMLBKS-26JUN032010PITHOU-PITPSKENES30-7",
+                "strategy": "pitcher_ks",
+                "model_prob_pct": 42,
+                "date": "2026-06-03",
+                "reason": "",
+            },
+            {
+                "ticker": "KXMLBKS-26JUN032010PITHOU-PITPSKENES30-10",
+                "strategy": "pitcher_ks",
+                "model_prob_pct": 9,
+                "date": "2026-06-03",
+                "reason": "",
+            },
+        ]
+        game_logs = {
+            "Paul Skenes": [
+                {"date": "2026-06-03", "strikeouts": 7},
+            ]
+        }
+        result = backfill_outcomes(signals, game_logs=game_logs)
+        pairs = result["pitcher_ks"]
+        assert len(pairs) == 3
+        # Sort by prob descending for predictable order
+        pairs_sorted = sorted(pairs, key=lambda p: -p[0])
+        assert pairs_sorted[0] == (73.0, 1)   # 7 >= 5  → yes
+        assert pairs_sorted[1] == (42.0, 1)   # 7 >= 7  → yes
+        assert pairs_sorted[2] == (9.0, 0)    # 7 < 10  → no
+
+    def test_skips_non_pitcher_ks_signals(self):
+        """Only pitcher_ks signals are processed."""
+        signals = [{
+            "ticker": "KXMLBHIT-26JUN042140LADAZ-LADMBETTS50-2",
+            "strategy": "player_hits",
+            "model_prob_pct": 16,
+            "date": "2026-06-04",
+            "reason": "",
+        }]
+        result = backfill_outcomes(signals, game_logs={})
+        assert result == {}
+
+    def test_deduplicates_correlated_wins_within_bin(self):
+        """When a pitcher beats multiple thresholds in the same probability bin,
+        only one observation per (pitcher, game, bin) is kept.
+
+        This prevents a single dominant performance (e.g. 10 Ks when model
+        said 1% for 6+, 7+, 8+, 9+) from inflating the bin win rate 4x.
+        """
+        # Pitcher gets 10 Ks. Model assigned 1% to thresholds 6, 7, 8, 9 —
+        # all land in the 0-5% bin. Without dedup: 4 wins. With dedup: 1.
+        signals = [
+            {
+                "ticker": "KXMLBKS-26MAY272005NYYHOU-NYYGCOLE45-6",
+                "strategy": "pitcher_ks",
+                "model_prob_pct": 1,
+                "date": "2026-05-27",
+                "reason": "",
+            },
+            {
+                "ticker": "KXMLBKS-26MAY272005NYYHOU-NYYGCOLE45-7",
+                "strategy": "pitcher_ks",
+                "model_prob_pct": 1,
+                "date": "2026-05-27",
+                "reason": "",
+            },
+            {
+                "ticker": "KXMLBKS-26MAY272005NYYHOU-NYYGCOLE45-8",
+                "strategy": "pitcher_ks",
+                "model_prob_pct": 1,
+                "date": "2026-05-27",
+                "reason": "",
+            },
+            {
+                "ticker": "KXMLBKS-26MAY272005NYYHOU-NYYGCOLE45-9",
+                "strategy": "pitcher_ks",
+                "model_prob_pct": 1,
+                "date": "2026-05-27",
+                "reason": "",
+            },
+        ]
+        game_logs = {"Gerrit Cole": [{"date": "2026-05-27", "strikeouts": 10}]}
+        result = backfill_outcomes(signals, game_logs=game_logs)
+        pairs = result["pitcher_ks"]
+        # Without fix: 4 wins. With fix: 1 win per (pitcher, game, bin).
+        assert len(pairs) == 1, (
+            f"Expected 1 observation (one per game per bin), got {len(pairs)}"
+        )
 
 
 class TestCalibrateDoesNotInflateLowProbabilities:

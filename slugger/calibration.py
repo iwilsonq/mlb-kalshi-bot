@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -28,6 +29,286 @@ log = logging.getLogger(__name__)
 # Minimum settled signals per strategy before trusting calibration.
 # Below this threshold, the calibration is too noisy to help.
 _MIN_SAMPLES = 30
+
+
+# ─── Ticker parsing (pitcher_ks signals) ─────────────────────────────────────
+
+# Ticker format: KXMLBKS-26JUN032010PITHOU-PITPSKENES30-7
+#   segment[0] = KXMLBKS         (product)
+#   segment[1] = 26JUN032010PITHOU  (11-char date + away_team + home_team)
+#   segment[2] = PITPSKENES30    (team + first_initial + LASTNAME + jersey#)
+#   segment[3] = 7               (threshold)
+
+_NAME_RE = re.compile(r"^([A-Z])([A-Z]+?)(\d+)$")
+
+
+def _parse_ks_signal(sig: dict) -> Optional[Tuple[str, str, int, float]]:
+    """Extract (pitcher_name, date, threshold, model_prob) from a pitcher_ks signal.
+
+    Returns None if the signal is not a pitcher_ks signal or can't be parsed.
+    The pitcher_name is formatted as "F Lastname" (first initial + title-cased last name).
+    """
+    if sig.get("strategy") != "pitcher_ks":
+        return None
+
+    ticker = sig.get("ticker", "")
+    parts = ticker.split("-")
+    if len(parts) < 4:
+        return None
+
+    try:
+        threshold = int(parts[-1])
+    except (ValueError, IndexError):
+        return None
+
+    # Extract teams from event segment to determine team prefix length.
+    # Event segment: 11-char date + teams (e.g. "26JUN032010PITHOU").
+    event = parts[1]
+    teams_str = event[11:]      # e.g. "PITHOU", "AZTEX", "LADAZ"
+    pitcher_part = parts[2]     # e.g. "PITPSKENES30"
+
+    # Try all valid (2,3) × (2,3) team splits; pick the longest match.
+    team = None
+    candidates = []
+    for t1_len in (2, 3):
+        for t2_len in (2, 3):
+            if t1_len + t2_len != len(teams_str):
+                continue
+            t1 = teams_str[:t1_len]
+            t2 = teams_str[t1_len:]
+            if pitcher_part.startswith(t1):
+                candidates.append(t1)
+            if pitcher_part.startswith(t2):
+                candidates.append(t2)
+    if not candidates:
+        return None
+    team = max(candidates, key=len)
+
+    rest = pitcher_part[len(team):]
+    m = _NAME_RE.match(rest)
+    if not m:
+        return None
+
+    first_initial, last_raw, _jersey = m.groups()
+    name = f"{first_initial} {last_raw.title()}"
+
+    date = sig.get("date", "")
+    prob = float(sig.get("model_prob_pct", 0))
+
+    return name, date, threshold, prob
+
+
+_BIN_WIDTH = 5  # must match the value used in CalibrationLayer.fit()
+
+
+def backfill_outcomes(
+    signals: List[dict],
+    game_logs: Optional[Dict[str, List[dict]]] = None,
+) -> Dict[str, List[Tuple[float, int]]]:
+    """Produce (model_prob, outcome) pairs for pitcher_ks signals using MLB game logs.
+
+    Instead of relying on Kalshi settlement data, this function matches each
+    signal's pitcher + date + threshold against actual K counts from MLB game
+    logs to determine outcomes directly.
+
+    Deduplication is applied at two levels:
+      1. By ticker — poll-cycle duplicates of the same market are collapsed.
+      2. By (pitcher, date, probability bin) — when a pitcher beats multiple
+         thresholds that all fall in the same bin (e.g. model said 1% for 6+,
+         7+, 8+, 9+ and the pitcher threw 10 Ks), only the one with the
+         closest probability to the bin midpoint is kept.  This prevents a
+         single dominant start from inflating the bin win rate.
+
+    Args:
+        signals:    List of signal records (from load_signals).
+        game_logs:  Dict mapping pitcher full name → list of
+                    {"date": "YYYY-MM-DD", "strikeouts": int}.
+                    If None, fetches live from the MLB Stats API.
+
+    Returns:
+        Dict mapping strategy name → list of (model_prob_pct, outcome) pairs.
+        Currently only produces data for "pitcher_ks".
+    """
+    if game_logs is None:
+        game_logs = _fetch_all_game_logs(signals)
+
+    # Build a fast lookup: (pitcher_name_lower, date) → strikeouts
+    ks_by_game: Dict[Tuple[str, str], int] = {}
+    for name, games in game_logs.items():
+        for g in games:
+            key = (name.lower(), g["date"])
+            ks_by_game[key] = g["strikeouts"]
+
+    # First pass: deduplicate by ticker, then collect all (name, date, prob, outcome).
+    seen_ticker: set = set()
+    candidates: List[Tuple[str, str, float, int]] = []  # (name, date, prob, outcome)
+
+    for sig in signals:
+        parsed = _parse_ks_signal(sig)
+        if parsed is None:
+            continue
+
+        ticker = sig.get("ticker", "")
+        if ticker in seen_ticker:
+            continue
+        seen_ticker.add(ticker)
+
+        name, date, threshold, prob = parsed
+
+        actual_ks = _lookup_ks(name, date, ks_by_game)
+        if actual_ks is None:
+            continue
+
+        outcome = 1 if actual_ks >= threshold else 0
+        candidates.append((name, date, prob, outcome))
+
+    # Second pass: deduplicate within each (name, date, bin).
+    # Keep the candidate whose probability is closest to the bin midpoint.
+    # This ensures one observation per game per calibration bin.
+    seen_game_bin: Dict[Tuple[str, str, float], Tuple[float, int]] = {}
+    for name, date, prob, outcome in candidates:
+        bin_idx = int(prob // _BIN_WIDTH)
+        bin_mid = bin_idx * _BIN_WIDTH + _BIN_WIDTH / 2
+        key = (name, date, bin_mid)
+        if key not in seen_game_bin:
+            seen_game_bin[key] = (prob, outcome)
+        else:
+            existing_prob, _ = seen_game_bin[key]
+            if abs(prob - bin_mid) < abs(existing_prob - bin_mid):
+                seen_game_bin[key] = (prob, outcome)
+
+    pairs = [(prob, outcome) for (prob, outcome) in seen_game_bin.values()]
+    return {"pitcher_ks": pairs} if pairs else {}
+
+
+def _lookup_ks(
+    short_name: str,
+    date: str,
+    ks_by_game: Dict[Tuple[str, str], int],
+) -> Optional[int]:
+    """Look up actual strikeout count for a pitcher on a given date.
+
+    short_name is "F Lastname" format (e.g. "P Skenes").
+    ks_by_game keys are (full_name_lower, date).
+    We match by checking if the full name ends with the last name
+    and the first name starts with the initial.
+    """
+    initial = short_name[0].lower()
+    last = short_name.split(" ", 1)[1].lower() if " " in short_name else short_name.lower()
+
+    for (full_name_lower, game_date), ks in ks_by_game.items():
+        if game_date != date:
+            continue
+        # Match: full name's last part matches and first char matches initial
+        name_parts = full_name_lower.split()
+        if len(name_parts) < 2:
+            continue
+        full_first = name_parts[0]
+        full_last = " ".join(name_parts[1:])
+        if full_first.startswith(initial) and full_last == last:
+            return ks
+
+    return None
+
+
+def _fetch_all_game_logs(
+    signals: List[dict],
+) -> Dict[str, List[dict]]:
+    """Fetch MLB game logs for all pitchers referenced in pitcher_ks signals.
+
+    Returns dict mapping pitcher full name → list of
+    {"date": "YYYY-MM-DD", "strikeouts": int} entries.
+    """
+    # Collect unique pitcher short names
+    pitcher_names: set = set()
+    for sig in signals:
+        parsed = _parse_ks_signal(sig)
+        if parsed:
+            pitcher_names.add(parsed[0])  # short name
+
+    if not pitcher_names:
+        return {}
+
+    log.info("Backfill: fetching game logs for %d pitchers", len(pitcher_names))
+
+    # Import here to avoid circular dependency and keep module lightweight
+    import statsapi
+    import requests
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import date
+
+    MLB_API = "https://statsapi.mlb.com/api/v1"
+    season = date.today().year
+
+    def _lookup_and_fetch(short_name: str) -> Tuple[str, List[dict]]:
+        """Look up pitcher by name and fetch their game log."""
+        initial = short_name[0]
+        last = short_name.split(" ", 1)[1] if " " in short_name else short_name
+
+        try:
+            results = statsapi.lookup_player(last)
+        except Exception as exc:
+            log.debug("Player lookup failed for %s: %s", short_name, exc)
+            return short_name, []
+
+        # Find matching pitcher
+        match = None
+        for r in results:
+            full = r.get("fullName", "")
+            pos = r.get("primaryPosition", {}).get("abbreviation", "")
+            if pos == "P" and full[0].upper() == initial.upper():
+                match = r
+                break
+
+        if not match:
+            # Fallback: try any matching first initial
+            for r in results:
+                full = r.get("fullName", "")
+                if full and full[0].upper() == initial.upper():
+                    match = r
+                    break
+
+        if not match:
+            log.debug("No MLB match for %s", short_name)
+            return short_name, []
+
+        player_id = match["id"]
+        full_name = match["fullName"]
+
+        try:
+            url = f"{MLB_API}/people/{player_id}/stats?stats=gameLog&group=pitching&season={season}"
+            resp = requests.get(url, timeout=10)
+            splits = resp.json().get("stats", [{}])[0].get("splits", [])
+        except Exception as exc:
+            log.debug("Game log fetch failed for %s (%d): %s", full_name, player_id, exc)
+            return full_name, []
+
+        games = []
+        for g in splits:
+            stat = g.get("stat", {})
+            game_date = g.get("date", "")
+            ks = int(stat.get("strikeOuts", 0))
+            games.append({"date": game_date, "strikeouts": ks})
+
+        log.debug("Backfill: %s — %d starts", full_name, len(games))
+        return full_name, games
+
+    game_logs: Dict[str, List[dict]] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(_lookup_and_fetch, name): name
+            for name in pitcher_names
+        }
+        for fut in as_completed(futures):
+            full_name, games = fut.result()
+            if games:
+                game_logs[full_name] = games
+
+    log.info(
+        "Backfill: fetched game logs for %d/%d pitchers",
+        len(game_logs), len(pitcher_names),
+    )
+    return game_logs
 
 
 # ─── Isotonic regression (PAVA) ──────────────────────────────────────────────
@@ -203,13 +484,18 @@ class CalibrationLayer:
         signals: List[dict],
         settlements: Dict[str, dict],
         min_samples: int = _MIN_SAMPLES,
+        mlb_outcomes: Optional[Dict[str, List[Tuple[float, int]]]] = None,
     ) -> CalibrationLayer:
         """Fit calibration curves from historical signal and settlement data.
 
         Args:
-            signals:      List of signal records from load_signals().
-            settlements:  Dict of ticker → settlement record from load_journal().
-            min_samples:  Minimum settled signals per strategy to fit calibration.
+            signals:       List of signal records from load_signals().
+            settlements:   Dict of ticker → settlement record from load_journal().
+            min_samples:   Minimum settled signals per strategy to fit calibration.
+            mlb_outcomes:  Optional dict of strategy → [(model_prob, outcome)]
+                           from backfill_outcomes().  For strategies present here,
+                           these outcomes replace Kalshi settlement data (they are
+                           more complete — every game, not just traded markets).
 
         Returns:
             CalibrationLayer with per-strategy isotonic regression curves.
@@ -222,10 +508,17 @@ class CalibrationLayer:
         strategy_data: Dict[str, List[Tuple[float, int]]] = {}
         seen: set = set()  # (strategy, ticker) pairs already processed
 
+        # Strategies with MLB backfill data use that instead of settlements.
+        mlb_strategies = set(mlb_outcomes.keys()) if mlb_outcomes else set()
+
         for sig in signals:
             ticker = sig.get("ticker", "")
             strategy = sig.get("strategy", "")
             prob = sig.get("model_prob_pct", 0)
+
+            # Skip strategies that have MLB backfill data — we'll use that instead.
+            if strategy in mlb_strategies:
+                continue
 
             # Skip duplicate signals for the same market
             dedup_key = (strategy, ticker)
@@ -246,6 +539,11 @@ class CalibrationLayer:
             if strategy not in strategy_data:
                 strategy_data[strategy] = []
             strategy_data[strategy].append((float(prob), outcome))
+
+        # Merge in MLB backfill data (already deduplicated by backfill_outcomes).
+        if mlb_outcomes:
+            for strategy, pairs in mlb_outcomes.items():
+                strategy_data[strategy] = pairs
 
         # Fit isotonic regression per strategy using binned data.
         # Binning is critical: raw binary outcomes (0/1) are too noisy for

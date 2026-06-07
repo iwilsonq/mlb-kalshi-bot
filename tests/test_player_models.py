@@ -123,6 +123,9 @@ class TestHRLambdaAdjustmentCap:
         With a cap, lambda should stay below 0.20 (~18% per-game HR
         probability, which is high but plausible for elite hitters on
         a hot streak at Coors).
+
+        recent_hr=0 keeps this batter in the base (non-hot-streak) path
+        so we're testing the adjustment cap in isolation.
         """
         batter = _avg_batter(
             hr=30, ab=400, hr_per_ab=0.075,  # 30 HR pace
@@ -130,6 +133,7 @@ class TestHRLambdaAdjustmentCap:
             avg_exit_velo=93.0,     # elite (league avg 88.5)
             xslg=0.550,            # elite (league avg 0.400)
             batting_order=3,
+            recent_hr=0,            # not on a hot streak — test base path only
         )
         pitcher = _avg_pitcher(
             hr_per_9=1.8,           # HR-prone

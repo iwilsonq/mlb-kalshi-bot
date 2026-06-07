@@ -374,10 +374,37 @@ def _apply_pitcher_statcast(profile: PitcherProfile, data):
         if len(swings) > 0:
             profile.whiff_rate = len(whiffs) / len(swings)
 
+    # Chase rate (swings on pitches outside the strike zone)
+    # Zones 11-14 are outside the zone; a chase is any swing (not ball/called_strike).
+    if "zone" in data.columns and "description" in data.columns:
+        outside = data[data["zone"].isin([11, 12, 13, 14])]
+        if len(outside) > 0:
+            chases = outside[~outside["description"].isin(
+                ["ball", "blocked_ball", "called_strike", "pitchout"]
+            )]
+            profile.chase_rate = len(chases) / len(outside)
+
+    # Barrel rate against (batted balls hit hard off this pitcher)
+    if "barrel" in data.columns and "launch_speed" in data.columns:
+        batted = data[data["launch_speed"].notna()]
+        if len(batted) > 0:
+            profile.barrel_rate_against = float(batted["barrel"].fillna(0).sum() / len(batted))
+
+    # xERA — estimated from mean xwOBA on contact (balls in play).
+    # Linear mapping: xERA = (xwOBA / 0.320) * 4.00
+    # so league-average xwOBA (0.320) → xERA 4.00.
+    if "estimated_woba_using_speedangle" in data.columns:
+        xwoba_contact = data["estimated_woba_using_speedangle"].dropna()
+        if len(xwoba_contact) > 0:
+            mean_xwoba = float(xwoba_contact.mean())
+            profile.xera = round((mean_xwoba / 0.320) * 4.00, 2)
+
     log.debug(
-        "Statcast pitcher %s: %d pitches  velo=%.1f  whiff=%.3f  mix=%s",
+        "Statcast pitcher %s: %d pitches  velo=%.1f  whiff=%.3f  chase=%.3f"
+        "  barrel_against=%.3f  xera=%.2f  mix=%s",
         profile.name, n_pitches,
-        profile.avg_fastball_velo, profile.whiff_rate,
+        profile.avg_fastball_velo, profile.whiff_rate, profile.chase_rate,
+        profile.barrel_rate_against, profile.xera,
         {k: f"{v:.0%}" for k, v in list(profile.pitch_mix.items())[:3]},
     )
 
@@ -480,15 +507,7 @@ def get_batter_profile(player_id: int, season: int = None) -> BatterProfile:
 
         splits = fut_gamelog.result()
         if splits:
-            recent = splits[-7:] if len(splits) >= 7 else splits
-            if recent:
-                total_h = sum(int(g["stat"].get("hits", 0)) for g in recent)
-                total_ab = sum(int(g["stat"].get("atBats", 0)) for g in recent)
-                total_hr = sum(int(g["stat"].get("homeRuns", 0)) for g in recent)
-                if total_ab > 0:
-                    profile.recent_avg = total_h / total_ab
-                    profile.recent_ops = (total_h + sum(int(g["stat"].get("baseOnBalls", 0)) for g in recent)) / (total_ab + sum(int(g["stat"].get("baseOnBalls", 0)) for g in recent))
-                profile.recent_hr = total_hr
+            _apply_batter_game_log(profile, splits)
 
         sc_result = fut_statcast.result()
         if sc_result.get("data") is not None:
@@ -500,6 +519,36 @@ def get_batter_profile(player_id: int, season: int = None) -> BatterProfile:
 
     _batter_cache[cache_key] = profile
     return profile
+
+
+def _apply_batter_game_log(profile: BatterProfile, games: list) -> None:
+    """Apply a list of game-log entries (MLB Stats API shape) to a batter profile.
+
+    Only the last 7 games contribute to recent_avg, recent_ops, and recent_hr.
+    recent_ops is true OPS (OBP + SLG), not OBP.
+    """
+    recent = games[-7:] if len(games) >= 7 else games
+    if not recent:
+        return
+
+    total_h  = sum(int(g["stat"].get("hits",        0)) for g in recent)
+    total_ab = sum(int(g["stat"].get("atBats",       0)) for g in recent)
+    total_hr = sum(int(g["stat"].get("homeRuns",     0)) for g in recent)
+    total_2b = sum(int(g["stat"].get("doubles",      0)) for g in recent)
+    total_3b = sum(int(g["stat"].get("triples",      0)) for g in recent)
+    total_bb = sum(int(g["stat"].get("baseOnBalls",  0)) for g in recent)
+
+    profile.recent_hr = total_hr
+
+    if total_ab > 0:
+        profile.recent_avg = total_h / total_ab
+        # OBP = (H + BB) / (AB + BB)
+        obp = (total_h + total_bb) / (total_ab + total_bb) if (total_ab + total_bb) > 0 else 0.0
+        # SLG = total bases / AB
+        # TB = singles + 2×2B + 3×3B + 4×HR  =  H + 2B + 2×3B + 3×HR
+        total_bases = total_h + total_2b + 2 * total_3b + 3 * total_hr
+        slg = total_bases / total_ab
+        profile.recent_ops = obp + slg
 
 
 def _apply_batter_statcast(profile: BatterProfile, data):

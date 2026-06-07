@@ -170,10 +170,18 @@ def cmd_calibrate(config: Config, fit: bool = False):
 
     # ── Fit mode: train and save calibration curves ────────────────────────
     if fit:
-        from slugger.calibration import CalibrationLayer
+        from slugger.calibration import CalibrationLayer, backfill_outcomes
         from pathlib import Path
 
-        cal = CalibrationLayer.fit(signals, settlements)
+        # Backfill pitcher_ks outcomes from MLB game logs (much more complete
+        # than Kalshi settlements — covers every evaluated game, not just
+        # markets we traded).
+        print("Fetching MLB game logs for pitcher_ks backfill...")
+        mlb_outcomes = backfill_outcomes(signals)
+        n_mlb = sum(len(v) for v in mlb_outcomes.values())
+        print(f"  Backfilled {n_mlb} pitcher_ks outcomes from MLB game logs")
+
+        cal = CalibrationLayer.fit(signals, settlements, mlb_outcomes=mlb_outcomes)
         cal_path = str(Path(config.log_dir) / "calibration.json")
         cal.save(cal_path)
         print(cal.format_report())

@@ -20,6 +20,7 @@ from slugger.mlb_data import get_team_profile
 from slugger.models import (
     HITS_LAMBDA_DEFLATOR, HITS_MIN_PITCHER_IP,
     HR_PARK_FACTORS, HIT_PARK_FACTORS,
+    HR_HOT_STREAK_MIN_RECENT,
     LEAGUE_AVG_WHIP, MAX_PITCHER_WHIP_ADJ, MIN_PITCHER_IP,
     expected_ab, expected_hits_lambda, expected_hr_lambda, expected_ks,
     game_winner_probability, hr_prob_poisson, parse_hit_threshold,
@@ -296,10 +297,13 @@ def strategy_player_hr(
     if not event_ticker or not batter_profile:
         return []
 
-    if batter_profile.ab < _HR_MIN_AB:
+    is_hot = batter_profile.recent_hr >= HR_HOT_STREAK_MIN_RECENT
+    ab_min = 40 if is_hot else _HR_MIN_AB
+    if batter_profile.ab < ab_min:
         log.debug(
-            "player_hr | %s — only %d AB (need %d) — skipping",
-            batter_profile.name, batter_profile.ab, _HR_MIN_AB,
+            "player_hr | %s — only %d AB (need %d%s) — skipping",
+            batter_profile.name, batter_profile.ab, ab_min,
+            ", hot mode" if is_hot else "",
         )
         return []
 
@@ -338,6 +342,8 @@ def strategy_player_hr(
         if opp_ip >= MIN_PITCHER_IP else ""
     )
 
+    hot_note = f"  [HOT {batter_profile.recent_hr}HR/7g]" if is_hot else ""
+
     # ── Build model closure ────────────────────────────────────────────────
     def hr_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
         if threshold is None:
@@ -345,7 +351,9 @@ def strategy_player_hr(
         prob_pct = round(poisson_ge(threshold, lam) * 100)
         reason = (
             f"{batter_profile.name}"
+            f"{hot_note}"
             f"  {split_hr}HR/{split_ab}AB({platoon_note})"
+            f"  recent={batter_profile.recent_hr}HR/7g"
             f"  park={park_factor:.2f}"
             f"  λ={lam:.2f}"
             f"  P({threshold}+HR)={prob_pct}%"

@@ -70,6 +70,14 @@ MAX_PITCHER_HR_ADJ   = 1.5    # cap pitcher HR/9 multiplier
 HR_MAX_TOTAL_ADJ     = 1.50   # cap on total multiplicative adjustment product
 HR_LAMBDA_DEFLATOR   = 0.60   # calibration: model over-predicts HR by ~2-3x
 
+# ── Hot streak HR model ───────────────────────────────────────────────────────
+# When a batter is "hot" (HR_HOT_STREAK_MIN_RECENT+ HRs in their last 7 games)
+# we trust recent form more: flip the season/recent blend weights, use a lighter
+# shrinkage prior, and apply a less aggressive deflator.
+HR_HOT_STREAK_MIN_RECENT = 2    # minimum HRs in last 7 games to trigger hot mode
+HR_HOT_PRIOR_AB          = 150  # reduced prior weight (vs 300) — less regression to mean
+HR_HOT_STREAK_DEFLATOR   = 0.75 # less aggressive deflator for confirmed hot batters (vs 0.60)
+
 # HR park factors by home team abbreviation (normalized: 1.0 = league average).
 # Source: multi-year (2022-2024) HR park factor data.
 HR_PARK_FACTORS: Dict[str, float] = {
@@ -366,6 +374,13 @@ def expected_hr_lambda(
     is capped at HR_MAX_TOTAL_ADJ to prevent compounding from inflating
     lambda beyond realistic levels.
 
+    Hot streak mode: when a batter has HR_HOT_STREAK_MIN_RECENT+ HRs in
+    their last 7 games, the model trusts recent form more heavily — recent
+    HR rate gets 60% weight (vs 30% normally), the shrinkage prior is
+    halved (150 AB vs 300), and a lighter deflator (0.75 vs 0.60) is used.
+    The AB minimum is also relaxed to 40 for hot batters, allowing emerging
+    players to qualify when their recent production is clear.
+
     Args:
         batter:       Batter profile with season stats and Statcast data.
         pitcher:      Opposing pitcher profile.
@@ -375,7 +390,9 @@ def expected_hr_lambda(
         Lambda (expected HR per game) for the Poisson model, or 0 if
         insufficient data.
     """
-    if batter.ab < 80:
+    is_hot = batter.recent_hr >= HR_HOT_STREAK_MIN_RECENT
+    ab_min = 40 if is_hot else 80
+    if batter.ab < ab_min:
         return 0.0
 
     opp_hr_per_9 = pitcher.hr_per_9 if pitcher else 0.0
@@ -390,14 +407,22 @@ def expected_hr_lambda(
     else:
         split_hr, split_ab = batter.hr, batter.ab
 
-    # Base lambda: shrunk HR rate * expected AB, blended with recent form
+    # Base lambda: shrunk HR rate * expected AB, blended with recent form.
+    # Hot streak mode: use a lighter shrinkage prior so recent data dominates
+    # over the league-average pull, and give recent HRs 60% weight instead of 30%.
     ab_est = expected_ab(batter.batting_order)
-    eff_rate = shrink_hr_rate(split_hr, split_ab)
+    if is_hot:
+        prior_hr = LEAGUE_AVG_HR_PER_AB * HR_HOT_PRIOR_AB
+        eff_rate = (split_hr + prior_hr) / (split_ab + HR_HOT_PRIOR_AB)
+    else:
+        eff_rate = shrink_hr_rate(split_hr, split_ab)
 
-    # Blend in recent HR rate (last 7 games) to capture hot streaks.
-    # Recent AB is estimated as 7 games * expected AB per game.
-    if batter.recent_hr > 0:
-        recent_ab_est = 7 * AVG_AB_PER_GAME  # ~27 AB over 7 games
+    recent_ab_est = 7 * AVG_AB_PER_GAME  # ~27 AB over 7 games
+    if is_hot:
+        # Recent form is the signal: weight it at 60%, season at 40%
+        recent_hr_rate = batter.recent_hr / recent_ab_est
+        eff_rate = 0.40 * eff_rate + 0.60 * recent_hr_rate
+    elif batter.recent_hr > 0:
         recent_hr_rate = batter.recent_hr / recent_ab_est
         eff_rate = 0.70 * eff_rate + 0.30 * recent_hr_rate
 
@@ -447,8 +472,10 @@ def expected_hr_lambda(
 
     lam *= adj
 
-    # Calibration deflation
-    lam *= HR_LAMBDA_DEFLATOR
+    # Calibration deflation — lighter for hot streakers since their recent
+    # production has already proven itself in game results
+    deflator = HR_HOT_STREAK_DEFLATOR if is_hot else HR_LAMBDA_DEFLATOR
+    lam *= deflator
 
     return max(0.0, lam)
 
