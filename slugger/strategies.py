@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 # ── Strategy-specific constants (not model math — kept here) ──────────────────
 _KS_MIN_THRESHOLD   = 5       # skip 4+ and below; 5+ markets now included
 _KS_MIN_MODEL_PROB  = 12      # minimum model prob (%) to consider trading YES side
+_KS_MIN_EDGE_CENTS  = 15      # minimum edge in cents — data shows <20¢ is -18% ROI
 _KS_NO_MAX_MODEL_PROB = 10    # buy NO when model says probability is at most this (%)
 _KS_NO_MIN_EDGE_CENTS = 5     # minimum edge (market_yes_price - model_prob) to buy NO
 # NOTE: NO-side is disabled below (no_side=False). Market-price analysis
@@ -54,8 +55,8 @@ _KS_NO_MIN_EDGE_CENTS = 5     # minimum edge (market_yes_price - model_prob) to 
 _KS_THRESHOLD_PATTERN = r'(\d+)\s*\+'
 
 # Strategy-specific HR constants (not model math)
-_HR_MIN_MODEL_PROB    = 12     # minimum model probability (%) to even consider trading
-_HR_MIN_EDGE_CENTS    = 8      # HR-specific minimum edge (higher than global MIN_EDGE_CENTS)
+_HR_MIN_MODEL_PROB    = 20     # minimum model probability — data shows <20% is -52% ROI
+_HR_MIN_EDGE_CENTS    = 15     # HR-specific minimum edge — data shows <20¢ is deeply negative
 _HR_MIN_AB            = 80     # minimum AB before considering a batter (filter noise)
 
 # Strategy-specific hits constants (not model math)
@@ -166,6 +167,7 @@ def strategy_pitcher_ks(
         threshold_pattern=_KS_THRESHOLD_PATTERN,
         min_threshold=_KS_MIN_THRESHOLD,
         min_model_prob=_KS_MIN_MODEL_PROB,
+        min_edge_cents=_KS_MIN_EDGE_CENTS,
         max_signals=2,
         no_side=False,
         no_max_model_prob=_KS_NO_MAX_MODEL_PROB,
