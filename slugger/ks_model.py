@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -461,8 +462,43 @@ def holdout_brier_vs_market(
     kb = brier_score(market_ps, ys)
     beats = None
     if mb is not None and kb is not None:
-        beats = mb < kb
+        # Fail closed on noise. A point estimate of mb < kb is not evidence of an
+        # edge: the same model measured on one late holdout window showed a
+        # deficit of +0.00068, and on 4371 walk-forward rows across the season
+        # +0.00675 — a tenfold difference driven purely by which window was
+        # scored. beats_market gates whether a strategy may be re-enabled, so it
+        # requires the whole bootstrap interval to favour the model.
+        lo, hi = _bootstrap_brier_deficit_ci(model_ps, market_ps, ys)
+        beats = hi is not None and hi < 0.0
     return mb, kb, beats
+
+
+def _bootstrap_brier_deficit_ci(
+    model_ps: Sequence[float],
+    market_ps: Sequence[float],
+    outcomes: Sequence[int],
+    *,
+    n_boot: int = 2000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Percentile CI for (model Brier - market Brier). Negative means model wins."""
+    n = len(outcomes)
+    if n < 30:
+        return None, None
+    rng = random.Random(seed)
+    deficits: List[float] = []
+    for _ in range(n_boot):
+        total = 0.0
+        for _ in range(n):
+            i = rng.randrange(n)
+            y = outcomes[i]
+            total += (model_ps[i] - y) ** 2 - (market_ps[i] - y) ** 2
+        deficits.append(total / n)
+    deficits.sort()
+    lo = deficits[int((alpha / 2) * n_boot)]
+    hi = deficits[min(int((1 - alpha / 2) * n_boot), n_boot - 1)]
+    return lo, hi
 
 
 def build_holdout_props_from_signals(

@@ -329,9 +329,67 @@ def test_holdout_brier_uses_real_varied_market_prices():
     )
     assert model.holdout_model_brier is not None
     assert model.holdout_market_brier is not None
-    assert model.holdout_beats_market is (
-        model.holdout_model_brier < model.holdout_market_brier
-    )
+    # Only 10 props: even a large point-estimate win is not evidence of an edge,
+    # and beats_market gates re-enabling a strategy, so it must fail closed.
+    assert model.holdout_model_brier < model.holdout_market_brier
+    assert model.holdout_beats_market is False
+
+
+def test_beats_market_requires_the_whole_interval_to_favour_the_model():
+    """A point estimate is not evidence.
+
+    The same model showed a +0.00068 deficit on one late holdout window and
+    +0.00675 on 4371 walk-forward rows — a tenfold difference driven only by
+    which window was scored. So the verdict needs the bootstrap interval, not
+    the point estimate.
+    """
+    model = KsModel(intercept=0.0, coef=[0.0, 0.0, 0.0], n_samples=50)
+
+    # Model nails every outcome, market is wrong on every one, 200 rows.
+    decisive = []
+    for i in range(200):
+        won = i % 2 == 0
+        decisive.append({
+            "threshold": 6, "recent_k": 6.0, "season_k": 6.0, "opp_k_rate": 0.225,
+            "actual_k": 7.0 if won else 0.0,
+            "market_price_cents": 10.0 if won else 90.0,
+            "synthetic_market": False,
+        })
+
+    def perfect(thr, recent, season, opp=0.0):
+        return 0.99 if recent > 5.0 else 0.01
+
+    # Model probability keyed to the outcome via recent_k so it is right every time
+    for row in decisive:
+        row["recent_k"] = 9.0 if row["actual_k"] >= 6 else 1.0
+    model.prob_ge = perfect  # type: ignore[method-assign]
+    mb, kb, beats = holdout_brier_vs_market(model, decisive)
+    assert mb < kb
+    assert beats is True, "a decisive, well-powered win must be recognised"
+
+    # Same direction of win, but only 20 rows -> underpowered -> no verdict
+    mb2, kb2, beats2 = holdout_brier_vs_market(model, decisive[:20])
+    assert mb2 < kb2
+    assert beats2 is False
+
+
+def test_marginal_win_is_not_called_an_edge():
+    """A tiny Brier advantage inside the noise band must not green-light trading."""
+    model = KsModel(intercept=0.0, coef=[0.0, 0.0, 0.0], n_samples=50)
+
+    def near_market(thr, recent, season, opp=0.0):
+        return 0.49  # market is 50c, so the model is barely different
+
+    model.prob_ge = near_market  # type: ignore[method-assign]
+    props = []
+    for i in range(300):
+        props.append({
+            "threshold": 6, "recent_k": 6.0, "season_k": 6.0, "opp_k_rate": 0.225,
+            "actual_k": 7.0 if i % 2 == 0 else 0.0,
+            "market_price_cents": 50.0, "synthetic_market": False,
+        })
+    mb, kb, beats = holdout_brier_vs_market(model, props)
+    assert beats is False, f"marginal edge {kb - mb:+.6f} must not count"
 
 
 def test_holdout_brier_rejects_synthetic_market_flag():
