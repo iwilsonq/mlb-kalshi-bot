@@ -11,9 +11,11 @@ import pytest
 from slugger.signal_pipeline import (
     MarketSpec,
     ModelResult,
+    clear_unparsed_titles,
     evaluate_markets,
     parse_threshold,
     parse_threshold_regex,
+    unparsed_titles,
 )
 
 
@@ -429,3 +431,86 @@ class TestEvaluateMarkets:
         )
         signals = evaluate_markets(spec, model, client, config)
         assert signals == []
+
+
+# ─── Unparseable titles are recorded, not silently dropped ──────────────────
+
+class TestUnparsedTitleTracking:
+    """A market whose threshold will not parse is never priced at all.
+
+    The live specs use narrow N+ patterns while parse_threshold() also handles
+    "over 6.5" and "at least 9". Nobody has established which forms Kalshi
+    actually uses, so the pipeline records what it drops (mlb-kalshi-bot-8r5).
+    """
+
+    def _spec(self):
+        return MarketSpec(
+            event_ticker="TEST",
+            strategy_name="pitcher_ks",
+            title_keywords=["strikeout"],
+            player_name="John Smith",
+            threshold_pattern=r'(\d+)\s*\+',
+            min_threshold=6,
+        )
+
+    def test_records_title_the_live_pattern_cannot_parse(self, tmp_path):
+        clear_unparsed_titles()
+        markets = [
+            _make_market("TEST-A", "Smith over 6.5 strikeouts", "0.20"),
+            _make_market("TEST-B", "Smith at least 9 strikeouts", "0.20"),
+        ]
+        client = _make_client(markets)
+        config = _make_config(str(tmp_path), min_edge=3, cost_buffer=0)
+
+        signals = evaluate_markets(
+            self._spec(),
+            lambda title, threshold, price: ModelResult(prob_pct=45, reason="t"),
+            client,
+            config,
+        )
+
+        assert signals == []
+        dropped = unparsed_titles()["pitcher_ks"]
+        assert dropped == [
+            "Smith at least 9 strikeouts",
+            "Smith over 6.5 strikeouts",
+        ]
+        # These are exactly the forms the unused parse_threshold() handles
+        assert parse_threshold("Smith over 6.5 strikeouts") == 7
+        assert parse_threshold("Smith at least 9 strikeouts") == 9
+        clear_unparsed_titles()
+
+    def test_parseable_titles_are_not_recorded(self, tmp_path):
+        clear_unparsed_titles()
+        markets = [_make_market("TEST-7", "Smith 7+ strikeouts", "0.20")]
+        client = _make_client(markets)
+        config = _make_config(str(tmp_path), min_edge=3, cost_buffer=0)
+
+        evaluate_markets(
+            self._spec(),
+            lambda title, threshold, price: ModelResult(prob_pct=45, reason="t"),
+            client,
+            config,
+        )
+        assert unparsed_titles() == {}
+        clear_unparsed_titles()
+
+    def test_duplicate_titles_counted_once(self, tmp_path):
+        clear_unparsed_titles()
+        markets = [
+            _make_market("TEST-A", "Smith over 6.5 strikeouts", "0.20"),
+            _make_market("TEST-B", "Smith over 6.5 strikeouts", "0.21"),
+        ]
+        client = _make_client(markets)
+        config = _make_config(str(tmp_path), min_edge=3, cost_buffer=0)
+
+        evaluate_markets(
+            self._spec(),
+            lambda title, threshold, price: ModelResult(prob_pct=45, reason="t"),
+            client,
+            config,
+        )
+        assert unparsed_titles() == {
+            "pitcher_ks": ["Smith over 6.5 strikeouts"],
+        }
+        clear_unparsed_titles()

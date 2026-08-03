@@ -21,7 +21,7 @@ from slugger.calibration import CalibrationLayer
 from slugger.config import Config
 from slugger.kalshi_client import market_quotes
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
-from slugger.signal_pipeline import load_calibration
+from slugger.signal_pipeline import load_calibration, unparsed_titles
 from slugger.consensus import consensus_allows_trade, load_consensus_prices
 from slugger.execution import (
     cancel_resting_orders_for_started_games,
@@ -912,6 +912,17 @@ def run(config: Config, game_filter: Optional[str] = None):
                     )
             except Exception as exc:
                 log.debug("Auto-settle failed: %s", exc)
+
+        # Markets we could not parse a threshold from were never priced at all,
+        # so surface them rather than leaving the loss invisible.
+        dropped = unparsed_titles()
+        if dropped:
+            for strat, titles in sorted(dropped.items()):
+                log.warning(
+                    "%s: %d market title(s) dropped for want of a parseable "
+                    "threshold, e.g. %s",
+                    strat, len(titles), titles[:3],
+                )
 
         if single_pass:
             log.info("— Single-pass complete —")

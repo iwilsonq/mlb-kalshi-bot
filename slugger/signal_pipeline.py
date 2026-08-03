@@ -33,6 +33,41 @@ log = logging.getLogger(__name__)
 _IDENTITY_CALIBRATION = CalibrationLayer()
 
 
+# ─── Unparseable title tracking ──────────────────────────────────────────────
+#
+# There are four threshold parsers in this codebase: parse_threshold (keyword
+# aware, handles "over 6.5" / "at least 9", tested but with no production
+# caller), parse_threshold_regex (the one the live specs actually use),
+# and models.parse_k_threshold / parse_hit_threshold (no callers at all).
+#
+# The live specs pass narrow N+ patterns, so anything Kalshi titles differently
+# is dropped. Whether that ever happens is an open question — no real title
+# corpus exists in the repo. Counting the drops answers it from production
+# instead of by assumption, and tells us which parser to keep.
+
+_unparsed_titles: Dict[str, Set[str]] = {}
+
+
+def record_unparsed_title(strategy: str, title: str) -> None:
+    """Note a market whose threshold could not be parsed, so it was never priced."""
+    seen = _unparsed_titles.setdefault(strategy or "unknown", set())
+    if title not in seen:
+        seen.add(title)
+        log.warning(
+            "Unparseable threshold for %s — market never priced: %r",
+            strategy or "unknown", title,
+        )
+
+
+def unparsed_titles() -> Dict[str, List[str]]:
+    """Distinct titles dropped for want of a threshold, by strategy."""
+    return {k: sorted(v) for k, v in _unparsed_titles.items() if v}
+
+
+def clear_unparsed_titles() -> None:
+    _unparsed_titles.clear()
+
+
 # ─── Threshold parsing ───────────────────────────────────────────────────────
 
 # Reusable threshold patterns
@@ -213,7 +248,12 @@ def evaluate_markets(
                 title, spec.threshold_pattern, ceil=spec.threshold_ceil,
             )
             if threshold is None:
-                log.debug("Could not parse threshold from %r — skipping", title)
+                # The live specs use narrow N+ patterns while parse_threshold()
+                # also understands "over 6.5" and "at least 9". Nobody knows
+                # whether Kalshi ever uses those forms, so record the titles we
+                # drop rather than guessing: a market we cannot parse is a market
+                # we silently never price.
+                record_unparsed_title(spec.strategy_name, title)
                 continue
             if threshold < spec.min_threshold:
                 log.debug(
