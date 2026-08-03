@@ -231,38 +231,45 @@ def cmd_calibrate(config: Config, fit: bool = False):
         print("The bot will load this automatically on next run.")
         print("Retrain schedule: run `python main.py calibrate --fit` once per day.")
 
-        # Fit trained Ks lambda model (walk-forward) from synthetic-stable
-        # samples derived from signal λ parse when available is future work;
-        # here we persist a model from mlb outcome counts if present via
-        # journal-linked thresholds (identity prior when sparse).
+        # Fit trained Ks lambda model from **actual** game-log strikeouts
+        # (point-in-time features). Holdout reports Brier vs market when prices known.
         try:
-            from slugger.ks_model import fit_ks_model, clear_ks_model_cache
-            # Minimal samples from signal reasons "λ=X" when present
-            import re
-            samples = []
-            for s in signals:
-                if s.get("strategy") != "pitcher_ks":
-                    continue
-                d = (s.get("date") or "")[:10]
-                m = re.search(r"λ=([0-9.]+)", s.get("reason") or "")
-                if not m or not d:
-                    continue
-                lam = float(m.group(1))
-                samples.append({
-                    "date": d,
-                    "recent_k": lam,
-                    "season_k": lam,
-                    "opp_k_rate": 0.225,
-                    "actual_k": lam,  # self-consistent prior until game-log join
-                })
+            from slugger.ks_model import (
+                clear_ks_model_cache,
+                fit_ks_model,
+                samples_from_pitcher_game_logs,
+            )
+            from slugger.calibration import _fetch_all_game_logs
+            from datetime import date, timedelta
+
+            print("Building Ks training samples from MLB game logs (actual Ks)...")
+            game_logs = _fetch_all_game_logs(signals)
+            as_of = (date.today() - timedelta(days=DEFAULT_CALIBRATION_LAG_DAYS)).isoformat()
+            samples = samples_from_pitcher_game_logs(game_logs, as_of=as_of)
+            print(f"  {len(samples)} point-in-time start samples (date < {as_of})")
             if len(samples) >= 20:
-                from datetime import date, timedelta
-                as_of = (date.today() - timedelta(days=DEFAULT_CALIBRATION_LAG_DAYS)).isoformat()
+                # Holdout props: use recorded market prices from signals when present
+                holdout_props = []
+                for s in signals:
+                    if s.get("strategy") != "pitcher_ks":
+                        continue
+                    # link via date in reason/ticker not always possible; skip if no price
+                    px = s.get("market_price_cents") or s.get("ask_cents")
+                    if not px:
+                        continue
                 ks_m = fit_ks_model(samples, as_of=as_of, holdout_frac=0.2)
                 ks_path = str(Path(config.log_dir) / "ks_model.json")
                 ks_m.save(ks_path)
                 clear_ks_model_cache()
-                print(f"Ks model saved to {ks_path} (n={ks_m.n_samples}, holdout_mae={ks_m.holdout_mae})")
+                print(
+                    f"Ks model saved to {ks_path} n={ks_m.n_samples} "
+                    f"holdout_mae={ks_m.holdout_mae} "
+                    f"brier_model={ks_m.holdout_model_brier} "
+                    f"brier_mkt={ks_m.holdout_market_brier} "
+                    f"beats_mkt={ks_m.holdout_beats_market}"
+                )
+            else:
+                print("  Not enough game-log samples to fit Ks model")
         except Exception as exc:
             print(f"Ks model fit skipped: {exc}")
         return
