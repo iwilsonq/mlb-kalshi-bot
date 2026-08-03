@@ -60,6 +60,8 @@ class Config:
     strategy_health_window: int = 50
     strategy_health_min_trades: int = 30
     strategy_health_min_roi_pct: float = -25.0
+    # Max average (model_brier - market_brier) before auto-disable (0.02 = 2pts)
+    strategy_health_max_brier_deficit: float = 0.02
 
     # Combo / parlay
     combo_max_legs: int = 3           # Max legs per combo (2-3)
@@ -120,6 +122,9 @@ class Config:
             strategy_health_window=int(os.getenv("STRATEGY_HEALTH_WINDOW", "50")),
             strategy_health_min_trades=int(os.getenv("STRATEGY_HEALTH_MIN_TRADES", "30")),
             strategy_health_min_roi_pct=float(os.getenv("STRATEGY_HEALTH_MIN_ROI_PCT", "-25")),
+            strategy_health_max_brier_deficit=float(
+                os.getenv("STRATEGY_HEALTH_MAX_BRIER_DEFICIT", "0.02")
+            ),
             combo_max_legs=int(os.getenv("COMBO_MAX_LEGS", "3")),
             pregame_hours=float(os.getenv("PREGAME_HOURS", "2")),
             poll_interval_sec=int(os.getenv("POLL_INTERVAL_SEC", "60")),

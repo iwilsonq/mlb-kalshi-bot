@@ -728,6 +728,7 @@ def run(config: Config, game_filter: Optional[str] = None):
         window_n=config.strategy_health_window,
         min_trades=config.strategy_health_min_trades,
         min_roi_pct=config.strategy_health_min_roi_pct,
+        max_brier_deficit=config.strategy_health_max_brier_deficit,
     )
     health.load_from_journal(journal.load_journal(config.log_dir))
     if health.disabled:
