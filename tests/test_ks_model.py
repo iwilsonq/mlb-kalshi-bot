@@ -797,3 +797,54 @@ def test_expected_ks_uses_trained_model(tmp_path, monkeypatch):
     lam = expected_ks(profile, 0.22, use_trained=True)
     assert lam > 0
     clear_ks_model_cache()
+
+
+def test_fit_estimates_dispersion_and_uses_it():
+    """The fit must measure overdispersion, not assume Poisson.
+
+    Overdispersed counts (var > mean) must yield dispersion > 1, and prob_ge must
+    then put more weight in the tail than Poisson would.
+    """
+    from slugger.models import poisson_ge
+
+    # Same mean everywhere, but wildly varying outcomes -> var >> mean
+    samples = []
+    for i in range(120):
+        samples.append({
+            "date": f"2026-04-{(i % 28) + 1:02d}",
+            "recent_k": 6.0, "season_k": 6.0, "opp_k_rate": 0.225,
+            "actual_k": float(0 if i % 2 else 12),
+        })
+    model = fit_ks_model(samples, as_of="2026-05-01", holdout_frac=0.0)
+    assert model.dispersion > 1.5, f"dispersion not detected: {model.dispersion}"
+
+    lam = model.predict_lambda(6.0, 6.0, 0.225)
+    assert model.prob_ge(9, 6.0, 6.0, 0.225) > poisson_ge(9, lam)
+
+
+def test_well_specified_poisson_keeps_dispersion_near_one():
+    samples = []
+    counts = [4, 5, 6, 5, 4, 6, 5, 5, 6, 4] * 12  # tight spread around 5
+    for i, k in enumerate(counts):
+        samples.append({
+            "date": f"2026-04-{(i % 28) + 1:02d}",
+            "recent_k": 5.0, "season_k": 5.0, "opp_k_rate": 0.225,
+            "actual_k": float(k),
+        })
+    model = fit_ks_model(samples, as_of="2026-05-01", holdout_frac=0.0)
+    assert model.dispersion < 1.2, f"spurious overdispersion: {model.dispersion}"
+
+
+def test_dispersion_survives_save_load(tmp_path):
+    m = KsModel(intercept=1.0, coef=[0.4, 0.4, 1.0], n_samples=99, dispersion=1.13)
+    p = tmp_path / "m.json"
+    m.save(str(p))
+    loaded = KsModel.load(str(p))
+    assert loaded is not None
+    assert loaded.dispersion == pytest.approx(1.13)
+    # And an older artifact without the field must default to Poisson
+    import json
+    d = json.loads(p.read_text())
+    del d["dispersion"]
+    p.write_text(json.dumps(d))
+    assert KsModel.load(str(p)).dispersion == 1.0

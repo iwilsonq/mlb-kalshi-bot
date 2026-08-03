@@ -197,6 +197,55 @@ def poisson_ge(n: int, lam: float) -> float:
     return max(0.01, min(0.99, 1.0 - cumulative))
 
 
+def negbinom_ge(n: int, lam: float, dispersion: float) -> float:
+    """P(X >= n) for a negative binomial with mean lam and variance dispersion*lam.
+
+    Strikeouts per start are overdispersed relative to Poisson. Measured on 649
+    holdout starts, conditioning on the model's own predicted lambda so this is
+    not just pitcher heterogeneity leaking in:
+
+      pred λ    n   mean K   var K   var/mean
+           2   35     0.97    1.50      1.543
+           3   72     2.88    3.10      1.077
+           4  205     3.91    4.38      1.121
+           5  217     5.10    5.30      1.038
+           6   94     6.09    7.56      1.243
+      weighted                          1.129
+
+    Poisson assumes var/mean == 1, so it gives the tail too little weight and
+    understates P(K >= threshold) for the 6+ thresholds pitcher_ks actually
+    trades — which is the residual bias left after the retransformation fix.
+
+    Parameterised so var/mean is constant (quasi-Poisson / NB1): p = 1/dispersion
+    and r = lam/(dispersion-1). Falls back to Poisson when dispersion <= 1, which
+    keeps behaviour identical for a well-specified Poisson fit.
+
+    Note this is the opposite correction to binomial_ge: hits are *under*
+    dispersed because at-bats are bounded trials, whereas a start's strikeout
+    count mixes over how long the pitcher lasts.
+    """
+    if lam <= 0:
+        return 0.01
+    if dispersion <= 1.0 + 1e-9:
+        return poisson_ge(n, lam)
+    if n <= 0:
+        return 0.99
+
+    p = 1.0 / dispersion
+    r = lam / (dispersion - 1.0)
+    cumulative = 0.0
+    for k in range(n):
+        try:
+            log_pmf = (
+                math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1)
+                + r * math.log(p) + k * math.log1p(-p)
+            )
+            cumulative += math.exp(log_pmf)
+        except (OverflowError, ValueError):
+            break
+    return max(0.01, min(0.99, 1.0 - cumulative))
+
+
 def binomial_ge(n: int, trials: float, p: float) -> float:
     """P(X >= n) for X ~ Binomial(trials, p), with fractional trials supported.
 

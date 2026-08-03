@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from slugger.models import LEAGUE_AVG_K_RATE, poisson_ge
+from slugger.models import LEAGUE_AVG_K_RATE, negbinom_ge, poisson_ge
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,9 @@ class KsModel:
     # the bar for this artifact being worth shipping at all.
     holdout_incumbent_brier: Optional[float] = None
     holdout_beats_incumbent: Optional[bool] = None
+    # var/mean of the count, estimated from training Pearson residuals. 1.0 means
+    # Poisson; strikeouts run ~1.09-1.13, so the tail needs extra weight.
+    dispersion: float = 1.0
 
     def features(self, recent_k: float, season_k: float, opp_k_rate: float) -> List[float]:
         return [
@@ -74,7 +77,7 @@ class KsModel:
 
     def prob_ge(self, threshold: int, recent_k: float, season_k: float, opp_k_rate: float = 0.0) -> float:
         lam = self.predict_lambda(recent_k, season_k, opp_k_rate)
-        return poisson_ge(threshold, lam)
+        return negbinom_ge(threshold, lam, self.dispersion)
 
     def save(self, path: str) -> None:
         p = Path(path)
@@ -91,6 +94,7 @@ class KsModel:
             "holdout_beats_market": self.holdout_beats_market,
             "holdout_incumbent_brier": self.holdout_incumbent_brier,
             "holdout_beats_incumbent": self.holdout_beats_incumbent,
+            "dispersion": self.dispersion,
         }, indent=2))
 
     @classmethod
@@ -112,6 +116,7 @@ class KsModel:
                 holdout_beats_market=d.get("holdout_beats_market"),
                 holdout_incumbent_brier=d.get("holdout_incumbent_brier"),
                 holdout_beats_incumbent=d.get("holdout_beats_incumbent"),
+                dispersion=float(d.get("dispersion", 1.0) or 1.0),
             )
         except Exception as exc:
             log.warning("Could not load KsModel from %s: %s", path, exc)
@@ -815,6 +820,24 @@ def fit_ks_model(
         holdout_from=(test[0].get("date") or None) if test else None,
     )
 
+    # Dispersion from training Pearson residuals: phi = sum((y-mu)^2/mu)/(n-p).
+    # Estimated, never tuned against the evaluation set — a phi picked to minimise
+    # holdout Brier would just be fitting the thing we use to judge the model.
+    resid = 0.0
+    n_resid = 0
+    for s in train:
+        mu = model.predict_lambda(
+            float(s.get("recent_k", 0) or 0),
+            float(s.get("season_k", 0) or 0),
+            float(s.get("opp_k_rate", 0) or 0),
+        )
+        if mu > 0:
+            actual = float(s.get("actual_k", s.get("strikeouts", 0)) or 0)
+            resid += (actual - mu) ** 2 / mu
+            n_resid += 1
+    if n_resid > len(coef) + 1:
+        model.dispersion = max(1.0, resid / (n_resid - len(coef) - 1))
+
     if test:
         errs = []
         for s in test:
@@ -925,8 +948,8 @@ def format_ks_fit_report(report: Dict[str, object]) -> str:
         f"opponent K% resolved to {report['distinct_opp_k_rates']} distinct values",
         f"  {report['n_holdout_props']} holdout props with real market prices",
         f"Ks model saved to {report['model_path']} n={m.n_samples} "
-        f"coef={[round(c, 3) for c in m.coef]} holdout_from={m.holdout_from} "
-        f"holdout_mae={m.holdout_mae}",
+        f"coef={[round(c, 3) for c in m.coef]} dispersion={m.dispersion:.3f} "
+        f"holdout_from={m.holdout_from} holdout_mae={m.holdout_mae}",
         f"  BRIER model={m.holdout_model_brier} market={m.holdout_market_brier} "
         f"incumbent={m.holdout_incumbent_brier} "
         f"beats_market={m.holdout_beats_market} "

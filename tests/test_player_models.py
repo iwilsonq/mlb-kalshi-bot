@@ -288,3 +288,57 @@ class TestBinomialGe:
     def test_clamped_like_poisson_ge(self):
         from slugger.models import binomial_ge
         assert 0.01 <= binomial_ge(1, 6, 0.99) <= 0.99
+
+
+class TestNegbinomGe:
+    """Strikeouts per start are overdispersed, so the tail needs more than Poisson.
+
+    Measured on 649 holdout starts, conditioning on the model's own predicted
+    lambda: weighted var/mean = 1.129. Poisson assumes 1.0 and therefore
+    understates P(K >= threshold) at the 6+ thresholds pitcher_ks trades.
+    """
+
+    def test_reduces_to_poisson_when_not_overdispersed(self):
+        from slugger.models import negbinom_ge, poisson_ge
+        for thr in (1, 4, 7, 10):
+            assert negbinom_ge(thr, 5.5, 1.0) == poisson_ge(thr, 5.5)
+            assert negbinom_ge(thr, 5.5, 0.8) == poisson_ge(thr, 5.5)
+
+    def test_fattens_the_tail_relative_to_poisson(self):
+        from slugger.models import negbinom_ge, poisson_ge
+        lam = 5.0
+        # Above the mean the negative binomial must assign MORE probability
+        for thr in (7, 8, 9, 10):
+            assert negbinom_ge(thr, lam, 1.13) > poisson_ge(thr, lam)
+
+    def test_mean_and_variance_match_the_parameterisation(self):
+        """var/mean must equal the dispersion, i.e. quasi-Poisson (NB1)."""
+        import math
+        lam, phi = 6.0, 1.25
+        p = 1.0 / phi
+        r = lam / (phi - 1.0)
+        pmf = []
+        for k in range(0, 200):
+            pmf.append(math.exp(
+                math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1)
+                + r * math.log(p) + k * math.log1p(-p)
+            ))
+        mean = sum(k * v for k, v in enumerate(pmf))
+        var = sum((k - mean) ** 2 * v for k, v in enumerate(pmf))
+        assert mean == pytest.approx(lam, rel=1e-6)
+        assert var / mean == pytest.approx(phi, rel=1e-6)
+
+    def test_monotone_decreasing_in_threshold(self):
+        from slugger.models import negbinom_ge
+        vals = [negbinom_ge(t, 5.0, 1.13) for t in range(1, 12)]
+        assert vals == sorted(vals, reverse=True)
+
+    def test_monotone_increasing_in_lambda(self):
+        from slugger.models import negbinom_ge
+        vals = [negbinom_ge(7, lam, 1.13) for lam in (3.0, 4.0, 5.0, 6.0, 7.0)]
+        assert vals == sorted(vals)
+
+    def test_degenerate_inputs(self):
+        from slugger.models import negbinom_ge
+        assert negbinom_ge(7, 0.0, 1.13) == 0.01
+        assert negbinom_ge(0, 5.0, 1.13) == 0.99
