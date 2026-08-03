@@ -13,7 +13,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 import requests
 
@@ -22,6 +22,7 @@ from slugger.config import Config
 from slugger.kalshi_client import market_quotes
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
 from slugger.signal_pipeline import load_calibration
+from slugger.risk import GameFactorBudget, StrategyHealthMonitor
 from slugger.sizing import DailyRiskBudget, daily_spent_from_journal, kelly_count
 from slugger.strategies import STRATEGY_PIPELINE
 from slugger.tickers import game_event_ticker
@@ -197,6 +198,7 @@ def execute_signals(
     placed_tickers: Set[str],
     budget: Optional["GameBudget"] = None,
     daily: Optional[DailyRiskBudget] = None,
+    game_factor: Optional[GameFactorBudget] = None,
 ) -> bool:
     """Place orders for a list of signals. Returns True if any signal was acted on."""
     any_acted = False
@@ -261,6 +263,15 @@ def execute_signals(
             )
             continue
 
+        # ── Same-game factor (correlated markets across prop types) ───────
+        if game_factor is not None and not game_factor.can_place(signal.ticker, cost_est):
+            log.info(
+                "  🛑 Game-factor budget for %s exhausted — skipping %s",
+                signal.ticker.split("-")[1] if "-" in signal.ticker else signal.ticker,
+                signal.ticker,
+            )
+            continue
+
         if daily is not None and daily.max_fraction > 0 and not daily.can_spend(cost_est):
             log.info(
                 "  🛑 Daily risk remaining $%.2f < cost $%.2f — skipping %s",
@@ -277,6 +288,8 @@ def execute_signals(
             held_tickers.add(signal.ticker)
             if budget:
                 budget.record(cost_est)
+            if game_factor is not None:
+                game_factor.record(signal.ticker, cost_est)
             if daily is not None:
                 daily.record(cost_est)
         else:
@@ -309,6 +322,8 @@ def execute_signals(
                 placed_tickers.add(signal.ticker)
                 if budget:
                     budget.record(cost_usd)
+                if game_factor is not None:
+                    game_factor.record(signal.ticker, cost_usd)
                 if daily is not None:
                     daily.record(cost_usd)
                 journal.record_trade(
@@ -355,6 +370,8 @@ def process_game(
     placed_tickers: Set[str],
     calibration: Optional[CalibrationLayer] = None,
     daily: Optional[DailyRiskBudget] = None,
+    health: Optional[StrategyHealthMonitor] = None,
+    game_factor: Optional[GameFactorBudget] = None,
 ):
     """Run all strategies for a single game and execute trades.
 
@@ -396,15 +413,23 @@ def process_game(
         max_signals=config.max_signals_per_game,
         max_exposure_usd=config.max_exposure_per_game_usd,
     )
+    if game_factor is None:
+        game_factor = GameFactorBudget(
+            max_signals_per_game=config.max_signals_per_game,
+            max_exposure_usd=config.max_exposure_per_game_usd,
+        )
 
     # Accumulated signals from all prior strategies — fed to each subsequent
     # strategy so combo (last in the pipeline) can see all single-leg signals.
     all_prior_signals: List[TradeSignal] = []
 
     # ── Run strategy pipeline in order ─────────────────────────────────────
-    enabled = set(config.enabled_strategies)
+    base_enabled = set(config.enabled_strategies)
     for strat_name, strat_fn in STRATEGY_PIPELINE:
-        if strat_name not in enabled:
+        if strat_name not in base_enabled:
+            continue
+        if health is not None and not health.is_enabled(strat_name, base_enabled):
+            log.info("  ⛔ %s auto-disabled (rolling health) — skipping", strat_name)
             continue
         if circuit.is_tripped():
             log.warning("⚡ Circuit breaker tripped — stopping")
@@ -417,6 +442,7 @@ def process_game(
             effective_bankroll, held_tickers, placed_tickers,
             budget=budget,
             daily=daily,
+            game_factor=game_factor,
         ):
             any_signals = True
 
@@ -435,6 +461,7 @@ def settle_pending(
     client: MarketClient,
     config: Config,
     circuit: Optional[CircuitBreaker] = None,
+    health: Optional[StrategyHealthMonitor] = None,
 ) -> int:
     """Check Kalshi for outcomes on any unsettled journal trades.
 
@@ -493,10 +520,23 @@ def settle_pending(
         pnl = revenue_usd - yes_cost - fee
         if circuit is not None:
             circuit.record_settlement(pnl)
+        if health is not None:
+            strat, cost = _trade_cost_for_ticker(records, ticker)
+            health.observe(strat, pnl, cost if cost > 0 else yes_cost)
         log.info("  📋 Settled %-45s  result=%-4s  P&L $%+.2f", ticker, result or "?", pnl)
         found += 1
 
     return found
+
+
+def _trade_cost_for_ticker(records: List[dict], ticker: str) -> Tuple[str, float]:
+    """Return (strategy, cost_usd) for the latest trade on ticker."""
+    strategy, cost = "unknown", 0.0
+    for r in records:
+        if r.get("type") == "trade" and r.get("ticker") == ticker:
+            strategy = r.get("strategy", "unknown")
+            cost = float(r.get("cost_usd") or 0.0)
+    return strategy, cost
 
 
 # ─── CLV snapshots ────────────────────────────────────────────────────────────
@@ -641,6 +681,16 @@ def run(config: Config, game_filter: Optional[str] = None):
     cal_path = str(Path(config.log_dir) / "calibration.json")
     calibration = load_calibration(cal_path)
 
+    # Rolling strategy health from journal history
+    health = StrategyHealthMonitor(
+        window_n=config.strategy_health_window,
+        min_trades=config.strategy_health_min_trades,
+        min_roi_pct=config.strategy_health_min_roi_pct,
+    )
+    health.load_from_journal(journal.load_journal(config.log_dir))
+    if health.disabled:
+        log.warning("Strategies auto-disabled at start: %s", ", ".join(sorted(health.disabled)))
+
     # Load today's ledger — persists placed tickers across invocations
     placed_tickers: Set[str] = load_ledger(config.log_dir)
 
@@ -750,6 +800,7 @@ def run(config: Config, game_filter: Optional[str] = None):
                     placed_tickers=placed_tickers,
                     calibration=calibration,
                     daily=daily,
+                    health=health,
                 )
             except Exception as exc:
                 log.error("Error processing %s: %s", game.game_id, exc)
@@ -760,7 +811,7 @@ def run(config: Config, game_filter: Optional[str] = None):
         # Auto-settle: check for outcomes on any open journal trades
         if not single_pass:
             try:
-                n = settle_pending(client, config, circuit=circuit)
+                n = settle_pending(client, config, circuit=circuit, health=health)
                 if n:
                     overall, _ = journal.get_stats(journal.load_journal(config.log_dir))
                     log.info(

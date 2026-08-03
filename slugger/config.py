@@ -56,6 +56,10 @@ class Config:
     max_signals_per_game: int = 5     # Cap correlated same-game exposure
     # Dollar cap per game (0 = signal-count only). Phase 0 default = 2× max position.
     max_exposure_per_game_usd: float = 10.0
+    # Rolling strategy auto-disable
+    strategy_health_window: int = 50
+    strategy_health_min_trades: int = 30
+    strategy_health_min_roi_pct: float = -25.0
 
     # Combo / parlay
     combo_max_legs: int = 3           # Max legs per combo (2-3)
@@ -113,6 +117,9 @@ class Config:
             min_volume=int(os.getenv("MIN_VOLUME", "0")),
             max_signals_per_game=int(os.getenv("MAX_SIGNALS_PER_GAME", "5")),
             max_exposure_per_game_usd=float(os.getenv("MAX_EXPOSURE_PER_GAME_USD", "10")),
+            strategy_health_window=int(os.getenv("STRATEGY_HEALTH_WINDOW", "50")),
+            strategy_health_min_trades=int(os.getenv("STRATEGY_HEALTH_MIN_TRADES", "30")),
+            strategy_health_min_roi_pct=float(os.getenv("STRATEGY_HEALTH_MIN_ROI_PCT", "-25")),
             combo_max_legs=int(os.getenv("COMBO_MAX_LEGS", "3")),
             pregame_hours=float(os.getenv("PREGAME_HOURS", "2")),
             poll_interval_sec=int(os.getenv("POLL_INTERVAL_SEC", "60")),
