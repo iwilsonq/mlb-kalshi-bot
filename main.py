@@ -250,7 +250,7 @@ def cmd_calibrate(config: Config, fit: bool = False):
             if len(samples) >= 20:
                 from slugger.ks_model import (
                     build_holdout_props_from_signals,
-                    compare_roi_to_phase0_baseline,
+                    model_roi_vs_phase0_baseline,
                 )
                 # Real market prices from signals.jsonl joined to actual Ks
                 holdout_props = build_holdout_props_from_signals(
@@ -268,18 +268,30 @@ def cmd_calibrate(config: Config, fit: bool = False):
                 clear_ks_model_cache()
                 print(
                     f"Ks model saved to {ks_path} n={ks_m.n_samples} "
+                    f"coef={[round(c, 3) for c in ks_m.coef]} "
+                    f"holdout_from={ks_m.holdout_from} "
                     f"holdout_mae={ks_m.holdout_mae} "
                     f"brier_model={ks_m.holdout_model_brier} "
                     f"brier_mkt={ks_m.holdout_market_brier} "
                     f"beats_mkt={ks_m.holdout_beats_market}"
                 )
-                # Journal ROI: Phase-0 edge gate vs unrestricted baseline
-                roi_cmp = compare_roi_to_phase0_baseline(records, "pitcher_ks")
+                # Model-scored ROI vs journal Phase-0 baseline (uses KsModel.prob_ge).
+                # holdout_only=True: only starts after the walk-forward boundary count.
+                roi_cmp = model_roi_vs_phase0_baseline(
+                    ks_m,
+                    holdout_props,
+                    records,
+                    min_n=10,
+                    cost_buffer_cents=float(config.edge_cost_buffer_cents),
+                )
                 print(
-                    f"  ROI baseline n={roi_cmp['baseline']['n']:.0f} "
-                    f"roi={roi_cmp['baseline']['roi_pct']:+.1f}% | "
-                    f"gated(edge≥20) n={roi_cmp['gated']['n']:.0f} "
-                    f"roi={roi_cmp['gated']['roi_pct']:+.1f}% | "
+                    f"  MODEL_ROI status={roi_cmp.get('status')} "
+                    f"cells={roi_cmp['n_cells_scored']} "
+                    f"(dropped_in_sample={roi_cmp['n_in_sample_dropped']}) "
+                    f"model_n={roi_cmp['model']['n']:.0f} "
+                    f"model_roi={roi_cmp['model']['roi_pct']:+.1f}% | "
+                    f"baseline_n={roi_cmp['baseline']['n']:.0f} "
+                    f"baseline_roi={roi_cmp['baseline']['roi_pct']:+.1f}% | "
                     f"not_worse={roi_cmp['not_worse_than_baseline']}"
                 )
             else:

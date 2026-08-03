@@ -20,6 +20,16 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MODEL_PATH = "logs/ks_model.json"
 
+# Relative shrinkage on standardized slopes. recent_k and season_k are highly
+# collinear by construction (season is a superset of recent), so the fit needs
+# real regularization to avoid large cancelling coefficients.
+RIDGE_ALPHA = 0.10
+
+# Plausible bounds for a starter's expected strikeouts in a single start.
+# Guardrail only — a fit that needs this clamp is already suspect.
+LAMBDA_MIN = 0.0
+LAMBDA_MAX = 14.0
+
 
 @dataclass
 class KsModel:
@@ -28,6 +38,9 @@ class KsModel:
     coef: List[float] = field(default_factory=lambda: [0.7, 0.3, 0.0])
     as_of: str = ""
     n_samples: int = 0
+    # First date of the walk-forward holdout window. Anything on/after this date
+    # was never trained on, so it is the only window ROI may be claimed from.
+    holdout_from: Optional[str] = None
     holdout_mae: Optional[float] = None
     holdout_model_brier: Optional[float] = None
     holdout_market_brier: Optional[float] = None
@@ -50,7 +63,9 @@ class KsModel:
         z = self.intercept
         for c, x in zip(self.coef, f):
             z += c * x
-        return max(0.0, math.exp(z))
+        # Clamp the exponent before exp() so extreme extrapolation can't overflow
+        z = min(z, math.log(LAMBDA_MAX))
+        return min(max(LAMBDA_MIN, math.exp(z)), LAMBDA_MAX)
 
     def prob_ge(self, threshold: int, recent_k: float, season_k: float, opp_k_rate: float = 0.0) -> float:
         lam = self.predict_lambda(recent_k, season_k, opp_k_rate)
@@ -64,6 +79,7 @@ class KsModel:
             "coef": self.coef,
             "as_of": self.as_of,
             "n_samples": self.n_samples,
+            "holdout_from": self.holdout_from,
             "holdout_mae": self.holdout_mae,
             "holdout_model_brier": self.holdout_model_brier,
             "holdout_market_brier": self.holdout_market_brier,
@@ -82,6 +98,7 @@ class KsModel:
                 coef=[float(x) for x in d.get("coef", [0.7, 0.3, 0.0])],
                 as_of=d.get("as_of", "") or "",
                 n_samples=int(d.get("n_samples", 0) or 0),
+                holdout_from=d.get("holdout_from"),
                 holdout_mae=d.get("holdout_mae"),
                 holdout_model_brier=d.get("holdout_model_brier"),
                 holdout_market_brier=d.get("holdout_market_brier"),
@@ -134,23 +151,11 @@ def samples_from_pitcher_game_logs(
     return samples
 
 
-def _ols(X: List[List[float]], y: List[float]) -> Tuple[float, List[float]]:
-    n = len(X)
-    if n == 0:
-        return 0.0, [0.0, 0.0, 0.0]
-    p = len(X[0])
-    A = [[1.0] + row for row in X]
-    dim = p + 1
-    AtA = [[0.0] * dim for _ in range(dim)]
-    Aty = [0.0] * dim
-    for i in range(n):
-        for a in range(dim):
-            Aty[a] += A[i][a] * y[i]
-            for b in range(dim):
-                AtA[a][b] += A[i][a] * A[i][b]
-    ridge = 1e-3
-    for i in range(dim):
-        AtA[i][i] += ridge
+def _solve(AtA: List[List[float]], Aty: List[float]) -> List[float]:
+    """Gauss-Jordan solve for AtA @ x = Aty. Returns zeros if singular."""
+    dim = len(Aty)
+    if dim == 0:
+        return []
     M = [AtA[i][:] + [Aty[i]] for i in range(dim)]
     for col in range(dim):
         pivot = col
@@ -158,7 +163,11 @@ def _ols(X: List[List[float]], y: List[float]) -> Tuple[float, List[float]]:
             if abs(M[r][col]) > abs(M[pivot][col]):
                 pivot = r
         M[col], M[pivot] = M[pivot], M[col]
-        piv = M[col][col] or 1e-12
+        if abs(M[col][col]) < 1e-12:
+            # Column carries no independent information — leave coefficient at 0
+            M[col][col] = 1.0
+            M[col][dim] = 0.0
+        piv = M[col][col]
         for c in range(col, dim + 1):
             M[col][c] /= piv
         for r in range(dim):
@@ -167,8 +176,66 @@ def _ols(X: List[List[float]], y: List[float]) -> Tuple[float, List[float]]:
             factor = M[r][col]
             for c in range(col, dim + 1):
                 M[r][c] -= factor * M[col][c]
-    beta = [M[i][dim] for i in range(dim)]
-    return beta[0], beta[1:]
+    return [M[i][dim] for i in range(dim)]
+
+
+def _ridge_fit(
+    X: List[List[float]],
+    y: List[float],
+    *,
+    alpha: float = RIDGE_ALPHA,
+) -> Tuple[float, List[float]]:
+    """Ridge regression on standardized features, intercept unpenalized.
+
+    Standardization matters: `log1p(recent_k)` and `log1p(season_k)` are
+    strongly collinear, so an unstandardized penalty of 1e-3 leaves the fit
+    free to assign huge cancelling weights (e.g. +15.4 / -14.1) that explode
+    out of sample. Centering the response and penalizing only the slopes in
+    z-space bounds each coefficient by |z'y| / (alpha * n) along the
+    near-degenerate direction.
+
+    alpha is relative shrinkage: for orthogonal standardized features the
+    fitted slope is roughly ols/(1 + alpha).
+    """
+    n = len(X)
+    if n == 0:
+        return 0.0, [0.0, 0.0, 0.0]
+    p = len(X[0])
+
+    means = [sum(row[j] for row in X) / n for j in range(p)]
+    stds: List[float] = []
+    for j in range(p):
+        var = sum((row[j] - means[j]) ** 2 for row in X) / n
+        stds.append(math.sqrt(var) if var > 1e-18 else 0.0)
+
+    y_bar = sum(y) / n
+    live = [j for j in range(p) if stds[j] > 0.0]
+    if not live:
+        return y_bar, [0.0] * p
+
+    # Standardized design over the non-constant columns only
+    Z = [[(row[j] - means[j]) / stds[j] for j in live] for row in X]
+    yc = [v - y_bar for v in y]
+
+    dim = len(live)
+    ZtZ = [[0.0] * dim for _ in range(dim)]
+    Zty = [0.0] * dim
+    for i in range(n):
+        zi = Z[i]
+        for a in range(dim):
+            Zty[a] += zi[a] * yc[i]
+            for b in range(dim):
+                ZtZ[a][b] += zi[a] * zi[b]
+    for i in range(dim):
+        ZtZ[i][i] += alpha * n
+
+    b_std = _solve(ZtZ, Zty)
+
+    coef = [0.0] * p
+    for k, j in enumerate(live):
+        coef[j] = b_std[k] / stds[j]
+    intercept = y_bar - sum(coef[j] * means[j] for j in range(p))
+    return intercept, coef
 
 
 def brier_score(probs: Sequence[float], outcomes: Sequence[int]) -> Optional[float]:
@@ -359,30 +426,137 @@ def journal_roi_for_strategy(
     return {"n": float(n), "cost_usd": cost, "pnl_usd": pnl, "roi_pct": roi}
 
 
-def compare_roi_to_phase0_baseline(
-    records: Sequence[dict],
-    strategy: str = "pitcher_ks",
-    *,
-    phase0_min_edge: float = 20.0,
-) -> Dict[str, object]:
-    """Compare unrestricted historical ROI vs Phase-0 gated edge floor.
+# Phase-0 trading floors for model-scored ROI (must match strategies.py Ks gates)
+_PHASE0_MIN_MODEL_PROB = 25
+_PHASE0_MAX_MODEL_PROB = 55
+_PHASE0_MIN_EDGE_CENTS = 20
+_PHASE0_MIN_THRESHOLD = 6
 
-    Baseline = all settled trades for strategy (pre-gate reality).
-    Gated = only trades that recorded edge_cents >= phase0_min_edge
-    (proxy for Phase 0 floors). AC: gated ROI should not be worse than baseline.
+
+def model_roi_vs_phase0_baseline(
+    model: KsModel,
+    cells: Sequence[dict],
+    journal_records: Sequence[dict],
+    *,
+    min_n: int = 10,
+    cost_buffer_cents: float = 5.0,
+    stake_usd: float = 1.0,
+    strategy: str = "pitcher_ks",
+    holdout_only: bool = True,
+) -> Dict[str, object]:
+    """Score trained KsModel ROI on holdout cells vs journal Phase-0 baseline.
+
+    Model path (must call model.prob_ge / predict_lambda):
+      - P(K≥threshold) from trained model
+      - Trade YES only if threshold≥6, model prob in [25,55], net edge≥20¢
+        where net_edge = model_prob_pct - market_price_cents - cost_buffer
+      - Settle from actual_k; stake fixed stake_usd per trade at market price
+
+    Baseline path:
+      - journal_roi_for_strategy(records, pitcher_ks) on all settled journal trades
+
+    holdout_only (default): drop cells dated before model.holdout_from, so ROI is
+    claimed only on starts the model never trained on. Passing the full prop set
+    would report an in-sample number and overstate the edge.
+
+    Fail-closed: not_worse_than_baseline is True only when model_n >= min_n
+    AND model ROI ≥ baseline ROI. Empty/insufficient → False + insufficient_data.
     """
-    baseline = journal_roi_for_strategy(records, strategy)
-    gated = journal_roi_for_strategy(records, strategy, min_edge_cents=phase0_min_edge)
-    not_worse = True
-    if baseline["n"] >= 5 and gated["n"] >= 1:
-        not_worse = gated["roi_pct"] >= baseline["roi_pct"] - 1e-9
-    elif gated["n"] == 0:
-        not_worse = True  # no gated trades yet — not worse
-    return {
+    baseline = journal_roi_for_strategy(journal_records, strategy)
+
+    scored = list(cells)
+    n_in_sample_dropped = 0
+    if holdout_only and model.holdout_from:
+        kept = [c for c in scored if (c.get("date") or "") >= model.holdout_from]
+        n_in_sample_dropped = len(scored) - len(kept)
+        scored = kept
+
+    cost = 0.0
+    pnl = 0.0
+    n = 0
+    traded_details: List[dict] = []
+
+    for cell in scored:
+        thr = int(cell.get("threshold", 0) or 0)
+        if thr < _PHASE0_MIN_THRESHOLD:
+            continue
+        mkt = cell.get("market_price_cents")
+        if mkt is None or float(mkt) <= 0 or float(mkt) >= 100:
+            continue
+        if cell.get("synthetic_market"):
+            continue
+        recent = float(cell.get("recent_k", 0) or 0)
+        season = float(cell.get("season_k", 0) or 0)
+        opp = float(cell.get("opp_k_rate", 0) or 0)
+        actual = float(cell.get("actual_k", 0) or 0)
+
+        # CRITICAL: use trained model probability (not journal edge_cents)
+        p_yes = model.prob_ge(thr, recent, season, opp)
+        model_pct = p_yes * 100.0
+        price = float(mkt)
+        net_edge = model_pct - price - float(cost_buffer_cents)
+
+        if model_pct < _PHASE0_MIN_MODEL_PROB or model_pct > _PHASE0_MAX_MODEL_PROB:
+            continue
+        if net_edge < _PHASE0_MIN_EDGE_CENTS:
+            continue
+
+        # Trade 1 unit sized so cost ≈ stake_usd at market price
+        # cost = count * price/100 = stake_usd → count = stake_usd * 100 / price
+        # For ROI we use dollar stake equal to cost of 1 contract * scale
+        trade_cost = stake_usd
+        contracts = trade_cost / (price / 100.0)
+        # YES settlement: if win, receive contracts * $1; profit = contracts*(1 - p)
+        # loss = -contracts * p  (= -trade_cost)
+        won = actual >= thr
+        if won:
+            trade_pnl = contracts * (1.0 - price / 100.0)
+        else:
+            trade_pnl = -trade_cost
+
+        n += 1
+        cost += trade_cost
+        pnl += trade_pnl
+        traded_details.append({
+            "threshold": thr,
+            "model_pct": model_pct,
+            "price": price,
+            "net_edge": net_edge,
+            "won": won,
+            "pnl": trade_pnl,
+        })
+
+    model_roi = (pnl / cost * 100.0) if cost > 0 else 0.0
+    model_stats = {
+        "n": float(n),
+        "cost_usd": cost,
+        "pnl_usd": pnl,
+        "roi_pct": model_roi,
+    }
+
+    common = {
         "baseline": baseline,
-        "gated": gated,
+        "model": model_stats,
+        "min_n": min_n,
+        "n_traded": n,
+        "n_cells_scored": len(scored),
+        "n_in_sample_dropped": n_in_sample_dropped,
+        "holdout_from": model.holdout_from,
+        "cost_buffer_cents": cost_buffer_cents,
+    }
+
+    if n < min_n:
+        return {
+            **common,
+            "not_worse_than_baseline": False,
+            "status": "insufficient_data",
+        }
+
+    not_worse = model_roi >= baseline["roi_pct"] - 1e-9
+    return {
+        **common,
         "not_worse_than_baseline": not_worse,
-        "phase0_min_edge": phase0_min_edge,
+        "status": "ok" if not_worse else "worse_than_baseline",
     }
 
 
@@ -392,6 +566,7 @@ def fit_ks_model(
     as_of: Optional[str] = None,
     holdout_frac: float = 0.2,
     holdout_props: Optional[Sequence[dict]] = None,
+    ridge_alpha: float = RIDGE_ALPHA,
 ) -> KsModel:
     """Fit from samples with actual_k (true outcomes). Walk-forward as_of filter."""
     rows = []
@@ -413,6 +588,17 @@ def fit_ks_model(
 
     rows = sorted(rows, key=lambda r: r.get("date") or "")
     cut = max(1, int(len(rows) * (1.0 - holdout_frac)))
+    if 0 < cut < len(rows):
+        # Never split one date across train/test. Several pitchers start on the
+        # same day, so an index cut leaves same-day starts in training while the
+        # holdout boundary claims they are out of sample. Walk the cut back until
+        # the boundary date lives entirely in the holdout.
+        boundary = (rows[cut].get("date") or "")
+        while cut > 0 and (rows[cut - 1].get("date") or "") == boundary:
+            cut -= 1
+        if cut == 0:
+            # Every row shares one date — no clean walk-forward split exists.
+            cut = len(rows)
     train, test = rows[:cut], rows[cut:]
 
     def pack(data):
@@ -427,8 +613,14 @@ def fit_ks_model(
         return X, y
 
     X, y = pack(train)
-    intercept, coef = _ols(X, y)
-    model = KsModel(intercept=intercept, coef=coef, as_of=as_of or "", n_samples=len(train))
+    intercept, coef = _ridge_fit(X, y, alpha=ridge_alpha)
+    model = KsModel(
+        intercept=intercept,
+        coef=coef,
+        as_of=as_of or "",
+        n_samples=len(train),
+        holdout_from=(test[0].get("date") or None) if test else None,
+    )
 
     if test:
         errs = []
