@@ -5,18 +5,29 @@ An automated trading bot that analyzes MLB games and places trades on the [Kalsh
 ## What It Does
 
 - Fetches live MLB data (schedules, pitcher stats, batter stats, weather)
-- Analyzes games using 4 built-in strategies
+- Analyzes games with the strategies registered in `STRATEGY_PIPELINE`
 - Places limit orders on Kalshi markets (or dry-runs by default)
-- Manages risk with Kelly criterion sizing and circuit breakers
+- Manages risk with Kelly sizing, per-game/daily caps, rolling strategy
+  health auto-disable, and circuit breakers
 
 ## Strategies
 
-| Strategy | Description |
-|----------|-------------|
-| `game_winner` | Predicts home team wins based on pitcher ERA |
-| `pitcher_ks` | Predicts pitcher strikeout props |
-| `player_hr` | Predicts player home run props |
-| `total_runs` | Predicts over/under on total runs |
+The live registry is `STRATEGY_PIPELINE` in `slugger/strategies.py`; the
+`ENABLED_STRATEGIES` allowlist can only narrow it, never extend it.
+
+| Strategy | Status | Model |
+|----------|--------|-------|
+| `player_hits` | live | Binomial over expected AB; per-AB probability from shrunk splits × WHIP/hard-hit/park, calibrated on game-log outcomes |
+| `pitcher_ks` | auto-disabled (rolling ROI) | Poisson GLM λ with negative-binomial tail, trained walk-forward on game logs (`logs/ks_model.json`) |
+
+Retired strategies (`game_winner`, `total_runs`, `player_hr`,
+`player_hr_rbis`, `combo`, `pitcher_er`) were deleted; the journal
+evidence for each lives in `RETIRED_STRATEGIES` in `slugger/strategies.py`.
+
+Honest status: neither model beats the market's Brier score on holdout,
+so the bot currently finds no edge and places few or no trades. The
+measurement/reporting pipeline (`calibrate --fit`, `report`) is the part
+that earns its keep.
 
 ## Prerequisites
 
@@ -49,9 +60,10 @@ Also set your trading preferences:
 - `MAX_POSITION_USD=5` — max per trade
 - `KELLY_FRACTION=0.25` — quarter-Kelly sizing
 - `MIN_EDGE_CENTS=5` — minimum *cost-adjusted* edge to trigger a trade
-- `EDGE_COST_BUFFER_CENTS=5` — haircut for spread/fees before sizing
-- `MAX_EXPOSURE_PER_GAME_USD=10` — dollar cap per game (~2× max position)
-- `ENABLED_STRATEGIES=pitcher_ks,player_hr,player_hits` — Phase 0 allowlist
+- `EDGE_COST_BUFFER_CENTS=2` — residual adverse-selection haircut (the exact
+  Kalshi fee and half-spread are computed per contract automatically)
+- `MAX_EXPOSURE_PER_GAME_USD=16` — dollar cap per game (~2× max position)
+- `ENABLED_STRATEGIES=pitcher_ks,player_hits` — allowlist (subset of the pipeline)
 
 ### 3. Generate an API key (if you haven't)
 
@@ -97,10 +109,21 @@ python3 main.py run
 ```
 
 ### Use specific strategies
-Edit `ENABLED_STRATEGIES` in `.env` (Phase 0 defaults omit weak strategies):
+Edit `ENABLED_STRATEGIES` in `.env`. Entries not registered in
+`STRATEGY_PIPELINE` are inert (a test enforces the default allowlist is a
+subset of the pipeline):
 ```bash
 ENABLED_STRATEGIES=pitcher_ks,player_hits
 ```
+
+### Retrain models and calibration (daily)
+```bash
+python3 main.py calibrate --fit
+```
+Fits walk-forward calibration curves from game-log outcomes (not just
+traded settlements), retrains the Ks model, and reports holdout Brier vs
+the market — with an explicit warning when the model has no demonstrated
+edge.
 
 ## CLI Options
 
@@ -122,14 +145,21 @@ Options:
 ```
 mlb-kalshi-bot/
 ├── slugger/
-│   ├── __init__.py      # Package init, version
-│   ├── config.py        # Configuration from .env
-│   ├── mlb_data.py      # MLB Stats API + Statcast data
-│   ├── kalshi_client.py # Kalshi API client (auth, orders, markets)
-│   └── strategies.py    # Trading strategies
-├── main.py              # CLI entry point
-├── requirements.txt     # Python dependencies
-└── .env.example         # Example config file
+│   ├── config.py           # Configuration from .env
+│   ├── mlb_data.py         # MLB Stats API + Statcast data
+│   ├── kalshi_client.py    # Kalshi API client (auth, orders, markets)
+│   ├── strategies.py       # Strategy fns + STRATEGY_PIPELINE registry
+│   ├── signal_pipeline.py  # Market matching, edge/fee math, signal recording
+│   ├── models.py           # Distributions and probability models
+│   ├── ks_model.py         # Trained strikeout model (walk-forward)
+│   ├── calibration.py      # Isotonic calibration from game-log outcomes
+│   ├── risk.py             # Rolling strategy health, exposure budgets
+│   ├── execution.py        # Limit pricing, order cancellation
+│   ├── game_processor.py   # Main loop
+│   └── backtest/           # Point-in-time replay harness
+├── main.py                 # CLI entry point
+├── requirements.txt        # Python dependencies
+└── .env.example            # Example config file
 ```
 
 ## How the Bot Works
@@ -143,6 +173,6 @@ mlb-kalshi-bot/
 
 ## Customization
 
-- **Add strategies**: Create a new function in `slugger/strategies.py` following the `TradeSignal` return pattern, then register it in `STRATEGIES`
+- **Add strategies**: Create the strategy function in `slugger/strategies.py`, wrap it with the uniform `StrategyFn` signature, and register it in `STRATEGY_PIPELINE` (the `STRATEGIES` dict no longer exists)
 - **Adjust sizing**: Modify `kelly_fraction`, `max_position_usd`, or `min_edge_cents` in `.env`
 - **Add sportsbooks**: The bot currently only supports Kalshi — adding others would require new API clients in `kalshi_client.py`
