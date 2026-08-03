@@ -1,7 +1,14 @@
 """Tests for maker limit pricing and consensus gate."""
 from slugger.consensus import consensus_allows_trade, load_consensus_prices
-from slugger.execution import limit_price_cents, should_cancel_for_first_pitch
+from slugger.execution import (
+    cancel_resting_orders_for_started_games,
+    classify_fill_role,
+    limit_price_cents,
+    should_cancel_for_first_pitch,
+)
+from slugger.game_state import GameStateTracker
 from slugger.strategies import RETIRED_STRATEGIES, STRATEGY_PIPELINE
+from slugger.types import GameInfo
 
 
 def test_limit_price_never_above_ask_or_fair():
@@ -35,3 +42,40 @@ def test_retired_strategies_not_in_pipeline():
     assert "pitcher_ks" in names
     assert "player_hits" in names
     assert "player_hr" not in names  # dark
+
+
+def test_cancel_resting_orders_for_started_games():
+    cancelled = []
+    orders = [
+        {"order_id": "o1", "ticker": "KXMLBKS-STARTED", "status": "resting"},
+        {"order_id": "o2", "ticker": "KXMLBKS-OPEN", "status": "resting"},
+        {"order_id": "o3", "ticker": "KXMLBKS-DONE", "status": "executed"},
+    ]
+    n = cancel_resting_orders_for_started_games(
+        orders,
+        ticker_game_started=lambda t: t.endswith("STARTED"),
+        cancel_fn=lambda oid: cancelled.append(oid) or True,
+    )
+    assert n == 1
+    assert cancelled == ["o1"]
+
+
+def test_classify_fill_role():
+    assert classify_fill_role(40, 38, 40) == "maker"
+    assert classify_fill_role(40, 40, 40) == "taker"
+
+
+def test_sp_scratch_invalidates_game():
+    tr = GameStateTracker()
+    g1 = GameInfo(
+        1, "A", "H", "AWY", "HOM", "1-1", "1-1", "P1", "P2", 10, 20,
+        "2026-05-10T20:00:00Z", "V", {}, "Pre-Game",
+    )
+    assert tr.observe(g1) is None
+    g2 = GameInfo(
+        1, "A", "H", "AWY", "HOM", "1-1", "1-1", "P1b", "P2", 99, 20,
+        "2026-05-10T20:00:00Z", "V", {}, "Pre-Game",
+    )
+    reason = tr.observe(g2)
+    assert reason is not None
+    assert tr.is_invalid(1)

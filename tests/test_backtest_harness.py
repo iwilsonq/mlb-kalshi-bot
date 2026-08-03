@@ -93,7 +93,9 @@ def test_snapshot_roundtrip(tmp_path):
 
 
 def test_replay_strategies_on_snapshot(tmp_path):
-    """Replay uses snapshot profiles + fixture markets; no live API."""
+    """Replay uses snapshot profiles + fixture markets; produces trade signals."""
+    from slugger.tickers import ks_event_ticker
+
     game = GameInfo(
         game_id=99,
         away_team="San Francisco Giants",
@@ -106,7 +108,7 @@ def test_replay_strategies_on_snapshot(tmp_path):
         home_pitcher_name="Glasnow",
         away_pitcher_id=100,
         home_pitcher_id=200,
-        game_datetime="2026-05-10T20:00:00Z",
+        game_datetime="2026-05-10T20:10:00Z",
         venue="Dodger Stadium",
         weather={},
         status="Pre-Game",
@@ -123,13 +125,37 @@ def test_replay_strategies_on_snapshot(tmp_path):
         home_pitcher=pitcher_profile_from_logs(200, "Glasnow", logs, "2026-05-10", throws="R"),
         away_pitcher=pitcher_profile_from_logs(100, "Webb", logs, "2026-05-10", throws="R"),
     )
-    # Markets under KS event ticker pattern from tickers module may be empty
-    # if ticker helpers need exact format — use empty markets; replay still runs.
+    event = ks_event_ticker(game)
+    assert event
+    # Thresholds where model prob lands in pitcher_ks band (25–55%) with λ≈8.5
+    markets = {
+        event: [
+            {
+                "ticker": f"{event}-LADGLASNOW-9",
+                "title": "Glasnow 9+ strikeouts",
+                "yes_bid_dollars": "0.20",
+                "yes_ask_dollars": "0.22",  # model ~48% → net edge >> 20¢
+            },
+            {
+                "ticker": f"{event}-SFWEBB-10",
+                "title": "Webb 10+ strikeouts",
+                "yes_bid_dollars": "0.15",
+                "yes_ask_dollars": "0.18",
+            },
+        ]
+    }
     result = replay_strategies(
         ctx,
-        markets_by_event={},
-        config=Config(dry_run=True, log_dir=str(tmp_path), enabled_strategies=("pitcher_ks",)),
+        markets_by_event=markets,
+        config=Config(
+            dry_run=True,
+            log_dir=str(tmp_path),
+            enabled_strategies=("pitcher_ks",),
+            min_edge_cents=3,
+            edge_cost_buffer_cents=0,
+        ),
         enabled=["pitcher_ks"],
     )
-    assert isinstance(result.signals, list)
     assert "pitcher_ks" in result.by_strategy
+    assert len(result.signals) >= 1, "replay must produce at least one TradeSignal"
+    assert all(s.strategy == "pitcher_ks" for s in result.signals)

@@ -447,6 +447,27 @@ class KalshiClient:
         data = self._get("/portfolio/fills", params=params)
         return data.get("fills", [])
 
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a resting order by id. Returns True if cancel accepted."""
+        if not order_id:
+            return False
+        try:
+            self._delete(f"/portfolio/orders/{order_id}")
+            log.info("Cancelled order %s", order_id)
+            return True
+        except requests.HTTPError as e:
+            log.warning("Cancel order %s failed: %s", order_id, e)
+            return False
+
+    def get_orders(self, status: str = "resting", limit: int = 100) -> List[Dict]:
+        """List orders filtered by status (e.g. resting)."""
+        try:
+            data = self._get("/portfolio/orders", params={"status": status, "limit": limit})
+            return data.get("orders", data.get("data", []) or [])
+        except Exception as e:
+            log.warning("get_orders failed: %s", e)
+            return []
+
     # ── Multivariate (combo / parlay) markets ────────────────────────────
 
     def get_multivariate_collections(

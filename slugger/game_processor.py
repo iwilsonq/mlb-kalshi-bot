@@ -23,11 +23,16 @@ from slugger.kalshi_client import market_quotes
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
 from slugger.signal_pipeline import load_calibration
 from slugger.consensus import consensus_allows_trade, load_consensus_prices
-from slugger.execution import limit_price_cents
+from slugger.execution import (
+    cancel_resting_orders_for_started_games,
+    classify_fill_role,
+    limit_price_cents,
+)
+from slugger.game_state import GameStateTracker
 from slugger.risk import GameFactorBudget, StrategyHealthMonitor
 from slugger.sizing import DailyRiskBudget, daily_spent_from_journal, kelly_count
 from slugger.strategies import STRATEGY_PIPELINE
-from slugger.tickers import game_event_ticker
+from slugger.tickers import game_event_ticker, parse_game_time_utc
 from slugger.types import GameContext, GameInfo, MarketClient, TradeSignal
 import slugger.journal as journal
 
@@ -334,12 +339,15 @@ def execute_signals(
                 # Cost uses fill price when known, else limit
                 px_for_cost = fill_px if fill_px > 0 else signal.price
                 cost_usd = signal.count * px_for_cost / 100
+                fill_role = classify_fill_role(
+                    signal.price, fill_px or signal.price, signal.ask_cents or signal.price,
+                )
                 status_icon = "✅" if result.status == "executed" else "🕐"
                 log.info(
                     "     %s Order placed: %s (status: %s) cost=$%.2f"
-                    " fill=%s¢ n=%s",
+                    " fill=%s¢ n=%s role=%s",
                     status_icon, result.order_id, result.status, cost_usd,
-                    fill_px or "—", fill_n or "—",
+                    fill_px or "—", fill_n or "—", fill_role,
                 )
                 held_tickers.add(signal.ticker)
                 placed_tickers.add(signal.ticker)
@@ -395,6 +403,7 @@ def process_game(
     daily: Optional[DailyRiskBudget] = None,
     health: Optional[StrategyHealthMonitor] = None,
     game_factor: Optional[GameFactorBudget] = None,
+    game_state: Optional[GameStateTracker] = None,
 ):
     """Run all strategies for a single game and execute trades.
 
@@ -408,6 +417,16 @@ def process_game(
     if game_has_started(game):
         log.info("  ⛔ Game has started (past scheduled time + buffer) — skipping entirely")
         return
+
+    # ── SP scratch / pitcher change within poll cycle ────────────────────
+    if game_state is not None:
+        reason = game_state.observe(game)
+        if reason or game_state.is_invalid(game.game_id):
+            log.info(
+                "  ⛔ Skipping trade: %s",
+                reason or game_state.invalidate_reason(game.game_id),
+            )
+            return
 
     log.info(
         "  Pitchers: %s vs %s",
@@ -714,6 +733,8 @@ def run(config: Config, game_filter: Optional[str] = None):
     if health.disabled:
         log.warning("Strategies auto-disabled at start: %s", ", ".join(sorted(health.disabled)))
 
+    game_state = GameStateTracker()
+
     # Load today's ledger — persists placed tickers across invocations
     placed_tickers: Set[str] = load_ledger(config.log_dir)
 
@@ -727,6 +748,27 @@ def run(config: Config, game_filter: Optional[str] = None):
             snapshot_pending_clv(client, config)
         except Exception as exc:
             log.debug("CLV snapshot pass failed: %s", exc)
+
+        # ── Cancel resting orders for games that have started ─────────────
+        cancel_fn = getattr(client, "cancel_order", None)
+        get_orders = getattr(client, "get_orders", None)
+        if callable(cancel_fn) and callable(get_orders):
+            try:
+                def _ticker_started(ticker: str) -> bool:
+                    dt = parse_game_time_utc(ticker)
+                    if dt is None:
+                        return False
+                    # 5-minute buffer after scheduled start
+                    return datetime.now(timezone.utc) >= dt + timedelta(minutes=5)
+
+                orders = get_orders(status="resting") or []
+                n_cancel = cancel_resting_orders_for_started_games(
+                    orders, _ticker_started, cancel_fn,
+                )
+                if n_cancel:
+                    log.info("Cancelled %d resting order(s) for started games", n_cancel)
+            except Exception as exc:
+                log.debug("Resting-order cancel pass failed: %s", exc)
 
         # ── Fetch live balance ──────────────────────────────────────────────
         try:
@@ -824,6 +866,7 @@ def run(config: Config, game_filter: Optional[str] = None):
                     calibration=calibration,
                     daily=daily,
                     health=health,
+                    game_state=game_state,
                 )
             except Exception as exc:
                 log.error("Error processing %s: %s", game.game_id, exc)

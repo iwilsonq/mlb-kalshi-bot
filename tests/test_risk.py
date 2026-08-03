@@ -52,6 +52,18 @@ def test_strategy_health_stays_enabled_when_ok():
     assert "player_hits" not in h.disabled
 
 
+def test_strategy_health_brier_vs_market_kill_switch():
+    """Model systematically worse Brier than market → auto-disable."""
+    h = StrategyHealthMonitor(
+        window_n=50, min_trades=10, min_roi_pct=-100.0, max_brier_deficit=0.01,
+    )
+    # ROI stays fine (break-even), but model always says 90% and is wrong vs 50¢ market
+    for i in range(12):
+        h.observe("pitcher_ks", pnl_usd=0.0, cost_usd=1.0)
+        h.observe_probability("pitcher_ks", model_prob_pct=90, market_price_cents=50, outcome_yes=0)
+    assert "pitcher_ks" in h.disabled
+
+
 def test_load_from_journal():
     records = []
     for i in range(15):
