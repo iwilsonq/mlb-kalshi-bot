@@ -161,6 +161,81 @@ def team_k_rate_as_of(
     return ks / pa
 
 
+def _poisson_ridge_fit(
+    X: List[List[float]],
+    y: List[float],
+    *,
+    alpha: float = RIDGE_ALPHA,
+    max_iter: int = 50,
+    tol: float = 1e-9,
+) -> Tuple[float, List[float]]:
+    """Poisson regression with a log link, ridge-penalised on standardized slopes.
+
+    Fitted by IRLS. This replaces OLS on log(actual_k), which was the wrong
+    estimator for a count: exponentiating the fit of a log-transformed response
+    recovers the *geometric* mean, not the arithmetic one. On real starts that
+    understated λ by 0.57 Ks (predicted 3.95 vs actual 4.52, geometric 3.70 vs
+    arithmetic 4.53), and a model biased low can never report YES edge — which is
+    why the 20¢ gate admitted zero cells.
+
+    A Poisson likelihood targets E[Y] directly, so no deflator or smearing
+    correction is needed.
+    """
+    n = len(X)
+    if n == 0:
+        return 0.0, [0.0, 0.0, 0.0]
+    p = len(X[0])
+
+    means = [sum(row[j] for row in X) / n for j in range(p)]
+    stds: List[float] = []
+    for j in range(p):
+        var = sum((row[j] - means[j]) ** 2 for row in X) / n
+        stds.append(math.sqrt(var) if var > 1e-18 else 0.0)
+    live = [j for j in range(p) if stds[j] > 0.0]
+
+    y_bar = sum(y) / n
+    if not live:
+        return math.log(max(y_bar, 1e-6)), [0.0] * p
+
+    # Design in z-space with an explicit unpenalised intercept column
+    Z = [[1.0] + [(row[j] - means[j]) / stds[j] for j in live] for row in X]
+    dim = 1 + len(live)
+    beta = [math.log(max(y_bar, 1e-6))] + [0.0] * len(live)
+
+    for _ in range(max_iter):
+        AtA = [[0.0] * dim for _ in range(dim)]
+        Atz = [0.0] * dim
+        sum_w = 0.0
+        for i in range(n):
+            zi = Z[i]
+            eta = sum(b * x for b, x in zip(beta, zi))
+            eta = min(max(eta, -20.0), 20.0)
+            mu = math.exp(eta)
+            w = max(mu, 1e-9)          # Poisson IRLS weight
+            work = eta + (y[i] - mu) / w  # working response
+            sum_w += w
+            for a in range(dim):
+                Atz[a] += w * zi[a] * work
+                for b in range(dim):
+                    AtA[a][b] += w * zi[a] * zi[b]
+        # Penalise slopes only; scale by total weight so alpha stays comparable
+        for a in range(1, dim):
+            AtA[a][a] += alpha * sum_w
+        new = _solve(AtA, Atz)
+        if not any(new):
+            break
+        delta = max(abs(a - b) for a, b in zip(new, beta))
+        beta = new
+        if delta < tol:
+            break
+
+    coef = [0.0] * p
+    for k, j in enumerate(live):
+        coef[j] = beta[1 + k] / stds[j]
+    intercept = beta[0] - sum(coef[j] * means[j] for j in range(p))
+    return intercept, coef
+
+
 def samples_from_pitcher_game_logs(
     game_logs: Dict[str, List[dict]],
     *,
@@ -725,11 +800,13 @@ def fit_ks_model(
             opp = float(s.get("opp_k_rate", 0) or 0)
             actual = float(s.get("actual_k", s.get("strikeouts", 0)) or 0)
             X.append([math.log1p(recent), math.log1p(season), max(0.0, opp)])
-            y.append(math.log(max(actual, 0.5)))
+            # Raw count: the Poisson fit models E[K] directly. Do not log it —
+            # that was the retransformation bias documented on _poisson_ridge_fit.
+            y.append(max(0.0, actual))
         return X, y
 
     X, y = pack(train)
-    intercept, coef = _ridge_fit(X, y, alpha=ridge_alpha)
+    intercept, coef = _poisson_ridge_fit(X, y, alpha=ridge_alpha)
     model = KsModel(
         intercept=intercept,
         coef=coef,

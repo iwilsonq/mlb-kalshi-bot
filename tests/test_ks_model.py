@@ -254,6 +254,43 @@ def test_opp_k_rate_becomes_a_live_feature_when_it_varies():
     assert lam_vs_whiffers > lam_vs_contact
 
 
+def test_poisson_fit_is_unbiased_on_the_mean():
+    """The fit must recover E[K], not the geometric mean.
+
+    Regression: fitting OLS on log(max(actual, 0.5)) and exponentiating recovers
+    the geometric mean. On real starts that understated λ by 0.57 Ks (predicted
+    3.95 vs actual 4.52) — and a model biased low can never report YES edge,
+    which is why the 20¢ gate admitted zero cells out of 449.
+    """
+    # Counts with a long-ish tail, where geometric and arithmetic means diverge
+    counts = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] * 8
+    samples = []
+    for i, k in enumerate(counts):
+        samples.append({
+            "date": f"2026-04-{(i % 28) + 1:02d}",
+            "recent_k": 4.0 + (k / 4.0),
+            "season_k": 4.0 + (k / 5.0),
+            "opp_k_rate": 0.20 + (i % 5) * 0.01,
+            "actual_k": float(k),
+        })
+    model = fit_ks_model(samples, as_of="2026-05-01", holdout_frac=0.0)
+    preds = [
+        model.predict_lambda(s["recent_k"], s["season_k"], s["opp_k_rate"])
+        for s in samples
+    ]
+    mean_pred = sum(preds) / len(preds)
+    mean_actual = sum(s["actual_k"] for s in samples) / len(samples)
+    geometric = math.exp(
+        sum(math.log(max(s["actual_k"], 0.5)) for s in samples) / len(samples)
+    )
+
+    assert geometric < mean_actual * 0.9, "fixture must actually separate the means"
+    # Poisson IRLS matches the arithmetic mean closely...
+    assert mean_pred == pytest.approx(mean_actual, rel=0.05)
+    # ...and is clearly not the geometric mean the old estimator returned
+    assert abs(mean_pred - mean_actual) < abs(mean_pred - geometric)
+
+
 def test_fitted_lambda_is_plausible_and_monotone():
     samples = samples_from_pitcher_game_logs(
         _multi_pitcher_logs(), as_of="2026-05-01", min_prior_starts=2
