@@ -13,7 +13,6 @@ from slugger.signal_pipeline import (
     ModelResult,
     clear_unparsed_titles,
     evaluate_markets,
-    parse_threshold,
     parse_threshold_regex,
     unparsed_titles,
 )
@@ -21,27 +20,6 @@ from slugger.signal_pipeline import (
 
 # ─── Threshold parsing ──────────────────────────────────────────────────────
 
-class TestParseThreshold:
-    def test_n_plus(self):
-        assert parse_threshold("7+ strikeouts") == 7
-
-    def test_over_half(self):
-        assert parse_threshold("over 6.5 strikeouts") == 7
-
-    def test_at_least(self):
-        assert parse_threshold("at least 9 strikeouts") == 9
-
-    def test_keyword_hit(self):
-        assert parse_threshold("2+ hits?", keyword="hit") == 2
-
-    def test_keyword_home_run(self):
-        assert parse_threshold("1+ home runs", keyword="home run") == 1
-
-    def test_no_match(self):
-        assert parse_threshold("Will the Dodgers win?") is None
-
-    def test_case_insensitive(self):
-        assert parse_threshold("7+ STRIKEOUTS") == 7
 
 
 class TestParseThresholdRegex:
@@ -440,9 +418,8 @@ class TestEvaluateMarkets:
 class TestUnparsedTitleTracking:
     """A market whose threshold will not parse is never priced at all.
 
-    The live specs use narrow N+ patterns while parse_threshold() also handles
-    "over 6.5" and "at least 9". Nobody has established which forms Kalshi
-    actually uses, so the pipeline records what it drops (mlb-kalshi-bot-8r5).
+    Real Kalshi titles observed so far all use the N+ form; this tracking is
+    the tripwire that would justify resurrecting a richer parser from git.
     """
 
     def _spec(self):
@@ -477,9 +454,6 @@ class TestUnparsedTitleTracking:
             "Smith at least 9 strikeouts",
             "Smith over 6.5 strikeouts",
         ]
-        # These are exactly the forms the unused parse_threshold() handles
-        assert parse_threshold("Smith over 6.5 strikeouts") == 7
-        assert parse_threshold("Smith at least 9 strikeouts") == 9
         clear_unparsed_titles()
 
     def test_parseable_titles_are_not_recorded(self, tmp_path):

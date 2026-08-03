@@ -3,20 +3,23 @@
 Pure math — no I/O, no Kalshi client, no Config dependency.  Each model
 takes player/team profiles and returns probabilities or Poisson lambdas.
 
+Distributions:
+  - poisson_ge:    P(X >= n), Poisson — strikeout counts (with negbinom_ge
+                   layering measured overdispersion on top)
+  - binomial_ge:   P(X >= n), Binomial — hit counts (bounded at-bats)
+  - negbinom_ge:   P(X >= n), NB1 with fitted dispersion
+
 Models:
-  - poisson_ge:                P(X >= n) for a Poisson random variable
-  - expected_ks:               Pitcher strikeout lambda (Poisson rate)
-  - hr_prob_poisson:           P(1+ HR) with Bayesian shrinkage
-  - game_winner_probability:   Home/away win probabilities (multi-factor log5)
-  - expected_hits_lambda:      Expected hits lambda (Poisson rate)
+  - expected_ks:              Pitcher strikeout lambda (trained model preferred,
+                              fallback_ks_lambda when no artifact on disk)
+  - game_winner_probability:  Home/away win probabilities (multi-factor log5;
+                              no live strategy — kept with test coverage)
 
 Helpers:
-  - expected_ab:       Expected at-bats per lineup position
-  - shrink_hr_rate:    Bayesian HR rate shrinkage
-  - shrink_avg:        Bayesian batting average shrinkage
-  - pitcher_quality:   Pitcher rating relative to league average
-  - parse_k_threshold: Extract K threshold from market title
-  - parse_hit_threshold: Extract hit threshold from market title
+  - expected_ab:                    Expected at-bats per lineup position
+  - shrink_avg:                     Bayesian batting average shrinkage
+  - pitcher_quality:                Pitcher rating vs league average
+  - kalshi_fee_cents_per_contract:  Exact taker fee at a given price
 """
 from __future__ import annotations
 
@@ -37,9 +40,6 @@ log = logging.getLogger(__name__)
 
 # ── Strikeout model ───────────────────────────────────────────────────────────
 LEAGUE_AVG_K_RATE  = 0.225   # ~22.5% of PAs end in strikeout (2024 MLB avg)
-LEAGUE_AVG_WHIFF   = 0.245   # ~24.5% whiff rate on swings (2024 MLB avg)
-LEAGUE_AVG_CHASE   = 0.285   # ~28.5% chase rate (swing at pitches outside zone, 2024)
-LEAGUE_AVG_FB_VELO = 93.5    # mph, average four-seam fastball velocity (2024)
 DEFAULT_IP         = 5.5     # default expected IP when recent data is missing
 KS_LAMBDA_DEFLATOR = 0.85    # calibration: model over-predicts by ~15-20%, deflate lambda
 
@@ -59,23 +59,6 @@ PA_BY_ORDER = {
     8: 3.55,
     9: 3.40,    # 9th hitter — fewest PA
 }
-
-# ── Home run model ────────────────────────────────────────────────────────────
-LEAGUE_AVG_HR_PER_9  = 1.1    # league-average HR allowed per 9 IP (2024)
-LEAGUE_AVG_HR_PER_AB = 0.017  # calibrated to ~6.5% per-game HR rate
-HR_PRIOR_AB          = 300    # prior weight in AB-equivalents for shrinkage
-MIN_PITCHER_IP       = 40.0   # minimum IP before trusting pitcher HR/9
-MAX_PITCHER_HR_ADJ   = 1.5    # cap pitcher HR/9 multiplier
-HR_MAX_TOTAL_ADJ     = 1.50   # cap on total multiplicative adjustment product
-HR_LAMBDA_DEFLATOR   = 0.60   # calibration: model over-predicts HR by ~2-3x
-
-# ── Hot streak HR model ───────────────────────────────────────────────────────
-# When a batter is "hot" (HR_HOT_STREAK_MIN_RECENT+ HRs in their last 7 games)
-# we trust recent form more: flip the season/recent blend weights, use a lighter
-# shrinkage prior, and apply a less aggressive deflator.
-HR_HOT_STREAK_MIN_RECENT = 2    # minimum HRs in last 7 games to trigger hot mode
-HR_HOT_PRIOR_AB          = 150  # reduced prior weight (vs 300) — less regression to mean
-HR_HOT_STREAK_DEFLATOR   = 0.75 # less aggressive deflator for confirmed hot batters (vs 0.60)
 
 # HR park factors by home team abbreviation (normalized: 1.0 = league average).
 # Source: multi-year (2022-2024) HR park factor data.
@@ -119,7 +102,6 @@ HR_PARK_FACTORS: Dict[str, float] = {
 # ── Hits model ────────────────────────────────────────────────────────────────
 LEAGUE_AVG_H_PER_AB  = 0.243   # 2024 MLB batting average
 HITS_PRIOR_AB        = 250     # prior weight for Bayesian shrinkage on AVG
-HITS_MIN_AB          = 60      # minimum AB before considering a batter
 HITS_MIN_PITCHER_IP  = 30.0    # minimum IP to trust pitcher WHIP/BAA
 LEAGUE_AVG_WHIP      = 1.28    # 2024 MLB league-average WHIP
 MAX_PITCHER_WHIP_ADJ = 1.35    # cap pitcher WHIP multiplier
@@ -410,27 +392,6 @@ def fallback_ks_lambda(
     return max(0.0, lam * KS_LAMBDA_DEFLATOR)
 
 
-def parse_k_threshold(title: str) -> Optional[int]:
-    """Extract the integer K threshold from a Kalshi market title.
-
-    Handles patterns like:
-      "7+ strikeouts"        -> 7
-      "Pitcher records 8+ Ks" -> 8
-      "over 6.5 strikeouts"  -> 7  (rounds up)
-      "at least 9 strikeouts" -> 9
-    Returns None if no threshold can be parsed.
-    """
-    t = title.lower()
-    m = re.search(r'(\d+)\s*\+', t)
-    if m:
-        return int(m.group(1))
-    m = re.search(r'over\s+(\d+(?:\.\d+)?)', t)
-    if m:
-        return int(math.ceil(float(m.group(1))))
-    m = re.search(r'at\s+least\s+(\d+)', t)
-    if m:
-        return int(m.group(1))
-    return None
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -438,169 +399,10 @@ def parse_k_threshold(title: str) -> Optional[int]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def shrink_hr_rate(hr: int, ab: int) -> float:
-    """Bayesian shrinkage of a batter's HR/AB rate toward league average.
-
-    Uses a Beta-Binomial conjugate prior equivalent to observing
-    HR_PRIOR_AB at-bats at the league-average HR rate.  This means:
-      - A batter with 0 AB is assigned pure league average (~2.8%)
-      - A batter with 150 AB is weighted 50% actual / 50% prior
-      - A batter with 500+ AB is mostly driven by actual data
-    """
-    prior_hr = LEAGUE_AVG_HR_PER_AB * HR_PRIOR_AB
-    return (hr + prior_hr) / (ab + HR_PRIOR_AB)
 
 
-def hr_prob_poisson(
-    hr: int,
-    ab: int,
-    opp_hr_per_9: float = 0.0,
-    opp_ip: float = 0.0,
-    batting_order: int = 0,
-) -> Tuple[float, float, float]:
-    """P(batter hits 1+ HR in a game) using a Poisson model with shrinkage.
-
-    Applies Bayesian shrinkage on the batter's HR/AB rate, then adjusts
-    for the opposing pitcher's HR/9 only when they have enough innings
-    to make that rate meaningful.
-
-    Args:
-        batting_order: 1-9 lineup position for PA adjustment (0 = use default).
-
-    Returns:
-        (probability, effective_hr_per_ab, applied_pitcher_adj)
-    """
-    effective_rate = shrink_hr_rate(hr, ab)
-    lam = effective_rate * expected_ab(batting_order)
-
-    pitcher_adj = 1.0
-    if opp_hr_per_9 > 0 and opp_ip >= MIN_PITCHER_IP:
-        pitcher_adj = min(opp_hr_per_9 / LEAGUE_AVG_HR_PER_9, MAX_PITCHER_HR_ADJ)
-        lam *= pitcher_adj
-
-    prob = 1.0 - math.exp(-lam) if lam > 0 else 0.0
-    return prob, effective_rate, pitcher_adj
 
 
-def expected_hr_lambda(
-    batter: BatterProfile,
-    pitcher: Optional[PitcherProfile],
-    home_abbrev: str,
-) -> float:
-    """Compute expected HR lambda for a batter in a single game.
-
-    Combines Bayesian-shrunk HR rate, Statcast adjustments (barrel rate,
-    exit velocity, xSLG), opposing pitcher adjustments (HR/9, barrel rate
-    against), park factor, and a calibration deflator.
-
-    The total multiplicative adjustment from Statcast and pitcher factors
-    is capped at HR_MAX_TOTAL_ADJ to prevent compounding from inflating
-    lambda beyond realistic levels.
-
-    Hot streak mode: when a batter has HR_HOT_STREAK_MIN_RECENT+ HRs in
-    their last 7 games, the model trusts recent form more heavily — recent
-    HR rate gets 60% weight (vs 30% normally), the shrinkage prior is
-    halved (150 AB vs 300), and a lighter deflator (0.75 vs 0.60) is used.
-    The AB minimum is also relaxed to 40 for hot batters, allowing emerging
-    players to qualify when their recent production is clear.
-
-    Args:
-        batter:       Batter profile with season stats and Statcast data.
-        pitcher:      Opposing pitcher profile.
-        home_abbrev:  Home team abbreviation (for park factor lookup).
-
-    Returns:
-        Lambda (expected HR per game) for the Poisson model, or 0 if
-        insufficient data.
-    """
-    is_hot = batter.recent_hr >= HR_HOT_STREAK_MIN_RECENT
-    ab_min = 40 if is_hot else 80
-    if batter.ab < ab_min:
-        return 0.0
-
-    opp_hr_per_9 = pitcher.hr_per_9 if pitcher else 0.0
-    opp_ip = pitcher.innings_pitched if pitcher else 0.0
-    opp_throws = (pitcher.throws if pitcher else "") or ""
-
-    # Platoon split selection
-    if opp_throws == "L" and batter.vs_lhp_ab >= 20:
-        split_hr, split_ab = batter.vs_lhp_hr, batter.vs_lhp_ab
-    elif opp_throws == "R" and batter.vs_rhp_ab >= 20:
-        split_hr, split_ab = batter.vs_rhp_hr, batter.vs_rhp_ab
-    else:
-        split_hr, split_ab = batter.hr, batter.ab
-
-    # Base lambda: shrunk HR rate * expected AB, blended with recent form.
-    # Hot streak mode: use a lighter shrinkage prior so recent data dominates
-    # over the league-average pull, and give recent HRs 60% weight instead of 30%.
-    ab_est = expected_ab(batter.batting_order)
-    if is_hot:
-        prior_hr = LEAGUE_AVG_HR_PER_AB * HR_HOT_PRIOR_AB
-        eff_rate = (split_hr + prior_hr) / (split_ab + HR_HOT_PRIOR_AB)
-    else:
-        eff_rate = shrink_hr_rate(split_hr, split_ab)
-
-    recent_ab_est = 7 * AVG_AB_PER_GAME  # ~27 AB over 7 games
-    if is_hot:
-        # Recent form is the signal: weight it at 60%, season at 40%
-        recent_hr_rate = batter.recent_hr / recent_ab_est
-        eff_rate = 0.40 * eff_rate + 0.60 * recent_hr_rate
-    elif batter.recent_hr > 0:
-        recent_hr_rate = batter.recent_hr / recent_ab_est
-        eff_rate = 0.70 * eff_rate + 0.30 * recent_hr_rate
-
-    lam = eff_rate * ab_est
-
-    # --- Collect adjustment factors (capped as a group) ---
-    adj = 1.0
-
-    # Pitcher HR/9 adjustment
-    if opp_hr_per_9 > 0 and opp_ip >= MIN_PITCHER_IP:
-        pitcher_adj = min(opp_hr_per_9 / LEAGUE_AVG_HR_PER_9, MAX_PITCHER_HR_ADJ)
-        adj *= pitcher_adj
-
-    # Park factor
-    home_kalshi = kalshi_team(home_abbrev)
-    park_factor = HR_PARK_FACTORS.get(
-        home_kalshi, HR_PARK_FACTORS.get(home_abbrev.upper(), 1.0),
-    )
-    adj *= park_factor
-
-    # Barrel rate adjustment (dampened)
-    _LEAGUE_AVG_BARREL = 0.065
-    if batter.barrel_rate > 0:
-        raw_barrel = batter.barrel_rate / _LEAGUE_AVG_BARREL
-        adj *= 1.0 + 0.5 * (raw_barrel - 1.0)
-
-    # Exit velocity adjustment
-    _LEAGUE_AVG_EV = 88.5
-    if batter.avg_exit_velo > 0:
-        ev_diff = batter.avg_exit_velo - _LEAGUE_AVG_EV
-        adj *= 1.0 + 0.03 * ev_diff
-
-    # xSLG adjustment (dampened)
-    _LEAGUE_AVG_XSLG = 0.400
-    if batter.xslg > 0:
-        raw_xslg = batter.xslg / _LEAGUE_AVG_XSLG
-        adj *= 1.0 + 0.3 * (raw_xslg - 1.0)
-
-    # Pitcher barrel rate against (dampened)
-    _LEAGUE_AVG_BRA = 0.065
-    if pitcher and pitcher.barrel_rate_against > 0 and opp_ip >= MIN_PITCHER_IP:
-        raw_bra = pitcher.barrel_rate_against / _LEAGUE_AVG_BRA
-        adj *= 1.0 + 0.3 * (raw_bra - 1.0)
-
-    # Cap total adjustment to prevent multiplicative blowup
-    adj = min(adj, HR_MAX_TOTAL_ADJ)
-
-    lam *= adj
-
-    # Calibration deflation — lighter for hot streakers since their recent
-    # production has already proven itself in game results
-    deflator = HR_HOT_STREAK_DEFLATOR if is_hot else HR_LAMBDA_DEFLATOR
-    lam *= deflator
-
-    return max(0.0, lam)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -608,20 +410,6 @@ def expected_hr_lambda(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def pitcher_quality(pitcher: Optional[PitcherProfile]) -> float:
-    """Rate a pitcher relative to league average.
-
-    Returns a multiplier where 1.0 = league average.  Lower ERA means
-    a BETTER pitcher, so we invert: quality = league_avg / pitcher_era.
-
-    Prefers xERA > recent ERA > season ERA as the predictive metric.
-    """
-    if not pitcher:
-        return 1.0
-    era = pitcher.xera or pitcher.recent_era or pitcher.era
-    if not era or era <= 0:
-        return 1.0
-    return LEAGUE_AVG_ERA / era
 
 
 def pythagorean_win_pct(runs_scored: float, runs_allowed: float) -> float:
@@ -638,6 +426,22 @@ def pythagorean_win_pct(runs_scored: float, runs_allowed: float) -> float:
     rs_exp = runs_scored ** PYTH_EXPONENT
     ra_exp = runs_allowed ** PYTH_EXPONENT
     return rs_exp / (rs_exp + ra_exp)
+
+
+def pitcher_quality(pitcher: Optional[PitcherProfile]) -> float:
+    """Rate a pitcher relative to league average.
+
+    Returns a multiplier where 1.0 = league average.  Lower ERA means
+    a BETTER pitcher, so we invert: quality = league_avg / pitcher_era.
+
+    Prefers xERA > recent ERA > season ERA as the predictive metric.
+    """
+    if not pitcher:
+        return 1.0
+    era = pitcher.xera or pitcher.recent_era or pitcher.era
+    if not era or era <= 0:
+        return 1.0
+    return LEAGUE_AVG_ERA / era
 
 
 def game_winner_probability(
@@ -739,102 +543,5 @@ def shrink_avg(hits: int, ab: int) -> float:
     return (hits + prior_hits) / (ab + HITS_PRIOR_AB)
 
 
-def parse_hit_threshold(title: str) -> Optional[int]:
-    """Extract the integer hit threshold from a Kalshi market title.
-
-    Handles patterns like:
-      "2+ hits"        -> 2
-      "3+ hits?"       -> 3
-    Returns None if no threshold can be parsed.
-    """
-    t = title.lower()
-    m = re.search(r'(\d+)\s*\+\s*hit', t)
-    if m:
-        return int(m.group(1))
-    m = re.search(r'over\s+(\d+(?:\.\d+)?)\s*hit', t)
-    if m:
-        return int(math.ceil(float(m.group(1))))
-    m = re.search(r'at\s+least\s+(\d+)\s*hit', t)
-    if m:
-        return int(m.group(1))
-    return None
 
 
-def expected_hits_lambda(
-    batter: BatterProfile,
-    pitcher: Optional[PitcherProfile],
-    home_abbrev: str,
-) -> float:
-    """Compute expected hits (lambda) for a batter in a single game.
-
-    Combines Bayesian-shrunk batting average, xBA Statcast data, opposing
-    pitcher WHIP adjustment, and park factor into a single Poisson rate.
-
-    Args:
-        batter:       Batter profile with season stats and Statcast data.
-        pitcher:      Opposing pitcher profile (for WHIP adjustment).
-        home_abbrev:  Home team abbreviation (for park factor lookup).
-
-    Returns:
-        Lambda (expected hits per game) for the Poisson model, or 0 if
-        insufficient data.
-    """
-    if batter.ab < HITS_MIN_AB:
-        return 0.0
-
-    opp_whip = pitcher.whip if pitcher else 0.0
-    opp_ip = pitcher.innings_pitched if pitcher else 0.0
-    opp_throws = (pitcher.throws if pitcher else "") or ""
-
-    # Platoon split selection
-    if opp_throws == "L" and batter.vs_lhp_ab >= 30:
-        split_h = round(batter.vs_lhp_avg * batter.vs_lhp_ab)
-        split_ab = batter.vs_lhp_ab
-    elif opp_throws == "R" and batter.vs_rhp_ab >= 30:
-        split_h = round(batter.vs_rhp_avg * batter.vs_rhp_ab)
-        split_ab = batter.vs_rhp_ab
-    else:
-        split_h = batter.hits
-        split_ab = batter.ab
-
-    ab_est = expected_ab(batter.batting_order)
-
-    eff_avg = shrink_avg(split_h, split_ab)
-
-    # Blend shrunk average with xBA and recent form.
-    # Recent form (last 7 games) captures hot/cold streaks that
-    # season stats and Statcast miss.
-    if batter.xba > 0 and batter.recent_avg > 0:
-        blended_avg = 0.40 * eff_avg + 0.30 * batter.xba + 0.30 * batter.recent_avg
-    elif batter.xba > 0:
-        blended_avg = 0.70 * eff_avg + 0.30 * batter.xba
-    elif batter.recent_avg > 0:
-        blended_avg = 0.70 * eff_avg + 0.30 * batter.recent_avg
-    else:
-        blended_avg = eff_avg
-
-    lam = blended_avg * ab_est
-
-    # Pitcher WHIP adjustment
-    if opp_whip > 0 and opp_ip >= HITS_MIN_PITCHER_IP:
-        raw_whip = opp_whip / LEAGUE_AVG_WHIP
-        adj = min(1.0 + 0.5 * (raw_whip - 1.0), MAX_PITCHER_WHIP_ADJ)
-        lam *= adj
-
-    # Hard hit rate adjustment (dampened)
-    _LEAGUE_AVG_HHR = 0.370
-    if batter.hard_hit_rate > 0:
-        raw_hhr = batter.hard_hit_rate / _LEAGUE_AVG_HHR
-        lam *= 1.0 + 0.25 * (raw_hhr - 1.0)
-
-    # Park factor
-    home_kalshi = kalshi_team(home_abbrev)
-    park_factor = HIT_PARK_FACTORS.get(
-        home_kalshi, HIT_PARK_FACTORS.get(home_abbrev.upper(), 1.0),
-    )
-    lam *= park_factor
-
-    # Calibration deflation — model over-predicts hit probability
-    lam *= HITS_LAMBDA_DEFLATOR
-
-    return lam

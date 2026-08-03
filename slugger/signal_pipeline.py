@@ -36,15 +36,10 @@ _IDENTITY_CALIBRATION = CalibrationLayer()
 
 # ─── Unparseable title tracking ──────────────────────────────────────────────
 #
-# There are four threshold parsers in this codebase: parse_threshold (keyword
-# aware, handles "over 6.5" / "at least 9", tested but with no production
-# caller), parse_threshold_regex (the one the live specs actually use),
-# and models.parse_k_threshold / parse_hit_threshold (no callers at all).
-#
-# The live specs pass narrow N+ patterns, so anything Kalshi titles differently
-# is dropped. Whether that ever happens is an open question — no real title
-# corpus exists in the repo. Counting the drops answers it from production
-# instead of by assumption, and tells us which parser to keep.
+# The live specs pass narrow N+ patterns to parse_threshold_regex. Dry runs
+# against real markets (2026-08-03, three games) parsed every listed title and
+# recorded zero drops, so the redundant parsers were deleted. This counter
+# stays as the tripwire for a future title-shape change.
 
 _unparsed_titles: Dict[str, Set[str]] = {}
 
@@ -71,52 +66,13 @@ def clear_unparsed_titles() -> None:
 
 # ─── Threshold parsing ───────────────────────────────────────────────────────
 
-# Reusable threshold patterns
-THRESHOLD_N_PLUS = r'(\d+)\s*\+'            # "7+" or "7 +"
-THRESHOLD_OVER = r'over\s+(\d+(?:\.\d+)?)'  # "over 6.5"
-THRESHOLD_AT_LEAST = r'at\s+least\s+(\d+)'  # "at least 9"
+# Every real Kalshi MLB title observed to date uses the "N+" form; the richer
+# keyword-aware parser that also handled "over 6.5" / "at least 9" was deleted
+# as unreachable (mlb-kalshi-bot-8r5). record_unparsed_title below is the
+# tripwire: if Kalshi ever changes title shape, the drops surface in the logs
+# and the parser can be resurrected from git.
 
 
-def parse_threshold(title: str, keyword: str = "") -> Optional[int]:
-    """Extract a numeric threshold from a market title.
-
-    Handles:
-      "7+ strikeouts"        → 7
-      "over 6.5 strikeouts"  → 7  (ceils)
-      "at least 9 strikeouts" → 9
-
-    If keyword is given (e.g. "hit", "home run"), uses keyword-aware regex.
-    Otherwise falls back to generic N+ / over / at-least patterns.
-    """
-    t = title.lower()
-
-    if keyword:
-        kw = keyword.lower()
-        # "N+ keyword" or "N + keyword"
-        m = re.search(rf'(\d+)\s*\+\s*{re.escape(kw)}', t)
-        if m:
-            return int(m.group(1))
-        # "over N keyword"
-        m = re.search(rf'over\s+(\d+(?:\.\d+)?)\s*{re.escape(kw)}', t)
-        if m:
-            return int(math.ceil(float(m.group(1))))
-        # "at least N keyword"
-        m = re.search(rf'at\s+least\s+(\d+)\s*{re.escape(kw)}', t)
-        if m:
-            return int(m.group(1))
-
-    # Generic patterns (no keyword context)
-    m = re.search(THRESHOLD_N_PLUS, t)
-    if m:
-        return int(m.group(1))
-    m = re.search(THRESHOLD_OVER, t)
-    if m:
-        return int(math.ceil(float(m.group(1))))
-    m = re.search(THRESHOLD_AT_LEAST, t)
-    if m:
-        return int(m.group(1))
-
-    return None
 
 
 def parse_threshold_regex(title: str, pattern: str, ceil: bool = False) -> Optional[int]:

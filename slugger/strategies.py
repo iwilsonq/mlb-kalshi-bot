@@ -391,7 +391,8 @@ RETIRED_STRATEGIES: Dict[str, str] = {
     "player_hr":
         "252 trades, −46.0% ROI, 5.6% win rate. Only 24 calibration samples "
         "(below calibration._MIN_SAMPLES=30) so no curve was ever fitted and it "
-        "traded uncalibrated the whole time. Model fns kept in models.py.",
+        "traded uncalibrated the whole time. Model fns deleted in 8r5; "
+        "git history has them.",
     "player_hr_rbis":
         "79 trades, −48.9% ROI. Probability was a 4-bucket step function on "
         "batting average, plus a hardcoded skip for 1+/2+ titles that excluded "
