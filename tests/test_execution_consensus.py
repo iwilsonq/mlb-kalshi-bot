@@ -41,7 +41,33 @@ def test_retired_strategies_not_in_pipeline():
         assert retired not in names
     assert "pitcher_ks" in names
     assert "player_hits" in names
-    assert "player_hr" not in names  # dark
+    assert "player_hr" in RETIRED_STRATEGIES
+
+
+def test_retired_strategies_have_no_implementation_left():
+    """Retired means deleted. A callable left behind is an invitation to re-add it."""
+    import slugger.strategies as strat
+
+    for retired in RETIRED_STRATEGIES:
+        assert not hasattr(strat, f"strategy_{retired}"), retired
+        assert not hasattr(strat, f"_run_{retired}"), retired
+    # The legacy registries these used to live in are gone too
+    assert not hasattr(strat, "STRATEGIES")
+    assert not hasattr(strat, "BATTER_STRATEGIES")
+
+
+def test_default_allowlist_is_a_subset_of_the_pipeline():
+    """An ENABLED_STRATEGIES entry the pipeline does not register is inert.
+
+    The live .env once listed player_hr, which silently did nothing and would
+    have gone straight back to trading at −46% ROI the moment someone re-added
+    the pipeline line.
+    """
+    from slugger.config import Config
+
+    names = {n for n, _ in STRATEGY_PIPELINE}
+    inert = set(Config().enabled_strategies) - names
+    assert inert == set(), f"inert allowlist entries: {sorted(inert)}"
 
 
 def test_cancel_resting_orders_for_started_games():

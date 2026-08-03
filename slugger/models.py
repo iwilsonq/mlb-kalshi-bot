@@ -9,7 +9,6 @@ Models:
   - hr_prob_poisson:           P(1+ HR) with Bayesian shrinkage
   - game_winner_probability:   Home/away win probabilities (multi-factor log5)
   - expected_hits_lambda:      Expected hits lambda (Poisson rate)
-  - total_prob:                Over/under total runs (ERA bucket model)
 
 Helpers:
   - expected_ab:       Expected at-bats per lineup position
@@ -459,24 +458,6 @@ def expected_hr_lambda(
     lam *= deflator
 
     return max(0.0, lam)
-
-
-def total_prob(era: float) -> int:
-    """Estimate probability of Over based on combined starting ERA.
-    Returns estimated % chance of Over 8.5 runs.
-    """
-    if era >= 6.0:
-        return 75
-    elif era >= 5.0:
-        return 62
-    elif era >= 4.5:
-        return 52
-    elif era >= 4.0:
-        return 43
-    elif era >= 3.5:
-        return 33
-    else:
-        return 25
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

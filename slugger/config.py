@@ -46,8 +46,8 @@ class Config:
     cb_max_consecutive_losses: int = 3
     
     # Market selection
-    # Active allowlist. Retired/dark: game_winner, total_runs, player_hr_rbis,
-    # combo, player_hr (kept dark after journal −EV; re-enable only after rebuild).
+    # Allowlist over STRATEGY_PIPELINE. Entries the pipeline does not register
+    # are inert; see strategies.RETIRED_STRATEGIES for what was removed and why.
     enabled_strategies: tuple = ("pitcher_ks", "player_hits")
     min_liquidity_dollars: float = 5.0
     min_volume: int = 0
