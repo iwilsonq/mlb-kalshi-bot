@@ -133,8 +133,11 @@ def test_replay_strategies_on_snapshot(tmp_path):
             {
                 "ticker": f"{event}-LADGLASNOW-9",
                 "title": "Glasnow 9+ strikeouts",
-                "yes_bid_dollars": "0.20",
-                "yes_ask_dollars": "0.22",  # model ~48% → net edge >> 20¢
+                # Model lands ~43-48% on 9+ depending on live opponent K rate.
+                # Net edge must clear the 20¢ floor after the exact fee (1¢ at
+                # 15¢) and half-spread (1¢), so price with headroom.
+                "yes_bid_dollars": "0.13",
+                "yes_ask_dollars": "0.15",
             },
             {
                 "ticker": f"{event}-SFWEBB-10",

@@ -24,6 +24,7 @@ from slugger.calibration import CalibrationLayer
 from slugger.config import Config
 from slugger.journal import record_signal
 from slugger.kalshi_client import market_price, market_quotes
+from slugger.models import kalshi_fee_cents_per_contract
 from slugger.sizing import kelly_count
 from slugger.types import MarketClient, MarketSpec, ModelFn, ModelResult, TradeSignal
 
@@ -274,8 +275,16 @@ def evaluate_markets(
         # then use calibrated probability for edge/trade decisions.
         prob_pct = cal.calibrate(spec.strategy_name, raw_prob_pct)
         gross_edge = prob_pct - price
-        # Cost buffer: half-spread + fees + mild adverse selection haircut.
-        net_edge = gross_edge - cost_buffer
+        # True cost of taking, per contract, in cents:
+        #   exact Kalshi fee at this price + half the observed spread
+        #   + a residual buffer for adverse selection (config).
+        # Previously one flat buffer stood in for all three, which understated
+        # cost at low prices — fees alone were 7.7% of stake at 0-20c entries
+        # and 29% of the journal's total losses.
+        fee_cents = kalshi_fee_cents_per_contract(price)
+        half_spread = math.ceil(spread / 2) if spread > 0 else 0
+        trade_cost = fee_cents + half_spread + cost_buffer
+        net_edge = gross_edge - trade_cost
         evaluated.append((threshold, prob_pct, price, gross_edge, net_edge))
 
         # ── Prob band filter (after calibration) ───────────────────────────
@@ -300,7 +309,8 @@ def evaluate_markets(
             ask_cents=price,
             mid_cents=mid,
             spread_cents=spread,
-            cost_buffer_cents=cost_buffer,
+            cost_buffer_cents=trade_cost,
+            fee_cents=fee_cents,
             gross_edge_cents=float(gross_edge),
             net_edge_cents=float(net_edge),
         )

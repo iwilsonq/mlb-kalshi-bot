@@ -268,6 +268,7 @@ def record_signal(
     mid_cents: float = 0.0,
     spread_cents: int = 0,
     cost_buffer_cents: int = 0,
+    fee_cents: float = 0.0,
     gross_edge_cents: Optional[float] = None,
     net_edge_cents: Optional[float] = None,
 ) -> None:
@@ -298,6 +299,7 @@ def record_signal(
         ),
         "spread_cents": int(spread_cents) if spread_cents or not bid_cents else max(0, ask - bid_cents),
         "cost_buffer_cents": int(cost_buffer_cents),
+        "fee_cents": float(fee_cents),
         "gross_edge_cents": round(gross, 1),
         "edge_cents": round(gross, 1),  # legacy alias = gross
         "net_edge_cents": round(net, 1),

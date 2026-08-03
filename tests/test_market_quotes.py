@@ -78,16 +78,20 @@ def test_signal_records_microstructure(tmp_path):
     assert signals[0].spread_cents == 5
     assert signals[0].raw_model_prob_pct == 50
     assert signals[0].gross_edge_cents == 20.0  # 50 - 30
-    assert signals[0].edge_cents == 15.0        # net after buffer
+    # net = 20 - fee(30c)=2 - half-spread ceil(5/2)=3 - residual buffer 5 = 10.
+    # The flat buffer used to stand in for fee+spread+adverse-selection; fee and
+    # half-spread are now exact per contract (mlb-kalshi-bot-hyr).
+    assert signals[0].edge_cents == 10.0
 
     data = json.loads((tmp_path / "signals.jsonl").read_text().strip().splitlines()[0])
     assert data["bid_cents"] == 25
     assert data["ask_cents"] == 30
     assert data["mid_cents"] == 27.5
     assert data["spread_cents"] == 5
-    assert data["cost_buffer_cents"] == 5
+    assert data["fee_cents"] == 2.0
+    assert data["cost_buffer_cents"] == 10  # fee 2 + half-spread 3 + residual 5
     assert data["gross_edge_cents"] == 20.0
-    assert data["net_edge_cents"] == 15.0
+    assert data["net_edge_cents"] == 10.0
     assert data["calibrated_prob_pct"] == 50
     assert data["model_prob_pct"] == 50  # raw for calibration
     assert data["traded"] is True

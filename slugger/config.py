@@ -34,8 +34,10 @@ class Config:
     max_contracts_per_trade: int = 10
     min_edge_cents: int = 5       # Global floor on *cost-adjusted* edge (cents)
     # Haircut applied to model−market edge before trade/size decisions.
-    # Covers half-spread + fees + mild adverse selection (Phase 0).
-    edge_cost_buffer_cents: int = 5
+    # Residual adverse-selection haircut ONLY. The exact per-price Kalshi fee
+    # and the observed half-spread are computed per contract in signal_pipeline
+    # (mlb-kalshi-bot-hyr); this no longer needs to stand in for them.
+    edge_cost_buffer_cents: int = 2
     kelly_fraction: float = 0.25  # Quarter-Kelly
     # Max fraction of live bankroll that may be risked across all trades in one day.
     # 0 disables the daily fraction cap (per-trade max_position_usd still applies).
@@ -103,7 +105,7 @@ class Config:
             max_position_usd=float(os.getenv("MAX_POSITION_USD", "5")),
             max_contracts_per_trade=int(os.getenv("MAX_CONTRACTS_PER_TRADE", "10")),
             min_edge_cents=int(os.getenv("MIN_EDGE_CENTS", "5")),
-            edge_cost_buffer_cents=int(os.getenv("EDGE_COST_BUFFER_CENTS", "5")),
+            edge_cost_buffer_cents=int(os.getenv("EDGE_COST_BUFFER_CENTS", "2")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             max_bankroll_fraction_per_day=float(
                 os.getenv("MAX_BANKROLL_FRACTION_PER_DAY", "0.20")

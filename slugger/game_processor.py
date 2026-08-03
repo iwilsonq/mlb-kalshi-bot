@@ -21,6 +21,7 @@ from slugger.calibration import CalibrationLayer
 from slugger.config import Config
 from slugger.kalshi_client import market_quotes
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
+from slugger.models import kalshi_fee_cents_per_contract
 from slugger.signal_pipeline import load_calibration, unparsed_titles
 from slugger.consensus import consensus_allows_trade, load_consensus_prices
 from slugger.execution import (
@@ -517,7 +518,8 @@ def settle_pending(
     if not records:
         return 0
 
-    trade_tickers    = {r["ticker"] for r in records if r.get("type") == "trade"}
+    trades_by_ticker = {r["ticker"]: r for r in records if r.get("type") == "trade"}
+    trade_tickers    = set(trades_by_ticker)
     settled_tickers  = {r["ticker"] for r in records if r.get("type") == "settlement"}
     pending          = trade_tickers - settled_tickers
 
@@ -540,8 +542,22 @@ def settle_pending(
         result      = s.get("market_result", "")
         revenue_usd = s.get("revenue", 0) / 100.0
         yes_cost    = float(s.get("yes_total_cost_dollars", 0))
-        fee         = float(s.get("fee_cost", 0))
         settled_at  = s.get("settled_time", "")
+        fee_raw = s.get("fee_cost")
+        if fee_raw is not None:
+            fee = float(fee_raw)
+        else:
+            # fee_cost was absent on 27 of 1042 historical settlements and the
+            # old float(s.get("fee_cost", 0)) silently recorded $0, understating
+            # total fee drag. Estimate from the fee formula instead of zeroing.
+            t = trades_by_ticker.get(ticker, {})
+            count = int(t.get("count") or 0)
+            px = float(t.get("price_cents") or 0)
+            fee = count * kalshi_fee_cents_per_contract(px) / 100.0
+            log.warning(
+                "%s settlement missing fee_cost — estimated $%.2f from "
+                "%d contracts @ %.0f¢", ticker, fee, count, px,
+            )
 
         settlement_price = None
         if result == "yes":

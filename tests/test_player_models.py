@@ -342,3 +342,39 @@ class TestNegbinomGe:
         from slugger.models import negbinom_ge
         assert negbinom_ge(7, 0.0, 1.13) == 0.01
         assert negbinom_ge(0, 5.0, 1.13) == 0.99
+
+
+class TestKalshiFee:
+    """Fee model verified against 724/1042 of our own settled fills exactly."""
+
+    def test_matches_observed_fills(self):
+        from slugger.models import kalshi_fee_cents_per_contract as fee
+        # ceil(0.07 * P * (1-P) * 100) in cents
+        assert fee(50) == 2   # ceil(1.75)
+        assert fee(30) == 2   # ceil(1.47)
+        assert fee(20) == 2   # ceil(1.12)
+        assert fee(10) == 1   # ceil(0.63)
+        assert fee(70) == 2   # symmetric with 30
+        assert fee(95) == 1
+
+    def test_symmetric_in_price(self):
+        from slugger.models import kalshi_fee_cents_per_contract as fee
+        for p in (5, 15, 25, 35, 45):
+            assert fee(p) == fee(100 - p)
+
+    def test_share_of_stake_is_what_kills_longshots(self):
+        """Fee as % of stake is several times worse at 10c than at 80c.
+
+        (10% vs 2.5% with ceiling rounding; the journal's realized 7.7% vs 0.6%
+        gap is wider still because multi-contract fills round once, not per
+        contract.)
+        """
+        from slugger.models import kalshi_fee_cents_per_contract as fee
+        drag_10 = fee(10) / 10
+        drag_80 = fee(80) / 80
+        assert drag_10 >= 4 * drag_80
+
+    def test_degenerate_prices(self):
+        from slugger.models import kalshi_fee_cents_per_contract as fee
+        assert fee(0) == 0
+        assert fee(100) == 0

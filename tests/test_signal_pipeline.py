@@ -114,7 +114,8 @@ class TestEvaluateMarkets:
         assert len(signals) == 1
         assert signals[0].side == "yes"
         assert signals[0].strategy == "pitcher_ks"
-        assert signals[0].edge_cents == 15.0  # 45 - 30
+        # net edge = 45 - 30 - fee(30c)=2c - half-spread(0) - buffer(0) = 13
+        assert signals[0].edge_cents == 13.0
         assert signals[0].ticker == "KXMLBKS-TEST-SMITH-7"
 
     def test_no_signal_when_no_edge(self, tmp_path):
@@ -406,7 +407,8 @@ class TestEvaluateMarkets:
         )
         signals = evaluate_markets(spec, model, client, config)
         assert len(signals) == 1
-        assert signals[0].edge_cents == 15.0  # 50 - 30 - 5
+        # net edge = 50 - 30 - fee(30c)=2c - buffer(5) = 13
+        assert signals[0].edge_cents == 13.0
 
     def test_max_model_prob_band(self, tmp_path):
         """Probabilities above max_model_prob should not trade."""

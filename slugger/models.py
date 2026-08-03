@@ -197,6 +197,26 @@ def poisson_ge(n: int, lam: float) -> float:
     return max(0.01, min(0.99, 1.0 - cumulative))
 
 
+def kalshi_fee_cents_per_contract(price_cents: float, fee_rate: float = 0.07) -> float:
+    """Kalshi trading fee in cents for one contract at a given price.
+
+    Formula (verified against 724/1042 of our own settled fills exactly):
+      fee = ceil_to_cent(fee_rate * P * (1 - P))  per contract
+
+    The fee is symmetric in P, so it is a roughly fixed cost in *notional* but a
+    savagely price-dependent cost as a share of *stake*: measured on the journal,
+    fee drag was 7.7% of stake at 0-20c entries and 0.6% at 60-80c. Fees were
+    $40.24 of a $140.82 total loss — 29% — so this belongs in the edge math,
+    not in a flat buffer. A flat 5c buffer is 25% of stake on a 20c contract
+    and 6% on an 80c one; the true fee at both is ~1c.
+
+    fee_rate is per-series configurable on Kalshi's side (see
+    GET /series/{ticker}/fee_changes); 0.07 is what our MLB fills matched.
+    """
+    p = min(max(float(price_cents) / 100.0, 0.0), 1.0)
+    return math.ceil(fee_rate * p * (1.0 - p) * 100.0)
+
+
 def negbinom_ge(n: int, lam: float, dispersion: float) -> float:
     """P(X >= n) for a negative binomial with mean lam and variance dispersion*lam.
 
