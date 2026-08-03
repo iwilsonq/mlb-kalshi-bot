@@ -72,6 +72,13 @@ python3 main.py check
 python3 main.py status
 ```
 
+### Model vs market report
+```bash
+python3 main.py report           # Brier/log-loss + ROI heatmaps
+python3 main.py report --ask     # use ask instead of mid for market implied
+python3 main.py report --min-n 10
+```
+
 ### Start the bot (dry-run)
 ```bash
 python3 main.py run

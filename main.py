@@ -8,11 +8,13 @@ Usage:
     python main.py check                    Test Kalshi API connection
     python main.py settle                   Fetch outcomes for unsettled journal trades
     python main.py stats                    Print win rate / ROI per strategy
+    python main.py report                   Brier/log-loss vs market + ROI heatmaps
 """
 from __future__ import annotations
 import argparse
 import logging
 import sys
+from typing import Optional
 
 from slugger.config import Config
 from slugger.mlb_data import get_todays_games
@@ -23,6 +25,7 @@ from slugger.game_processor import (
     snapshot_pending_clv,
 )
 import slugger.journal as journal
+from slugger.reporting import build_report, format_report
 
 log = logging.getLogger("slugger")
 
@@ -156,6 +159,31 @@ def cmd_stats(config: Config, date_filter: Optional[str] = None):
     print(journal.format_stats(overall, per_strategy))
 
 
+def cmd_report(
+    config: Config,
+    *,
+    market_source: str = "mid",
+    min_cell_n: int = 5,
+    use_ask: bool = False,
+):
+    """Print Brier/log-loss vs market and ROI heatmaps from journal + signals."""
+    signals = journal.load_signals(config.log_dir)
+    records = journal.load_journal(config.log_dir)
+    if not signals and not records:
+        log.info("No signals or journal at %s — run the bot first.", config.log_dir)
+        return
+
+    source = "ask" if use_ask else market_source
+    report = build_report(
+        signals,
+        records,
+        market_source=source,
+        use_calibrated=True,
+        min_cell_n=1,  # keep full heatmap; formatter highlights n≥min_cell_n
+    )
+    print(format_report(report, min_roi_n=min_cell_n))
+
+
 def cmd_calibrate(config: Config, fit: bool = False):
     """Analyze model calibration and optionally fit calibration curves.
 
@@ -279,7 +307,7 @@ def main():
     parser = argparse.ArgumentParser(prog="slugger", description="MLB Kalshi trading bot")
     parser.add_argument(
         "command",
-        choices=["run", "status", "check", "settle", "stats", "calibrate"],
+        choices=["run", "status", "check", "settle", "stats", "calibrate", "report"],
         help="Command",
     )
     parser.add_argument("--env", default=".env", help="Path to .env file")
@@ -296,6 +324,14 @@ def main():
     parser.add_argument(
         "--date", metavar="YYYY-MM-DD",
         help='(stats only) Filter to trades placed on this date. Use "today" for today.',
+    )
+    parser.add_argument(
+        "--ask", action="store_true",
+        help="(report only) Use ask as market-implied price instead of mid.",
+    )
+    parser.add_argument(
+        "--min-n", type=int, default=5, metavar="N",
+        help="(report only) Highlight ROI cells with at least N samples (default 5).",
     )
 
     args = parser.parse_args()
@@ -315,6 +351,8 @@ def main():
         cmd_calibrate(config, fit=args.fit)
     elif args.command == "stats":
         cmd_stats(config, date_filter=args.date)
+    elif args.command == "report":
+        cmd_report(config, use_ask=args.ask, min_cell_n=args.min_n)
     elif args.command == "check":
         cmd_check(config)
     elif args.command == "status":
