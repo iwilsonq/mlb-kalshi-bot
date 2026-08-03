@@ -22,6 +22,7 @@ from slugger.config import Config
 from slugger.kalshi_client import market_quotes
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
 from slugger.signal_pipeline import load_calibration
+from slugger.sizing import DailyRiskBudget, daily_spent_from_journal, kelly_count
 from slugger.strategies import STRATEGY_PIPELINE
 from slugger.tickers import game_event_ticker
 from slugger.types import GameContext, GameInfo, MarketClient, TradeSignal
@@ -195,6 +196,7 @@ def execute_signals(
     held_tickers: Set[str],
     placed_tickers: Set[str],
     budget: Optional["GameBudget"] = None,
+    daily: Optional[DailyRiskBudget] = None,
 ) -> bool:
     """Place orders for a list of signals. Returns True if any signal was acted on."""
     any_acted = False
@@ -210,6 +212,13 @@ def execute_signals(
             )
             return any_acted
 
+        if daily is not None and daily.max_fraction > 0 and daily.remaining_usd <= 0:
+            log.info(
+                "  🛑 Daily bankroll fraction cap reached ($%.2f/$%.2f) — skipping remaining",
+                daily.spent_usd, daily.cap_usd,
+            )
+            return any_acted
+
         any_acted = True
 
         # ── Dedup check ────────────────────────────────────────────────────
@@ -217,15 +226,29 @@ def execute_signals(
             log.info("  ⏭ %s | %s — already held, skipping", signal.strategy, signal.ticker)
             continue
 
-        # ── Rescale count to live bankroll ─────────────────────────────────
-        if effective_bankroll < config.max_position_usd and signal.count > 0:
-            scale = effective_bankroll / config.max_position_usd
-            signal.count = max(1, int(signal.count * scale))
+        # ── Binary Kelly size with bankroll + daily remaining ──────────────
+        remaining_daily = daily.remaining_usd if daily is not None and daily.max_fraction > 0 else None
+        signal.count = kelly_count(
+            signal.edge_cents,
+            signal.price,
+            config.kelly_fraction,
+            config.max_position_usd,
+            config.max_contracts_per_trade,
+            model_prob_pct=signal.model_prob_pct or None,
+            bankroll_usd=effective_bankroll,
+            remaining_daily_usd=remaining_daily,
+        )
+        if signal.count <= 0:
+            log.info(
+                "  ⏭ %s | %s — sized to 0 contracts (edge/daily/bankroll)",
+                signal.strategy, signal.ticker,
+            )
+            continue
 
         log.info(
-            "  📊 %s | %s | %d contracts @ %d¢ | Edge: %.1f¢",
+            "  📊 %s | %s | %d contracts @ %d¢ | Edge: %.1f¢ | model=%.1f%%",
             signal.strategy, signal.reason, signal.count,
-            signal.price, signal.edge_cents,
+            signal.price, signal.edge_cents, signal.model_prob_pct,
         )
 
         cost_est = signal.count * signal.price / 100
@@ -238,6 +261,13 @@ def execute_signals(
             )
             continue
 
+        if daily is not None and daily.max_fraction > 0 and not daily.can_spend(cost_est):
+            log.info(
+                "  🛑 Daily risk remaining $%.2f < cost $%.2f — skipping %s",
+                daily.remaining_usd, cost_est, signal.ticker,
+            )
+            continue
+
         if config.dry_run:
             log.info(
                 "     [DRY RUN] Would BUY %s %s %d × %d¢ = $%.2f",
@@ -247,6 +277,8 @@ def execute_signals(
             held_tickers.add(signal.ticker)
             if budget:
                 budget.record(cost_est)
+            if daily is not None:
+                daily.record(cost_est)
         else:
             if signal.side == "no":
                 result = client.create_no_order(
@@ -277,6 +309,8 @@ def execute_signals(
                 placed_tickers.add(signal.ticker)
                 if budget:
                     budget.record(cost_usd)
+                if daily is not None:
+                    daily.record(cost_usd)
                 journal.record_trade(
                     log_dir=config.log_dir,
                     ticker=signal.ticker,
@@ -320,6 +354,7 @@ def process_game(
     held_tickers: Set[str],
     placed_tickers: Set[str],
     calibration: Optional[CalibrationLayer] = None,
+    daily: Optional[DailyRiskBudget] = None,
 ):
     """Run all strategies for a single game and execute trades.
 
@@ -345,13 +380,13 @@ def process_game(
             len(ctx.away_batters), len(ctx.home_batters),
         )
 
-    # Effective bankroll cap
-    effective_bankroll = min(bankroll_usd, config.max_position_usd)
-    if effective_bankroll < config.max_position_usd:
+    # Kelly uses full live balance as bankroll; max_position_usd caps per trade.
+    effective_bankroll = bankroll_usd if bankroll_usd > 0 else config.max_position_usd
+    if bankroll_usd < config.max_position_usd:
         log.info(
             "  ⚠️  Live balance $%.2f < MAX_POSITION_USD $%.2f — "
-            "scaling Kelly to $%.2f",
-            bankroll_usd, config.max_position_usd, effective_bankroll,
+            "per-trade cap is balance",
+            bankroll_usd, config.max_position_usd,
         )
 
     any_signals = False
@@ -381,6 +416,7 @@ def process_game(
             signals, client, config, circuit,
             effective_bankroll, held_tickers, placed_tickers,
             budget=budget,
+            daily=daily,
         ):
             any_signals = True
 
@@ -586,9 +622,10 @@ def run(config: Config, game_filter: Optional[str] = None):
 
     log.info("🚀 Starting Slugger bot (v%s)", __import__("slugger").__version__)
     log.info(
-        "Config: dry_run=%s  kelly=%.2f  min_edge=%d¢  cost_buffer=%d¢  "
-        "max_game_exposure=$%.2f  strategies=%s  poll=%ds%s",
+        "Config: dry_run=%s  kelly=%.2f  daily_frac=%.0f%%  min_edge=%d¢  "
+        "cost_buffer=%d¢  max_game_exposure=$%.2f  strategies=%s  poll=%ds%s",
         config.dry_run, config.kelly_fraction,
+        config.max_bankroll_fraction_per_day * 100,
         config.min_edge_cents, config.edge_cost_buffer_cents,
         config.max_exposure_per_game_usd,
         ",".join(config.enabled_strategies),
@@ -633,6 +670,22 @@ def run(config: Config, game_filter: Optional[str] = None):
         if balance < 0.50:
             log.error("Balance too low ($%.2f) — halting bot.", balance)
             break
+
+        # ── Daily bankroll fraction budget ────────────────────────────────
+        today = date.today().isoformat()
+        already_spent = daily_spent_from_journal(
+            journal.load_journal(config.log_dir), today,
+        )
+        daily = DailyRiskBudget(
+            bankroll_usd=balance,
+            max_fraction=config.max_bankroll_fraction_per_day,
+            spent_usd=already_spent,
+        )
+        if daily.max_fraction > 0:
+            log.info(
+                "📅 Daily risk: spent $%.2f / cap $%.2f (%.0f%% of bankroll)",
+                daily.spent_usd, daily.cap_usd, daily.max_fraction * 100,
+            )
 
         # ── Build dedup set from live positions + ledger ────────────────────
         try:
@@ -696,6 +749,7 @@ def run(config: Config, game_filter: Optional[str] = None):
                     held_tickers=held_tickers,
                     placed_tickers=placed_tickers,
                     calibration=calibration,
+                    daily=daily,
                 )
             except Exception as exc:
                 log.error("Error processing %s: %s", game.game_id, exc)

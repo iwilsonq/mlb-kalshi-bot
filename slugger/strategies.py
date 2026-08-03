@@ -1095,6 +1095,7 @@ def strategy_combo(
             combo_kelly,
             config.max_position_usd,
             config.max_contracts_per_trade,
+            model_prob_pct=float(joint_prob_pct),
         )
 
         if count <= 0:

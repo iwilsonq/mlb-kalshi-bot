@@ -272,6 +272,7 @@ def evaluate_markets(
                 config.kelly_fraction,
                 config.max_position_usd,
                 config.max_contracts_per_trade,
+                model_prob_pct=float(prob_pct),
             )
             if count > 0:
                 signals.append(TradeSignal(
@@ -453,6 +454,7 @@ def _evaluate_no_side(
             config.kelly_fraction,
             config.max_position_usd,
             config.max_contracts_per_trade,
+            model_prob_pct=float(100 - model_yes_pct),
         )
         if count > 0:
             no_signals.append(TradeSignal(

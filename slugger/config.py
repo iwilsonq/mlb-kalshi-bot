@@ -37,6 +37,9 @@ class Config:
     # Covers half-spread + fees + mild adverse selection (Phase 0).
     edge_cost_buffer_cents: int = 5
     kelly_fraction: float = 0.25  # Quarter-Kelly
+    # Max fraction of live bankroll that may be risked across all trades in one day.
+    # 0 disables the daily fraction cap (per-trade max_position_usd still applies).
+    max_bankroll_fraction_per_day: float = 0.20
     
     # Circuit breaker
     cb_max_loss_usd: float = 10.0
@@ -96,6 +99,9 @@ class Config:
             min_edge_cents=int(os.getenv("MIN_EDGE_CENTS", "5")),
             edge_cost_buffer_cents=int(os.getenv("EDGE_COST_BUFFER_CENTS", "5")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
+            max_bankroll_fraction_per_day=float(
+                os.getenv("MAX_BANKROLL_FRACTION_PER_DAY", "0.20")
+            ),
             cb_max_loss_usd=float(os.getenv("CIRCUIT_BREAKER_MAX_LOSS_USD", "10")),
             cb_max_consecutive_losses=int(os.getenv("CIRCUIT_BREAKER_MAX_CONSECUTIVE_LOSSES", "3")),
             enabled_strategies=tuple(
