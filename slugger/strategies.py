@@ -10,7 +10,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from slugger.calibration import CalibrationLayer
 from slugger.config import Config
@@ -65,8 +65,8 @@ _HR_MIN_AB            = 80     # minimum AB before considering a batter (filter 
 
 # Strategy-specific hits constants — only near-flat strategy; keep but tighten
 _HITS_MIN_AB          = 60      # minimum AB before considering a batter
-_HITS_MIN_MODEL_PROB  = 15      # avoid thin longshot hit props
-_HITS_MIN_EDGE_CENTS  = 8       # cost-adjusted edge floor
+_HITS_MIN_MODEL_PROB  = 18      # avoid thin longshot hit props (Phase2 refine)
+_HITS_MIN_EDGE_CENTS  = 10      # cost-adjusted edge floor (journal + cal bias)
 _HITS_THRESHOLD_PATTERN = r'(\d+)\s*\+\s*hit'
 
 
@@ -1239,15 +1239,23 @@ def _run_combo(
 # To add a new strategy: define the function, write a wrapper, add it here.
 # No changes to game_processor.py needed.
 
+# Active pipeline only. Retired strategies remain callable for research but
+# are not registered here so they cannot re-enable via .env typos alone.
 STRATEGY_PIPELINE: List[Tuple[str, Any]] = [
-    ("game_winner",   _run_game_winner),
     ("pitcher_ks",    _run_pitcher_ks),
-    ("total_runs",    _run_total_runs),
-    ("player_hr",     _run_player_hr),
     ("player_hits",   _run_player_hits),
-    ("player_hr_rbis", _run_player_hr_rbis),
-    ("combo",         _run_combo),
+    # player_hr is intentionally absent from default pipeline (dark until rebuild).
+    # Re-add ("player_hr", _run_player_hr) only after holdout +EV is proven.
 ]
+
+# Permanently retired from live pipeline (heuristics / −EV journal).
+# Do not re-add without a new model + holdout Brier vs market.
+RETIRED_STRATEGIES: Dict[str, str] = {
+    "game_winner": "journal −207% ROI; home-only mapping broken",
+    "total_runs": "ERA bucket heuristic, not a game-total model",
+    "player_hr_rbis": "AVG buckets; calibration disaster (~45%→15%)",
+    "combo": "disabled until singles are +EV; joint sim required",
+}
 
 
 # ── Legacy exports (backward compatibility) ───────────────────────────────────

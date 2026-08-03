@@ -22,6 +22,8 @@ from slugger.config import Config
 from slugger.kalshi_client import market_quotes
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
 from slugger.signal_pipeline import load_calibration
+from slugger.consensus import consensus_allows_trade, load_consensus_prices
+from slugger.execution import limit_price_cents
 from slugger.risk import GameFactorBudget, StrategyHealthMonitor
 from slugger.sizing import DailyRiskBudget, daily_spent_from_journal, kelly_count
 from slugger.strategies import STRATEGY_PIPELINE
@@ -226,6 +228,27 @@ def execute_signals(
         # ── Dedup check ────────────────────────────────────────────────────
         if signal.ticker in held_tickers:
             log.info("  ⏭ %s | %s — already held, skipping", signal.strategy, signal.ticker)
+            continue
+
+        # ── Maker/limit discipline: never bid above fair − buffer ──────────
+        if signal.model_prob_pct > 0:
+            signal.price = limit_price_cents(
+                fair_prob_pct=signal.model_prob_pct,
+                ask_cents=signal.ask_cents or signal.price,
+                side=signal.side,
+                buffer_cents=1,
+            )
+
+        # ── Optional consensus prior gate ──────────────────────────────────
+        consensus = load_consensus_prices()
+        if not consensus_allows_trade(
+            signal.ticker, signal.price, consensus,
+            min_edge_cents=float(config.min_edge_cents),
+        ):
+            log.info(
+                "  ⏭ %s | %s — blocked by consensus prior (ask %d¢)",
+                signal.strategy, signal.ticker, signal.price,
+            )
             continue
 
         # ── Binary Kelly size with bankroll + daily remaining ──────────────

@@ -46,9 +46,9 @@ class Config:
     cb_max_consecutive_losses: int = 3
     
     # Market selection
-    # Phase 0: only strategies with a non-hopeless journal.  Disabled until rebuilt:
-    # game_winner, total_runs, player_hr_rbis, combo.
-    enabled_strategies: tuple = ("pitcher_ks", "player_hr", "player_hits")
+    # Active allowlist. Retired/dark: game_winner, total_runs, player_hr_rbis,
+    # combo, player_hr (kept dark after journal −EV; re-enable only after rebuild).
+    enabled_strategies: tuple = ("pitcher_ks", "player_hits")
     min_liquidity_dollars: float = 5.0
     min_volume: int = 0
 
@@ -110,7 +110,7 @@ class Config:
             cb_max_consecutive_losses=int(os.getenv("CIRCUIT_BREAKER_MAX_CONSECUTIVE_LOSSES", "3")),
             enabled_strategies=tuple(
                 s.strip() for s in os.getenv(
-                    "ENABLED_STRATEGIES", "pitcher_ks,player_hr,player_hits"
+                    "ENABLED_STRATEGIES", "pitcher_ks,player_hits"
                 ).split(",") if s.strip()
             ),
             min_liquidity_dollars=float(os.getenv("MIN_LIQUIDITY_DOLLARS", "5")),
