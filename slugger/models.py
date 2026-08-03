@@ -60,45 +60,6 @@ PA_BY_ORDER = {
     9: 3.40,    # 9th hitter — fewest PA
 }
 
-# HR park factors by home team abbreviation (normalized: 1.0 = league average).
-# Source: multi-year (2022-2024) HR park factor data.
-HR_PARK_FACTORS: Dict[str, float] = {
-    # Strongly pitcher-friendly
-    "SF":  0.82,   # Oracle Park — marine layer + wind + deep CF
-    "MIA": 0.85,   # loanDepot park
-    "OAK": 0.87,   # Oakland Coliseum
-    "NYM": 0.88,   # Citi Field
-    "SEA": 0.89,   # T-Mobile Park
-    "LAD": 0.90,   # Dodger Stadium
-    "PIT": 0.91,   # PNC Park
-    "SD":  0.93,   # Petco Park
-    "DET": 0.93,   # Comerica Park
-    "TB":  0.94,   # Tropicana Field
-    # Slightly pitcher-friendly / neutral
-    "STL": 0.96,   # Busch Stadium
-    "KC":  0.96,   # Kauffman Stadium
-    "WSH": 0.96,   # Nationals Park
-    "BOS": 0.97,   # Fenway Park
-    "CHC": 0.97,   # Wrigley Field
-    "TOR": 1.00,
-    "ATL": 1.00,   # Truist Park
-    "CHW": 1.00,   # Guaranteed Rate Field
-    "MIN": 1.02,   # Target Field
-    "LAA": 1.02,   # Angel Stadium
-    # Slightly hitter-friendly
-    "PHI": 1.03,   # Citizens Bank Park
-    "MIL": 1.06,   # American Family Field
-    "HOU": 1.08,   # Minute Maid Park (Crawford Boxes in LF)
-    "TEX": 1.10,   # Globe Life Field
-    "BAL": 1.10,   # Camden Yards
-    "CLE": 1.05,   # Progressive Field
-    "ARI": 1.05,   # Chase Field (altitude helps)
-    # Strongly hitter-friendly
-    "CIN": 1.14,   # Great American Ballpark
-    "NYY": 1.18,   # Yankee Stadium — short right-field porch
-    "COL": 1.38,   # Coors Field — altitude
-}
-
 # ── Hits model ────────────────────────────────────────────────────────────────
 LEAGUE_AVG_H_PER_AB  = 0.243   # 2024 MLB batting average
 HITS_PRIOR_AB        = 250     # prior weight for Bayesian shrinkage on AVG
