@@ -248,16 +248,21 @@ def cmd_calibrate(config: Config, fit: bool = False):
             samples = samples_from_pitcher_game_logs(game_logs, as_of=as_of)
             print(f"  {len(samples)} point-in-time start samples (date < {as_of})")
             if len(samples) >= 20:
-                # Holdout props: use recorded market prices from signals when present
-                holdout_props = []
-                for s in signals:
-                    if s.get("strategy") != "pitcher_ks":
-                        continue
-                    # link via date in reason/ticker not always possible; skip if no price
-                    px = s.get("market_price_cents") or s.get("ask_cents")
-                    if not px:
-                        continue
-                ks_m = fit_ks_model(samples, as_of=as_of, holdout_frac=0.2)
+                from slugger.ks_model import (
+                    build_holdout_props_from_signals,
+                    compare_roi_to_phase0_baseline,
+                )
+                # Real market prices from signals.jsonl joined to actual Ks
+                holdout_props = build_holdout_props_from_signals(
+                    signals, game_logs, as_of=as_of,
+                )
+                print(f"  {len(holdout_props)} holdout props with real market prices")
+                ks_m = fit_ks_model(
+                    samples,
+                    as_of=as_of,
+                    holdout_frac=0.2,
+                    holdout_props=holdout_props,
+                )
                 ks_path = str(Path(config.log_dir) / "ks_model.json")
                 ks_m.save(ks_path)
                 clear_ks_model_cache()
@@ -267,6 +272,15 @@ def cmd_calibrate(config: Config, fit: bool = False):
                     f"brier_model={ks_m.holdout_model_brier} "
                     f"brier_mkt={ks_m.holdout_market_brier} "
                     f"beats_mkt={ks_m.holdout_beats_market}"
+                )
+                # Journal ROI: Phase-0 edge gate vs unrestricted baseline
+                roi_cmp = compare_roi_to_phase0_baseline(records, "pitcher_ks")
+                print(
+                    f"  ROI baseline n={roi_cmp['baseline']['n']:.0f} "
+                    f"roi={roi_cmp['baseline']['roi_pct']:+.1f}% | "
+                    f"gated(edge≥20) n={roi_cmp['gated']['n']:.0f} "
+                    f"roi={roi_cmp['gated']['roi_pct']:+.1f}% | "
+                    f"not_worse={roi_cmp['not_worse_than_baseline']}"
                 )
             else:
                 print("  Not enough game-log samples to fit Ks model")
