@@ -80,6 +80,14 @@ class StrategyHealthMonitor:
       1. Rolling ROI = sum(pnl)/sum(cost) over last window_n trades < min_roi_pct
       2. Rolling Brier(model) − Brier(market) < min_brier_edge
          (negative means model worse than market)
+
+    Disabling latches for the life of the process: once a live session trips a
+    strategy it stays off until restart, so it cannot flap trade-by-trade.
+
+    Seeding from history is deliberately *not* latching. load_from_journal fills
+    the windows and then judges each strategy once from its final window, because
+    replaying with per-observation evaluation latches on the worst window that
+    ever occurred and the rolling window stops meaning anything.
     """
 
     window_n: int = 50
@@ -93,6 +101,10 @@ class StrategyHealthMonitor:
     # strategy → deque of (model_brier_term, market_brier_term) per settlement
     _brier_windows: Dict[str, Deque[Tuple[float, float]]] = field(default_factory=dict)
     disabled: Set[str] = field(default_factory=set)
+    # strategy → why it was disabled, for logs and reporting
+    disabled_reasons: Dict[str, str] = field(default_factory=dict)
+    # True while replaying history: record observations but defer judgement
+    _seeding: bool = field(default=False, repr=False)
 
     def _window(self, strategy: str) -> Deque[Tuple[float, float]]:
         if strategy not in self._windows:
@@ -109,7 +121,8 @@ class StrategyHealthMonitor:
             return
         w = self._window(strategy)
         w.append((float(pnl_usd), max(0.0, float(cost_usd))))
-        self._recompute(strategy)
+        if not self._seeding:
+            self._recompute(strategy)
 
     def observe_probability(
         self,
@@ -127,9 +140,14 @@ class StrategyHealthMonitor:
         mb = (p_m - y) ** 2
         kb = (p_k - y) ** 2
         self._brier_window(strategy).append((mb, kb))
-        self._recompute(strategy)
+        if not self._seeding:
+            self._recompute(strategy)
 
-    def _recompute(self, strategy: str) -> None:
+    def health_reason(self, strategy: str) -> Optional[str]:
+        """Why the strategy's *current* window is unhealthy, or None if it is fine.
+
+        Pure: reads the windows and returns a verdict without mutating state.
+        """
         w = self._window(strategy)
         if len(w) >= self.min_trades:
             pnl = sum(x[0] for x in w)
@@ -137,13 +155,10 @@ class StrategyHealthMonitor:
             if cost > 0:
                 roi = pnl / cost * 100.0
                 if roi < self.min_roi_pct:
-                    if strategy not in self.disabled:
-                        log.warning(
-                            "⛔ Strategy auto-disabled: %s rolling ROI %.1f%% < %.1f%% (n=%d)",
-                            strategy, roi, self.min_roi_pct, len(w),
-                        )
-                    self.disabled.add(strategy)
-                    return
+                    return (
+                        f"rolling ROI {roi:.1f}% < {self.min_roi_pct:.1f}% "
+                        f"(n={len(w)})"
+                    )
 
         bw = self._brier_window(strategy)
         if len(bw) >= self.min_trades:
@@ -151,14 +166,22 @@ class StrategyHealthMonitor:
             avg_kb = sum(x[1] for x in bw) / len(bw)
             deficit = avg_mb - avg_kb  # >0 model worse
             if deficit > self.max_brier_deficit:
-                if strategy not in self.disabled:
-                    log.warning(
-                        "⛔ Strategy auto-disabled: %s Brier deficit %.4f "
-                        "(model %.4f vs market %.4f) > %.4f (n=%d)",
-                        strategy, deficit, avg_mb, avg_kb,
-                        self.max_brier_deficit, len(bw),
-                    )
-                self.disabled.add(strategy)
+                return (
+                    f"Brier deficit {deficit:.4f} (model {avg_mb:.4f} vs "
+                    f"market {avg_kb:.4f}) > {self.max_brier_deficit:.4f} "
+                    f"(n={len(bw)})"
+                )
+        return None
+
+    def _recompute(self, strategy: str) -> None:
+        """Judge the current window and latch the strategy off if unhealthy."""
+        reason = self.health_reason(strategy)
+        if reason is None:
+            return
+        if strategy not in self.disabled:
+            log.warning("⛔ Strategy auto-disabled: %s %s", strategy, reason)
+        self.disabled.add(strategy)
+        self.disabled_reasons[strategy] = reason
 
     def is_enabled(self, strategy: str, config_enabled: Iterable[str]) -> bool:
         if strategy not in set(config_enabled):
@@ -166,31 +189,46 @@ class StrategyHealthMonitor:
         return strategy not in self.disabled
 
     def load_from_journal(self, records: List[dict]) -> None:
-        """Seed windows from historical trades+settlements (chronological)."""
+        """Seed windows from historical trades+settlements (chronological).
+
+        Judges each strategy exactly once, from the window state left at the end
+        of the replay. Evaluating after every observation instead would latch on
+        the worst window in the whole file: pitcher_ks tripped on an early −246%
+        window that was 480 trades stale, and player_hits was held off on a
+        window it had long since left (final 50-trade window +101.9%). That
+        turned a rolling health check into a permanent record of the worst day.
+        """
         trades = {r["ticker"]: r for r in records if r.get("type") == "trade"}
-        # settlements in file order
-        for r in records:
-            if r.get("type") != "settlement":
-                continue
-            t = trades.get(r.get("ticker", ""))
-            if not t:
-                continue
-            self.observe(
-                t.get("strategy", "unknown"),
-                float(r.get("pnl_usd") or 0.0),
-                float(t.get("cost_usd") or 0.0),
-            )
-            # Brier terms when model + market prices present on trade
-            model_p = t.get("model_prob_pct") or t.get("raw_model_prob_pct")
-            mkt = t.get("ask_cents") or t.get("price_cents")
-            result = r.get("market_result", "")
-            if model_p is not None and mkt is not None and result in ("yes", "no"):
-                self.observe_probability(
+        self._seeding = True
+        try:
+            # settlements in file order
+            for r in records:
+                if r.get("type") != "settlement":
+                    continue
+                t = trades.get(r.get("ticker", ""))
+                if not t:
+                    continue
+                self.observe(
                     t.get("strategy", "unknown"),
-                    float(model_p),
-                    float(mkt),
-                    1 if result == "yes" else 0,
+                    float(r.get("pnl_usd") or 0.0),
+                    float(t.get("cost_usd") or 0.0),
                 )
+                # Brier terms when model + market prices present on trade
+                model_p = t.get("model_prob_pct") or t.get("raw_model_prob_pct")
+                mkt = t.get("ask_cents") or t.get("price_cents")
+                result = r.get("market_result", "")
+                if model_p is not None and mkt is not None and result in ("yes", "no"):
+                    self.observe_probability(
+                        t.get("strategy", "unknown"),
+                        float(model_p),
+                        float(mkt),
+                        1 if result == "yes" else 0,
+                    )
+        finally:
+            self._seeding = False
+
+        for strategy in sorted(set(self._windows) | set(self._brier_windows)):
+            self._recompute(strategy)
 
     def effective_enabled(self, config_enabled: Iterable[str]) -> Tuple[str, ...]:
         return tuple(s for s in config_enabled if s not in self.disabled)

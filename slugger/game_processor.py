@@ -731,8 +731,30 @@ def run(config: Config, game_filter: Optional[str] = None):
         max_brier_deficit=config.strategy_health_max_brier_deficit,
     )
     health.load_from_journal(journal.load_journal(config.log_dir))
-    if health.disabled:
-        log.warning("Strategies auto-disabled at start: %s", ", ".join(sorted(health.disabled)))
+    for strat in sorted(health.disabled):
+        log.warning(
+            "⛔ %s auto-disabled at start — %s",
+            strat, health.disabled_reasons.get(strat, "unhealthy"),
+        )
+    # Mirror the gates in process_game: pipeline ∩ allowlist ∩ not-disabled.
+    # An allowlist entry missing from STRATEGY_PIPELINE is inert, so reporting
+    # config.enabled_strategies alone would overstate what can actually trade.
+    pipeline_names = [name for name, _ in STRATEGY_PIPELINE]
+    effective = [
+        name for name in pipeline_names
+        if health.is_enabled(name, config.enabled_strategies)
+    ]
+    if effective:
+        log.info("Strategies live this session: %s", ", ".join(effective))
+    else:
+        inert = sorted(set(config.enabled_strategies) - set(pipeline_names))
+        log.warning(
+            "No strategies are live — the bot will not place any orders. "
+            "ENABLED_STRATEGIES=%s; pipeline=%s%s",
+            ", ".join(config.enabled_strategies) or "<empty>",
+            ", ".join(pipeline_names) or "<empty>",
+            f"; not in pipeline (inert): {', '.join(inert)}" if inert else "",
+        )
 
     game_state = GameStateTracker()
 
