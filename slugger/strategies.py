@@ -247,10 +247,9 @@ def strategy_player_hits(
     )
     hit_p *= park_factor
 
-    # Calibration deflation. Retained for continuity with the fitted calibration
-    # curve, which was built from signals generated with it applied — dropping it
-    # here would double-correct until the curve is refit. Most of what it was
-    # compensating for was the Poisson tail, now gone; re-derive it next.
+    # Deflates the multiplier stack above, which overpredicts per-AB hit
+    # probability by ~30%. Re-derived against 7170 real outcomes after the
+    # binomial fix and 0.70 remained optimal — see the note on the constant.
     hit_p *= HITS_LAMBDA_DEFLATOR
     hit_p = min(max(hit_p, 0.0), 1.0)
     lam = hit_p * ab_est

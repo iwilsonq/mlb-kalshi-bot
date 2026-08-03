@@ -123,7 +123,12 @@ HITS_MIN_AB          = 60      # minimum AB before considering a batter
 HITS_MIN_PITCHER_IP  = 30.0    # minimum IP to trust pitcher WHIP/BAA
 LEAGUE_AVG_WHIP      = 1.28    # 2024 MLB league-average WHIP
 MAX_PITCHER_WHIP_ADJ = 1.35    # cap pitcher WHIP multiplier
-HITS_LAMBDA_DEFLATOR = 0.70    # Phase2 refine: journal cal bias ~10pts; stronger deflate
+# Re-derived 2026-08-03 against 7170 real outcomes (mlb-kalshi-bot-6lf): 0.70 is
+# empirically optimal even after the binomial fix (Brier 0.17432 vs 0.19311 at
+# 1.0; undeflated the model says 77% for 1+ hits when reality is 62%). The
+# blended-avg × WHIP × hard-hit × park stack overpredicts per-AB hit probability
+# by ~30% and this corrects it. Do not remove without re-running that check.
+HITS_LAMBDA_DEFLATOR = 0.70
 
 # Hit park factors by home team abbreviation (normalized: 1.0 = league average).
 # Source: multi-year (2022-2024) hit park factor data.
