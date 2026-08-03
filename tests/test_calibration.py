@@ -415,3 +415,84 @@ class TestFitDeduplicatesByTicker:
 
         assert low <= 15, f"Low bin calibrated to {low}%, expected ~10%"
         assert high >= 60, f"High bin calibrated to {high}%, expected ~70%"
+
+
+class TestWalkForwardNoLeakage:
+    """Walk-forward fit must not use records on or after as_of."""
+
+    def test_filter_records_before(self):
+        from slugger.calibration import filter_records_before
+        signals = [
+            {"ticker": "A", "date": "2026-06-01", "strategy": "s", "model_prob_pct": 30},
+            {"ticker": "B", "date": "2026-06-10", "strategy": "s", "model_prob_pct": 30},
+        ]
+        settlements = {
+            "A": {"market_result": "yes", "settled_at": "2026-06-01T12:00:00+00:00"},
+            "B": {"market_result": "no", "settled_at": "2026-06-10T12:00:00+00:00"},
+        }
+        sigs, setts = filter_records_before(signals, settlements, "2026-06-05")
+        assert len(sigs) == 1 and sigs[0]["ticker"] == "A"
+        assert "A" in setts and "B" not in setts
+
+    def test_fit_as_of_excludes_future(self):
+        """Future settlements must not change sample_counts when as_of cuts them."""
+        signals = []
+        settlements = {}
+        # Past: 40 unique in two bins so fit can succeed with min_samples=10
+        for i in range(20):
+            t = f"PAST-LO-{i}"
+            signals.append({
+                "ticker": t, "strategy": "wf", "model_prob_pct": 10,
+                "date": "2026-05-01", "timestamp": "2026-05-01T12:00:00+00:00",
+            })
+            settlements[t] = {
+                "market_result": "no" if i < 18 else "yes",
+                "settled_at": "2026-05-01T20:00:00+00:00",
+            }
+        for i in range(20):
+            t = f"PAST-HI-{i}"
+            signals.append({
+                "ticker": t, "strategy": "wf", "model_prob_pct": 70,
+                "date": "2026-05-01", "timestamp": "2026-05-01T12:00:00+00:00",
+            })
+            settlements[t] = {
+                "market_result": "yes" if i < 14 else "no",
+                "settled_at": "2026-05-01T20:00:00+00:00",
+            }
+        # Future flood that would dominate without as_of
+        for i in range(200):
+            t = f"FUT-{i}"
+            signals.append({
+                "ticker": t, "strategy": "wf", "model_prob_pct": 10,
+                "date": "2026-08-01", "timestamp": "2026-08-01T12:00:00+00:00",
+            })
+            settlements[t] = {
+                "market_result": "yes",
+                "settled_at": "2026-08-01T20:00:00+00:00",
+            }
+
+        full = CalibrationLayer.fit(signals, settlements, min_samples=10)
+        wf = CalibrationLayer.fit(signals, settlements, min_samples=10, as_of="2026-06-01")
+        assert full.sample_counts.get("wf", 0) == 240
+        assert wf.sample_counts.get("wf", 0) == 40
+        assert wf.as_of == "2026-06-01"
+
+    def test_fit_walk_forward_sets_lag(self):
+        signals = []
+        settlements = {}
+        for i in range(40):
+            t = f"T-{i}"
+            signals.append({
+                "ticker": t, "strategy": "s2", "model_prob_pct": 20 if i < 20 else 60,
+                "date": "2026-04-01", "timestamp": "2026-04-01T00:00:00+00:00",
+            })
+            settlements[t] = {
+                "market_result": "yes" if i % 2 == 0 else "no",
+                "settled_at": "2026-04-01T12:00:00+00:00",
+            }
+        cal = CalibrationLayer.fit_walk_forward(
+            signals, settlements, lag_days=1, as_of="2026-05-01", min_samples=10,
+        )
+        assert cal.lag_days == 1
+        assert cal.as_of == "2026-05-01"
+        assert cal.sample_counts.get("s2", 0) == 40

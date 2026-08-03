@@ -215,12 +215,21 @@ def cmd_calibrate(config: Config, fit: bool = False):
         n_mlb = sum(len(v) for v in mlb_outcomes.values())
         print(f"  Backfilled {n_mlb} pitcher_ks outcomes from MLB game logs")
 
-        cal = CalibrationLayer.fit(signals, settlements, mlb_outcomes=mlb_outcomes)
+        # Walk-forward: exclude today (and lag window) so live gates never
+        # peek at same-day outcomes. Retrain daily via this command.
+        from slugger.calibration import DEFAULT_CALIBRATION_LAG_DAYS
+        cal = CalibrationLayer.fit_walk_forward(
+            signals,
+            settlements,
+            lag_days=DEFAULT_CALIBRATION_LAG_DAYS,
+            mlb_outcomes=mlb_outcomes,
+        )
         cal_path = str(Path(config.log_dir) / "calibration.json")
         cal.save(cal_path)
         print(cal.format_report())
-        print(f"\nCalibration saved to {cal_path}")
+        print(f"\nCalibration saved to {cal_path} (as_of={cal.as_of}, lag={cal.lag_days}d)")
         print("The bot will load this automatically on next run.")
+        print("Retrain schedule: run `python main.py calibrate --fit` once per day.")
         return
 
     # Bucket signals by strategy and probability band

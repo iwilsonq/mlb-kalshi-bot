@@ -21,6 +21,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -29,6 +30,53 @@ log = logging.getLogger(__name__)
 # Minimum settled signals per strategy before trusting calibration.
 # Below this threshold, the calibration is too noisy to help.
 _MIN_SAMPLES = 30
+
+# Default lag (days) so live curves never include "today's" unsettled truth.
+# Retrain: `python main.py calibrate --fit` (uses lag) or bot loads last fit.
+DEFAULT_CALIBRATION_LAG_DAYS = 1
+
+
+def record_date_iso(rec: dict) -> Optional[str]:
+    """Extract YYYY-MM-DD from a signal/trade/settlement record for walk-forward cuts.
+
+    Prefers timestamp/placed_at/settled_at date portion, then explicit date field.
+    """
+    for key in ("timestamp", "placed_at", "settled_at"):
+        raw = rec.get(key)
+        if not raw or not isinstance(raw, str):
+            continue
+        # ISO: 2026-06-03T... or 2026-06-03
+        if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+            return raw[:10]
+    d = rec.get("date")
+    if d and isinstance(d, str) and len(d) >= 10:
+        return d[:10]
+    return None
+
+
+def filter_records_before(
+    signals: List[dict],
+    settlements: Dict[str, dict],
+    as_of: str,
+) -> Tuple[List[dict], Dict[str, dict]]:
+    """Keep only records with date strictly before as_of (YYYY-MM-DD).
+
+    Settlements without a parseable date are dropped when as_of is set
+    (fail closed — no leakage via missing timestamps).
+    """
+    kept_signals = []
+    for s in signals:
+        d = record_date_iso(s)
+        if d is not None and d < as_of:
+            kept_signals.append(s)
+
+    kept_settlements: Dict[str, dict] = {}
+    for ticker, sett in settlements.items():
+        d = record_date_iso(sett)
+        if d is not None and d < as_of:
+            kept_settlements[ticker] = sett
+
+    return kept_signals, kept_settlements
 
 
 # ─── Ticker parsing (pitcher_ks signals) ─────────────────────────────────────
@@ -412,11 +460,20 @@ class CalibrationLayer:
     Each strategy gets its own set of breakpoints mapping raw model
     probability → calibrated probability.  Strategies without enough
     data use an identity mapping (pass-through).
+
+    Walk-forward: fit only on data with date < as_of (exclusive). Live bots
+    should load curves fitted with a lag (DEFAULT_CALIBRATION_LAG_DAYS) so
+    same-day outcomes never enter the gate. Retrain schedule: run
+    `python main.py calibrate --fit` daily (or on bot start via
+    fit_walk_forward); artifact stores as_of + lag_days.
     """
     # strategy_name → list of (x, y) breakpoints
     curves: Dict[str, List[Tuple[float, float]]] = field(default_factory=dict)
     # strategy_name → number of samples used to fit
     sample_counts: Dict[str, int] = field(default_factory=dict)
+    # Exclusive upper bound on training dates (YYYY-MM-DD); empty = legacy full sample
+    as_of: str = ""
+    lag_days: int = 0
 
     def calibrate(self, strategy: str, raw_prob_pct: int) -> int:
         """Apply calibration to a raw model probability.
@@ -444,11 +501,17 @@ class CalibrationLayer:
         data = {
             "curves": {k: [[x, y] for x, y in v] for k, v in self.curves.items()},
             "sample_counts": self.sample_counts,
+            "as_of": self.as_of,
+            "lag_days": self.lag_days,
+            "walk_forward": bool(self.as_of),
         }
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(data, indent=2))
-        log.info("Saved calibration to %s (%d strategies)", path, len(self.curves))
+        log.info(
+            "Saved calibration to %s (%d strategies, as_of=%s lag=%d)",
+            path, len(self.curves), self.as_of or "none", self.lag_days,
+        )
 
     @classmethod
     def load(cls, path: str) -> CalibrationLayer:
@@ -468,15 +531,49 @@ class CalibrationLayer:
                 for k, v in data.get("curves", {}).items()
             }
             sample_counts = data.get("sample_counts", {})
+            as_of = data.get("as_of", "") or ""
+            lag_days = int(data.get("lag_days", 0) or 0)
             log.info(
-                "Loaded calibration from %s: %s",
+                "Loaded calibration from %s as_of=%s: %s",
                 path,
+                as_of or "legacy-full-sample",
                 ", ".join(f"{k}({sample_counts.get(k, '?')} samples)" for k in curves),
             )
-            return cls(curves=curves, sample_counts=sample_counts)
+            return cls(
+                curves=curves,
+                sample_counts=sample_counts,
+                as_of=as_of,
+                lag_days=lag_days,
+            )
         except Exception as exc:
             log.warning("Could not load calibration from %s: %s", path, exc)
             return cls()
+
+    @classmethod
+    def fit_walk_forward(
+        cls,
+        signals: List[dict],
+        settlements: Dict[str, dict],
+        lag_days: int = DEFAULT_CALIBRATION_LAG_DAYS,
+        as_of: Optional[str] = None,
+        min_samples: int = _MIN_SAMPLES,
+        mlb_outcomes: Optional[Dict[str, List[Tuple[float, int]]]] = None,
+    ) -> CalibrationLayer:
+        """Fit using only data strictly before as_of (default: today − lag_days).
+
+        This is the production entry point for live gates.
+        """
+        if as_of is None:
+            as_of = (date.today() - timedelta(days=max(0, lag_days))).isoformat()
+        layer = cls.fit(
+            signals,
+            settlements,
+            min_samples=min_samples,
+            mlb_outcomes=mlb_outcomes,
+            as_of=as_of,
+        )
+        layer.lag_days = lag_days
+        return layer
 
     @classmethod
     def fit(
@@ -485,6 +582,7 @@ class CalibrationLayer:
         settlements: Dict[str, dict],
         min_samples: int = _MIN_SAMPLES,
         mlb_outcomes: Optional[Dict[str, List[Tuple[float, int]]]] = None,
+        as_of: Optional[str] = None,
     ) -> CalibrationLayer:
         """Fit calibration curves from historical signal and settlement data.
 
@@ -496,10 +594,19 @@ class CalibrationLayer:
                            from backfill_outcomes().  For strategies present here,
                            these outcomes replace Kalshi settlement data (they are
                            more complete — every game, not just traded markets).
+            as_of:         If set (YYYY-MM-DD), only use records with date < as_of
+                           (walk-forward; no same-day or future leakage).
 
         Returns:
             CalibrationLayer with per-strategy isotonic regression curves.
         """
+        if as_of:
+            signals, settlements = filter_records_before(signals, settlements, as_of)
+            log.info(
+                "Walk-forward fit as_of=%s — %d signals, %d settlements after filter",
+                as_of, len(signals), len(settlements),
+            )
+
         # Group (model_prob, outcome) pairs by strategy.
         # DEDUP by (strategy, ticker): the signal pipeline records a signal
         # on every poll cycle, so the same market can appear 100+ times.
@@ -607,13 +714,20 @@ class CalibrationLayer:
                     low_x, low_y, high_x, high_y,
                 )
 
-        return cls(curves=curves, sample_counts=sample_counts)
+        return cls(
+            curves=curves,
+            sample_counts=sample_counts,
+            as_of=as_of or "",
+            lag_days=0,
+        )
 
     def format_report(self) -> str:
         """Format a human-readable calibration report."""
         lines = []
         lines.append(f"{'=' * 70}")
         lines.append("  CALIBRATION CURVES")
+        if self.as_of:
+            lines.append(f"  walk-forward as_of < {self.as_of}  lag_days={self.lag_days}")
         lines.append(f"{'=' * 70}")
 
         if not self.curves:
