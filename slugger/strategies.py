@@ -40,9 +40,13 @@ from slugger.types import (
 log = logging.getLogger(__name__)
 
 # ── Strategy-specific constants (not model math — kept here) ──────────────────
-_KS_MIN_THRESHOLD   = 5       # skip 4+ and below; 5+ markets now included
-_KS_MIN_MODEL_PROB  = 12      # minimum model prob (%) to consider trading YES side
-_KS_MIN_EDGE_CENTS  = 15      # minimum edge in cents — data shows <20¢ is -18% ROI
+# Phase 0 gates (journal-driven): only trade mid-probability K bands with
+# cost-adjusted edge ≥ 20¢. Outside ~25–55% the model is either under- or
+# over-confident vs realized outcomes.
+_KS_MIN_THRESHOLD   = 6       # skip 5+ and below — low thresholds = longshot noise
+_KS_MIN_MODEL_PROB  = 25      # calibrated model prob floor (%)
+_KS_MAX_MODEL_PROB  = 55      # calibrated model prob ceiling (%)
+_KS_MIN_EDGE_CENTS  = 20      # cost-adjusted edge floor (after EDGE_COST_BUFFER)
 _KS_NO_MAX_MODEL_PROB = 10    # buy NO when model says probability is at most this (%)
 _KS_NO_MIN_EDGE_CENTS = 5     # minimum edge (market_yes_price - model_prob) to buy NO
 # NOTE: NO-side is disabled below (no_side=False). Market-price analysis
@@ -54,15 +58,15 @@ _KS_NO_MIN_EDGE_CENTS = 5     # minimum edge (market_yes_price - model_prob) to 
 # Threshold regex: matches "7+", "over 6.5", "at least 9" in any K-related title
 _KS_THRESHOLD_PATTERN = r'(\d+)\s*\+'
 
-# Strategy-specific HR constants (not model math)
+# Strategy-specific HR constants (not model math) — Phase 0: only rare high-edge
 _HR_MIN_MODEL_PROB    = 20     # minimum model probability — data shows <20% is -52% ROI
-_HR_MIN_EDGE_CENTS    = 15     # HR-specific minimum edge — data shows <20¢ is deeply negative
+_HR_MIN_EDGE_CENTS    = 20     # cost-adjusted; <15–20¢ was deeply negative in journal
 _HR_MIN_AB            = 80     # minimum AB before considering a batter (filter noise)
 
-# Strategy-specific hits constants (not model math)
+# Strategy-specific hits constants — only near-flat strategy; keep but tighten
 _HITS_MIN_AB          = 60      # minimum AB before considering a batter
-_HITS_MIN_MODEL_PROB  = 12      # minimum model probability (%) to trade
-_HITS_MIN_EDGE_CENTS  = 4       # hits-specific minimum edge in cents
+_HITS_MIN_MODEL_PROB  = 15      # avoid thin longshot hit props
+_HITS_MIN_EDGE_CENTS  = 8       # cost-adjusted edge floor
 _HITS_THRESHOLD_PATTERN = r'(\d+)\s*\+\s*hit'
 
 
@@ -167,6 +171,7 @@ def strategy_pitcher_ks(
         threshold_pattern=_KS_THRESHOLD_PATTERN,
         min_threshold=_KS_MIN_THRESHOLD,
         min_model_prob=_KS_MIN_MODEL_PROB,
+        max_model_prob=_KS_MAX_MODEL_PROB,
         min_edge_cents=_KS_MIN_EDGE_CENTS,
         max_signals=2,
         no_side=False,

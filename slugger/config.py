@@ -32,7 +32,10 @@ class Config:
     dry_run: bool = True
     max_position_usd: float = 5.0
     max_contracts_per_trade: int = 10
-    min_edge_cents: int = 3       # Minimum edge in cents to trade
+    min_edge_cents: int = 5       # Global floor on *cost-adjusted* edge (cents)
+    # Haircut applied to model−market edge before trade/size decisions.
+    # Covers half-spread + fees + mild adverse selection (Phase 0).
+    edge_cost_buffer_cents: int = 5
     kelly_fraction: float = 0.25  # Quarter-Kelly
     
     # Circuit breaker
@@ -40,13 +43,16 @@ class Config:
     cb_max_consecutive_losses: int = 3
     
     # Market selection
+    # Phase 0: only strategies with a non-hopeless journal.  Disabled until rebuilt:
+    # game_winner, total_runs, player_hr_rbis, combo.
     enabled_strategies: tuple = ("pitcher_ks", "player_hr", "player_hits")
     min_liquidity_dollars: float = 5.0
     min_volume: int = 0
 
     # Risk management
     max_signals_per_game: int = 5     # Cap correlated same-game exposure
-    max_exposure_per_game_usd: float = 0.0  # 0 = no dollar cap (use signal count only)
+    # Dollar cap per game (0 = signal-count only). Phase 0 default = 2× max position.
+    max_exposure_per_game_usd: float = 10.0
 
     # Combo / parlay
     combo_max_legs: int = 3           # Max legs per combo (2-3)
@@ -87,15 +93,20 @@ class Config:
             dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
             max_position_usd=float(os.getenv("MAX_POSITION_USD", "5")),
             max_contracts_per_trade=int(os.getenv("MAX_CONTRACTS_PER_TRADE", "10")),
-            min_edge_cents=int(os.getenv("MIN_EDGE_CENTS", "3")),
+            min_edge_cents=int(os.getenv("MIN_EDGE_CENTS", "5")),
+            edge_cost_buffer_cents=int(os.getenv("EDGE_COST_BUFFER_CENTS", "5")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             cb_max_loss_usd=float(os.getenv("CIRCUIT_BREAKER_MAX_LOSS_USD", "10")),
             cb_max_consecutive_losses=int(os.getenv("CIRCUIT_BREAKER_MAX_CONSECUTIVE_LOSSES", "3")),
-            enabled_strategies=tuple(os.getenv("ENABLED_STRATEGIES", "pitcher_ks,player_hr,player_hits").split(",")),
+            enabled_strategies=tuple(
+                s.strip() for s in os.getenv(
+                    "ENABLED_STRATEGIES", "pitcher_ks,player_hr,player_hits"
+                ).split(",") if s.strip()
+            ),
             min_liquidity_dollars=float(os.getenv("MIN_LIQUIDITY_DOLLARS", "5")),
             min_volume=int(os.getenv("MIN_VOLUME", "0")),
             max_signals_per_game=int(os.getenv("MAX_SIGNALS_PER_GAME", "5")),
-            max_exposure_per_game_usd=float(os.getenv("MAX_EXPOSURE_PER_GAME_USD", "0")),
+            max_exposure_per_game_usd=float(os.getenv("MAX_EXPOSURE_PER_GAME_USD", "10")),
             combo_max_legs=int(os.getenv("COMBO_MAX_LEGS", "3")),
             pregame_hours=float(os.getenv("PREGAME_HOURS", "2")),
             poll_interval_sec=int(os.getenv("POLL_INTERVAL_SEC", "60")),

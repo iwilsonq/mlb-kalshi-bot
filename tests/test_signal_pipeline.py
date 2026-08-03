@@ -64,10 +64,16 @@ def _make_market(ticker: str, title: str, yes_ask_dollars: str) -> dict:
     }
 
 
-def _make_config(log_dir: str, min_edge: int = 3, max_position: float = 50.0) -> MagicMock:
+def _make_config(
+    log_dir: str,
+    min_edge: int = 3,
+    max_position: float = 50.0,
+    cost_buffer: int = 0,
+) -> MagicMock:
     config = MagicMock()
     config.log_dir = log_dir
     config.min_edge_cents = min_edge
+    config.edge_cost_buffer_cents = cost_buffer
     config.min_liquidity_dollars = 0
     config.kelly_fraction = 0.25
     config.max_position_usd = max_position
@@ -347,3 +353,79 @@ class TestEvaluateMarkets:
         spec = MarketSpec(event_ticker="TEST", strategy_name="test")
         signals = evaluate_markets(spec, lambda t, th, p: ModelResult(50, ""), client, config)
         assert len(signals) == 0
+
+    def test_cost_buffer_blocks_marginal_edge(self, tmp_path):
+        """Gross edge above floor but net edge below floor after buffer → no trade."""
+        markets = [
+            _make_market("TEST-7", "Smith 7+ strikeouts", "0.30"),  # price 30¢
+        ]
+        client = _make_client(markets)
+        # model 40 → gross edge 10; buffer 5 → net 5; floor 8 → no trade
+        config = _make_config(str(tmp_path), min_edge=8, cost_buffer=5)
+
+        def model(title, threshold, price):
+            return ModelResult(prob_pct=40, reason="test")
+
+        spec = MarketSpec(
+            event_ticker="TEST",
+            strategy_name="pitcher_ks",
+            title_keywords=["strikeout"],
+            player_name="John Smith",
+            threshold_pattern=r'(\d+)\s*\+',
+            min_threshold=6,
+        )
+        signals = evaluate_markets(spec, model, client, config)
+        assert signals == []
+
+        # Signal still journaled with gross edge
+        data = json.loads((tmp_path / "signals.jsonl").read_text().strip().splitlines()[0])
+        assert data["traded"] is False
+        assert data["edge_cents"] == 10.0
+
+    def test_cost_buffer_sizes_on_net_edge(self, tmp_path):
+        """When trade fires, TradeSignal.edge_cents is net of cost buffer."""
+        markets = [
+            _make_market("TEST-7", "Smith 7+ strikeouts", "0.30"),
+        ]
+        client = _make_client(markets)
+        # model 50 → gross 20; buffer 5 → net 15; floor 10 → trade
+        config = _make_config(str(tmp_path), min_edge=10, cost_buffer=5)
+
+        def model(title, threshold, price):
+            return ModelResult(prob_pct=50, reason="test")
+
+        spec = MarketSpec(
+            event_ticker="TEST",
+            strategy_name="pitcher_ks",
+            title_keywords=["strikeout"],
+            player_name="John Smith",
+            threshold_pattern=r'(\d+)\s*\+',
+            min_threshold=6,
+        )
+        signals = evaluate_markets(spec, model, client, config)
+        assert len(signals) == 1
+        assert signals[0].edge_cents == 15.0  # 50 - 30 - 5
+
+    def test_max_model_prob_band(self, tmp_path):
+        """Probabilities above max_model_prob should not trade."""
+        markets = [
+            _make_market("TEST-7", "Smith 7+ strikeouts", "0.20"),
+        ]
+        client = _make_client(markets)
+        config = _make_config(str(tmp_path), min_edge=3, cost_buffer=0)
+
+        def model(title, threshold, price):
+            return ModelResult(prob_pct=70, reason="too high")
+
+        spec = MarketSpec(
+            event_ticker="TEST",
+            strategy_name="pitcher_ks",
+            title_keywords=["strikeout"],
+            player_name="John Smith",
+            threshold_pattern=r'(\d+)\s*\+',
+            min_threshold=6,
+            min_model_prob=25,
+            max_model_prob=55,
+        )
+        signals = evaluate_markets(spec, model, client, config)
+        assert signals == []

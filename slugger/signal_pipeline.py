@@ -162,8 +162,10 @@ def evaluate_markets(
     if not markets:
         return signals
 
-    # Effective edge floor: max of config global and strategy-specific
+    # Effective edge floor: max of config global and strategy-specific.
+    # Floor is applied to *cost-adjusted* edge (after EDGE_COST_BUFFER_CENTS).
     edge_floor = max(config.min_edge_cents, spec.min_edge_cents)
+    cost_buffer = max(0, int(getattr(config, "edge_cost_buffer_cents", 0) or 0))
     confidence_fn = spec.confidence_fn or _default_confidence
 
     player_last = ""
@@ -172,7 +174,8 @@ def evaluate_markets(
         player_last = parts[-1].lower() if parts else ""
 
     # Track all evaluated markets for logging
-    evaluated: List[tuple] = []  # (threshold, prob_pct, price, edge)
+    # (threshold, prob_pct, price, gross_edge, net_edge)
+    evaluated: List[tuple] = []
 
     # ── YES-side evaluation ────────────────────────────────────────────────
     for m in markets:
@@ -226,26 +229,34 @@ def evaluate_markets(
         # Record raw probability in signals.jsonl (for future recalibration),
         # then use calibrated probability for edge/trade decisions.
         prob_pct = cal.calibrate(spec.strategy_name, raw_prob_pct)
-        edge = prob_pct - price
-        evaluated.append((threshold, prob_pct, price, edge))
+        gross_edge = prob_pct - price
+        # Cost buffer: half-spread + fees + mild adverse selection haircut.
+        net_edge = gross_edge - cost_buffer
+        evaluated.append((threshold, prob_pct, price, gross_edge, net_edge))
+
+        # ── Prob band filter (after calibration) ───────────────────────────
+        in_prob_band = prob_pct >= spec.min_model_prob
+        if spec.max_model_prob > 0 and prob_pct > spec.max_model_prob:
+            in_prob_band = False
 
         # ── Record signal (raw model prob for calibration data) ────────────
-        traded = edge >= edge_floor and prob_pct >= spec.min_model_prob
+        # Journal keeps *gross* edge for research continuity; trade uses net.
+        traded = net_edge >= edge_floor and in_prob_band
         record_signal(
             config.log_dir,
             ticker,
             spec.strategy_name,
             model_prob_pct=raw_prob_pct,
             market_price_cents=price,
-            edge_cents=float(edge),
+            edge_cents=float(gross_edge),
             traded=traded,
             reason=result.reason,
         )
 
-        # ── Build TradeSignal if edge is sufficient ────────────────────────
+        # ── Build TradeSignal if cost-adjusted edge is sufficient ──────────
         if traded:
             count = kelly_count(
-                edge, price,
+                net_edge, price,
                 config.kelly_fraction,
                 config.max_position_usd,
                 config.max_contracts_per_trade,
@@ -258,8 +269,8 @@ def evaluate_markets(
                     count=count,
                     price=price,
                     strategy=spec.strategy_name,
-                    confidence=confidence_fn(edge),
-                    edge_cents=float(edge),
+                    confidence=confidence_fn(net_edge),
+                    edge_cents=float(net_edge),
                     reason=result.reason,
                     model_prob_pct=float(prob_pct),
                 ))
@@ -270,6 +281,7 @@ def evaluate_markets(
         no_signals = _evaluate_no_side(
             markets, spec, model, config, edge_floor, confidence_fn, yes_tickers,
             calibration=cal,
+            cost_buffer=cost_buffer,
         )
         signals.extend(no_signals)
 
@@ -289,18 +301,19 @@ def evaluate_markets(
 
     # ── Log when no signals found ──────────────────────────────────────────
     if evaluated and not signals:
-        best = max(evaluated, key=lambda x: x[3])
+        best = max(evaluated, key=lambda x: x[4])  # best by net edge
         rows = "  ".join(
-            f"{thr}+: P={p}% vs {pr}¢ → {e:+d}¢"
-            for thr, p, pr, e in sorted(evaluated, key=lambda x: x[0] or 0)
+            f"{thr}+: P={p}% vs {pr}¢ → gross {ge:+.0f}¢ net {ne:+.0f}¢"
+            for thr, p, pr, ge, ne in sorted(evaluated, key=lambda x: x[0] or 0)
         )
         log.info(
-            "  ⬜ %s | %s | no edge ≥%d¢  (best: %s→%+d¢) | %s",
+            "  ⬜ %s | %s | no net edge ≥%d¢ (buffer %d¢)  (best net: %s→%+.0f¢) | %s",
             spec.strategy_name,
             spec.player_name or spec.event_ticker,
             edge_floor,
+            cost_buffer,
             f"{best[0]}+" if best[0] is not None else "n/a",
-            best[3],
+            best[4],
             rows,
         )
     elif not evaluated:
@@ -322,6 +335,7 @@ def _evaluate_no_side(
     confidence_fn: Callable[[float], float],
     yes_tickers: Set[str],
     calibration: Optional[CalibrationLayer] = None,
+    cost_buffer: int = 0,
 ) -> List[TradeSignal]:
     """Evaluate NO-side trades for markets where the model says YES is unlikely.
 
@@ -376,8 +390,9 @@ def _evaluate_no_side(
         if model_yes_pct > spec.no_max_model_prob:
             continue
 
-        # NO edge = how much the market overprices YES
-        no_edge = yes_price - model_yes_pct
+        # NO edge = how much the market overprices YES, after cost buffer
+        gross_no_edge = yes_price - model_yes_pct
+        no_edge = gross_no_edge - cost_buffer
         if no_edge < spec.no_min_edge_cents:
             continue
 
@@ -397,7 +412,7 @@ def _evaluate_no_side(
             spec.strategy_name,
             model_prob_pct=model_yes_pct,
             market_price_cents=yes_price,
-            edge_cents=float(no_edge),
+            edge_cents=float(gross_no_edge),
             traded=True,
             reason=no_reason,
         )

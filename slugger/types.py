@@ -301,7 +301,11 @@ class MarketSpec:
         threshold_ceil:     If True, ceil the parsed threshold (for "over 6.5" -> 7).
         min_threshold:      Skip markets with threshold below this value.
         min_model_prob:     Minimum model probability (%) to consider trading YES.
-        min_edge_cents:     Minimum edge in cents to trade (overrides config if higher).
+        max_model_prob:     Maximum model probability (%) to trade YES (0 = no cap).
+                            Used to skip overconfident / longshot bands that historically
+                            mis-calibrate (e.g. pitcher_ks outside 25–55%).
+        min_edge_cents:     Minimum *cost-adjusted* edge in cents to trade
+                            (overrides config if higher).
         max_signals:        Maximum number of YES signals to return (sorted by edge).
                             0 = unlimited.
         confidence_fn:      Compute TradeSignal.confidence from edge_cents.
@@ -319,6 +323,7 @@ class MarketSpec:
     threshold_ceil: bool = False
     min_threshold: int = 0
     min_model_prob: int = 0
+    max_model_prob: int = 0  # 0 = no upper cap
     min_edge_cents: int = 0
     max_signals: int = 0
     confidence_fn: Optional[Callable[[float], float]] = None

@@ -451,9 +451,13 @@ def run(config: Config, game_filter: Optional[str] = None):
 
     log.info("🚀 Starting Slugger bot (v%s)", __import__("slugger").__version__)
     log.info(
-        "Config: dry_run=%s  kelly=%.2f  min_edge=%d¢  poll=%ds%s",
+        "Config: dry_run=%s  kelly=%.2f  min_edge=%d¢  cost_buffer=%d¢  "
+        "max_game_exposure=$%.2f  strategies=%s  poll=%ds%s",
         config.dry_run, config.kelly_fraction,
-        config.min_edge_cents, config.poll_interval_sec,
+        config.min_edge_cents, config.edge_cost_buffer_cents,
+        config.max_exposure_per_game_usd,
+        ",".join(config.enabled_strategies),
+        config.poll_interval_sec,
         f"  game_filter={game_filter!r}" if game_filter else "",
     )
 

@@ -48,7 +48,10 @@ Also set your trading preferences:
 - `USE_DEMO=true` — use Kalshi's demo environment (default)
 - `MAX_POSITION_USD=5` — max per trade
 - `KELLY_FRACTION=0.25` — quarter-Kelly sizing
-- `MIN_EDGE_CENTS=3` — minimum edge to trigger a trade
+- `MIN_EDGE_CENTS=5` — minimum *cost-adjusted* edge to trigger a trade
+- `EDGE_COST_BUFFER_CENTS=5` — haircut for spread/fees before sizing
+- `MAX_EXPOSURE_PER_GAME_USD=10` — dollar cap per game (~2× max position)
+- `ENABLED_STRATEGIES=pitcher_ks,player_hr,player_hits` — Phase 0 allowlist
 
 ### 3. Generate an API key (if you haven't)
 
@@ -87,9 +90,9 @@ python3 main.py run
 ```
 
 ### Use specific strategies
-Edit `ENABLED_STRATEGIES` in `.env`:
+Edit `ENABLED_STRATEGIES` in `.env` (Phase 0 defaults omit weak strategies):
 ```bash
-ENABLED_STRATEGIES=game_winner,pitcher_ks
+ENABLED_STRATEGIES=pitcher_ks,player_hits
 ```
 
 ## CLI Options
