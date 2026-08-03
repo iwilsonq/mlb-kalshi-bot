@@ -4,6 +4,8 @@ Tests exercise the public model functions (expected_hits_lambda,
 expected_hr_lambda) to verify that lambda deflation, adjustment
 capping, and recent-form blending produce calibrated outputs.
 """
+
+import pytest
 from slugger.models import expected_hits_lambda, expected_hr_lambda, poisson_ge
 from slugger.types import BatterProfile, PitcherProfile
 
@@ -225,3 +227,64 @@ class TestHitsRecentFormBlend:
             f"Hot vs cold lambda diff={diff_pct:.1f}%; expected >5% "
             f"(recent form should have meaningful impact)"
         )
+
+
+# ─── Hits are binomial, not Poisson (mlb-kalshi-bot-3gr) ────────────────────
+
+class TestBinomialGe:
+    """Hits in a game are Binomial(AB, avg): bounded trials, one Bernoulli each.
+
+    Poisson is overdispersed at the same mean — too much mass at zero and too
+    much in the tail — so it understated 1+ hit props and overstated 3+/4+.
+    Measured on 7157 real markets: 1+ actual 62.2%, Poisson said 58.5%,
+    binomial 62.5%; 4+ actual 1.2%, Poisson said 2.0%, binomial 0.6%.
+    """
+
+    def test_matches_closed_form_for_integer_trials(self):
+        from slugger.models import binomial_ge
+        # P(>=1 hit) with 4 AB at .270 = 1 - 0.73^4
+        assert binomial_ge(1, 4, 0.270) == pytest.approx(1 - 0.73 ** 4, abs=1e-9)
+        # P(>=4 of 4) = p^4
+        assert binomial_ge(4, 4, 0.270) == pytest.approx(
+            max(0.01, 0.270 ** 4), abs=1e-9
+        )
+
+    def test_fixes_poisson_bias_direction_at_each_threshold(self):
+        from slugger.models import binomial_ge, poisson_ge
+        n, p = 4, 0.270
+        lam = n * p
+        # Poisson understates the chance of at least one hit
+        assert poisson_ge(1, lam) < binomial_ge(1, n, p)
+        # ...and overstates the longshot tail, which is where phantom edge came from
+        assert poisson_ge(3, lam) > binomial_ge(3, n, p)
+        assert poisson_ge(4, lam) > binomial_ge(4, n, p)
+
+    def test_monotone_decreasing_in_threshold(self):
+        from slugger.models import binomial_ge
+        vals = [binomial_ge(t, 4.3, 0.27) for t in (1, 2, 3, 4)]
+        assert vals == sorted(vals, reverse=True)
+
+    def test_monotone_increasing_in_p(self):
+        from slugger.models import binomial_ge
+        vals = [binomial_ge(2, 4.3, p) for p in (0.15, 0.20, 0.25, 0.30, 0.35)]
+        assert vals == sorted(vals)
+
+    def test_fractional_trials_interpolate(self):
+        from slugger.models import binomial_ge
+        lo = binomial_ge(2, 4, 0.27)
+        hi = binomial_ge(2, 5, 0.27)
+        mid = binomial_ge(2, 4.5, 0.27)
+        assert lo < mid < hi
+        assert mid == pytest.approx((lo + hi) / 2, abs=1e-9)
+
+    def test_degenerate_inputs(self):
+        from slugger.models import binomial_ge
+        assert binomial_ge(1, 0, 0.3) == 0.01
+        assert binomial_ge(1, 4, 0.0) == 0.01
+        assert binomial_ge(0, 4, 0.3) == 0.99
+        # Threshold above the trial count is impossible, so floor applies
+        assert binomial_ge(9, 4, 0.3) == 0.01
+
+    def test_clamped_like_poisson_ge(self):
+        from slugger.models import binomial_ge
+        assert 0.01 <= binomial_ge(1, 6, 0.99) <= 0.99

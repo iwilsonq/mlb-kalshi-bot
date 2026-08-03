@@ -152,8 +152,9 @@ _BIN_WIDTH = 5  # must match the value used in CalibrationLayer.fit()
 def backfill_outcomes(
     signals: List[dict],
     game_logs: Optional[Dict[str, List[dict]]] = None,
+    batter_logs: Optional[Dict[str, List[dict]]] = None,
 ) -> Dict[str, List[Tuple[float, int]]]:
-    """Produce (model_prob, outcome) pairs for pitcher_ks signals using MLB game logs.
+    """Produce (model_prob, outcome) pairs from MLB game logs, not settlements.
 
     Instead of relying on Kalshi settlement data, this function matches each
     signal's pitcher + date + threshold against actual K counts from MLB game
@@ -174,8 +175,8 @@ def backfill_outcomes(
                     If None, fetches live from the MLB Stats API.
 
     Returns:
-        Dict mapping strategy name → list of (model_prob_pct, outcome) pairs.
-        Currently only produces data for "pitcher_ks".
+        Dict mapping strategy name → list of (model_prob_pct, outcome) pairs,
+        for "pitcher_ks" and "player_hits".
     """
     if game_logs is None:
         game_logs = _fetch_all_game_logs(signals)
@@ -226,7 +227,19 @@ def backfill_outcomes(
                 seen_game_bin[key] = (prob, outcome)
 
     pairs = [(prob, outcome) for (prob, outcome) in seen_game_bin.values()]
-    return {"pitcher_ks": pairs} if pairs else {}
+    out: Dict[str, List[Tuple[float, int]]] = {}
+    if pairs:
+        out["pitcher_ks"] = pairs
+
+    # player_hits gets the same treatment. Without it the curve falls back to
+    # Kalshi settlements, which only exist for markets the bot traded — a sample
+    # selected for overprediction. See hits_outcomes_from_game_logs.
+    if batter_logs is None:
+        batter_logs = _fetch_all_batter_game_logs(signals)
+    hits_pairs = hits_outcomes_from_game_logs(signals, batter_logs or {})
+    if hits_pairs:
+        out["player_hits"] = hits_pairs
+    return out
 
 
 def _lookup_ks(
@@ -364,6 +377,143 @@ def _fetch_all_game_logs(
         len(game_logs), len(pitcher_names),
     )
     return game_logs
+
+
+def _parse_hits_signal(sig: dict) -> Optional[Tuple[str, str, int]]:
+    """Extract (batter_name, date, threshold) from a player_hits signal.
+
+    The batter's full name is the leading field of the reason string, which is
+    more reliable than decoding it from the ticker's team+name+jersey mangling.
+    """
+    if sig.get("strategy") != "player_hits":
+        return None
+    ticker = sig.get("ticker", "") or ""
+    m = re.search(r"-(\d+)$", ticker)
+    if not m:
+        return None
+    reason = sig.get("reason", "") or ""
+    name = reason.split("  ")[0].strip()
+    date = (sig.get("date") or "")[:10]
+    if not name or not date:
+        return None
+    return name, date, int(m.group(1))
+
+
+def _fetch_all_batter_game_logs(signals: List[dict]) -> Dict[str, List[dict]]:
+    """Per-game hits for every batter referenced by a player_hits signal.
+
+    Returns batter full name → [{"date", "hits", "ab"}, ...].
+    """
+    names = set()
+    for sig in signals:
+        parsed = _parse_hits_signal(sig)
+        if parsed:
+            names.add(parsed[0])
+    if not names:
+        return {}
+
+    import requests
+    import statsapi
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import date as _date
+
+    MLB_API = "https://statsapi.mlb.com/api/v1"
+    season = _date.today().year
+    log.info("Backfill: fetching hitting game logs for %d batters", len(names))
+
+    def _fetch(name: str) -> Tuple[str, List[dict]]:
+        try:
+            results = statsapi.lookup_player(name)
+        except Exception as exc:
+            log.debug("Batter lookup failed for %s: %s", name, exc)
+            return name, []
+        if not results:
+            return name, []
+        try:
+            url = (
+                f"{MLB_API}/people/{results[0]['id']}/stats"
+                f"?stats=gameLog&group=hitting&season={season}"
+            )
+            resp = requests.get(url, timeout=10)
+            splits = resp.json().get("stats", [{}])[0].get("splits", [])
+        except Exception as exc:
+            log.debug("Batter game log fetch failed for %s: %s", name, exc)
+            return name, []
+        games = []
+        for g in splits:
+            stat = g.get("stat", {})
+            d = (g.get("date") or "")[:10]
+            if not d:
+                continue
+            games.append({
+                "date": d,
+                "hits": int(stat.get("hits", 0) or 0),
+                "ab": int(stat.get("atBats", 0) or 0),
+            })
+        return name, games
+
+    out: Dict[str, List[dict]] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_fetch, n) for n in sorted(names)]
+        for fut in as_completed(futures):
+            name, games = fut.result()
+            if games:
+                out[name] = games
+    log.info("Backfill: fetched hitting logs for %d/%d batters", len(out), len(names))
+    return out
+
+
+def hits_outcomes_from_game_logs(
+    signals: List[dict],
+    batter_logs: Dict[str, List[dict]],
+) -> List[Tuple[float, int]]:
+    """(model_prob, outcome) pairs for player_hits from every LISTED market.
+
+    Kalshi settlements only cover markets the bot chose to trade, and it chose
+    them because they showed the largest apparent edge — i.e. the ones the model
+    most overestimated. Fitting calibration on that subsample taught the curve
+    that the model overpredicts far more than it does, and applying that
+    correction to the whole population made predictions worse than no
+    calibration at all: on 5068 walk-forward rows, Brier was 0.18679 with the
+    traded-only curve vs 0.17746 raw. Reconstructing outcomes from game logs
+    covers every listed market and removes the selection.
+
+    Dedup mirrors the pitcher_ks path: by ticker, then by (batter, date, bin) so
+    a single 4-hit game cannot stuff one probability bin with wins.
+    """
+    hits_by: Dict[Tuple[str, str], int] = {}
+    for name, games in batter_logs.items():
+        for g in games:
+            d = (g.get("date") or "")[:10]
+            if d:
+                hits_by[(name.lower(), d)] = int(g.get("hits", 0) or 0)
+
+    seen_ticker: set = set()
+    candidates: List[Tuple[str, str, float, int]] = []
+    for sig in signals:
+        parsed = _parse_hits_signal(sig)
+        if parsed is None:
+            continue
+        ticker = sig.get("ticker", "")
+        if ticker in seen_ticker:
+            continue
+        seen_ticker.add(ticker)
+        name, date, threshold = parsed
+        actual = hits_by.get((name.lower(), date))
+        if actual is None:
+            continue
+        prob = sig.get("model_prob_pct")
+        if prob is None:
+            continue
+        candidates.append((name, date, float(prob), 1 if actual >= threshold else 0))
+
+    seen_bin: Dict[Tuple[str, str, float], Tuple[float, int]] = {}
+    for name, date, prob, outcome in candidates:
+        bin_mid = int(prob // _BIN_WIDTH) * _BIN_WIDTH + _BIN_WIDTH / 2
+        key = (name, date, bin_mid)
+        if key not in seen_bin or abs(prob - bin_mid) < abs(seen_bin[key][0] - bin_mid):
+            seen_bin[key] = (prob, outcome)
+    return list(seen_bin.values())
 
 
 def parse_team_hitting_splits(splits: List[dict]) -> List[dict]:

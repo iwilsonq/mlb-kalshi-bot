@@ -2,8 +2,8 @@
 import pytest
 
 from slugger.calibration import (
-    CalibrationLayer, _interpolate, _parse_ks_signal, backfill_outcomes,
-    parse_team_hitting_splits,
+    CalibrationLayer, _interpolate, _parse_hits_signal, _parse_ks_signal,
+    backfill_outcomes, hits_outcomes_from_game_logs, parse_team_hitting_splits,
 )
 
 
@@ -557,3 +557,87 @@ class TestWalkForwardNoLeakage:
         assert cal.lag_days == 1
         assert cal.as_of == "2026-05-01"
         assert cal.sample_counts.get("s2", 0) == 40
+
+
+class TestHitsBackfillRemovesSelectionBias:
+    """player_hits calibration must be fit from every LISTED market, not settlements.
+
+    Kalshi settlements only exist for markets the bot traded, and it traded the
+    ones showing the largest apparent edge — i.e. the ones it most overestimated.
+    Fitting on that subsample taught the curve the model overpredicts far more
+    than it does; applying it to the whole population was worse than no
+    calibration at all (walk-forward Brier 0.18679 vs 0.17746 raw).
+    """
+
+    def _sig(self, ticker, name, date, prob, reason_extra="  4H/20AB(vsR)"):
+        return {
+            "type": "signal", "strategy": "player_hits", "ticker": ticker,
+            "date": date, "model_prob_pct": prob,
+            "reason": f"{name}{reason_extra}  λ=1.10  P(2+H)={prob}%",
+        }
+
+    def test_parses_name_date_threshold(self):
+        sig = self._sig("KXMLBHIT-26MAY191610ATLMIA-MIAXEDWARDS9-2",
+                        "Xavier Edwards", "2026-05-19", 22)
+        assert _parse_hits_signal(sig) == ("Xavier Edwards", "2026-05-19", 2)
+
+    def test_rejects_other_strategies_and_malformed(self):
+        assert _parse_hits_signal({"strategy": "pitcher_ks", "ticker": "X-7"}) is None
+        assert _parse_hits_signal(
+            {"strategy": "player_hits", "ticker": "no-threshold-suffix"}
+        ) is None
+        assert _parse_hits_signal(
+            {"strategy": "player_hits", "ticker": "X-2", "reason": "", "date": "2026-05-19"}
+        ) is None
+
+    def test_outcomes_come_from_game_logs_not_settlements(self):
+        signals = [
+            self._sig("T-A-1", "Ann Batter", "2026-05-01", 60),
+            self._sig("T-B-3", "Ann Batter", "2026-05-02", 8),
+        ]
+        logs = {"Ann Batter": [
+            {"date": "2026-05-01", "hits": 2, "ab": 4},   # 1+ -> win
+            {"date": "2026-05-02", "hits": 1, "ab": 4},   # 3+ -> loss
+        ]}
+        pairs = hits_outcomes_from_game_logs(signals, logs)
+        assert sorted(pairs) == [(8.0, 0), (60.0, 1)]
+
+    def test_untraded_markets_are_included(self):
+        """The whole point: a market with no settlement still yields an outcome."""
+        signals = [self._sig("T-C-2", "Ann Batter", "2026-05-03", 30)]
+        logs = {"Ann Batter": [{"date": "2026-05-03", "hits": 3, "ab": 5}]}
+        # No settlements dict is consulted at all
+        assert hits_outcomes_from_game_logs(signals, logs) == [(30.0, 1)]
+
+    def test_deduplicates_poll_cycle_repeats_by_ticker(self):
+        signals = [self._sig("T-D-2", "Ann Batter", "2026-05-04", 30) for _ in range(50)]
+        logs = {"Ann Batter": [{"date": "2026-05-04", "hits": 2, "ab": 4}]}
+        assert len(hits_outcomes_from_game_logs(signals, logs)) == 1
+
+    def test_deduplicates_same_batter_day_within_a_bin(self):
+        """One 4-hit game must not stuff a probability bin with wins."""
+        signals = [
+            self._sig("T-E-1", "Ann Batter", "2026-05-05", 61),
+            self._sig("T-E-2", "Ann Batter", "2026-05-05", 62),
+            self._sig("T-E-3", "Ann Batter", "2026-05-05", 63),
+        ]
+        logs = {"Ann Batter": [{"date": "2026-05-05", "hits": 4, "ab": 4}]}
+        pairs = hits_outcomes_from_game_logs(signals, logs)
+        assert len(pairs) == 1, f"expected one row per (batter, day, bin), got {pairs}"
+
+    def test_skips_batters_without_a_game_log(self):
+        signals = [self._sig("T-F-2", "Ghost Player", "2026-05-06", 30)]
+        assert hits_outcomes_from_game_logs(signals, {}) == []
+
+    def test_backfill_outcomes_covers_player_hits(self):
+        signals = [
+            self._sig("T-G-1", "Ann Batter", "2026-05-07", 60),
+            self._sig("T-G-3", "Ann Batter", "2026-05-08", 7),
+        ]
+        logs = {"Ann Batter": [
+            {"date": "2026-05-07", "hits": 1, "ab": 4},
+            {"date": "2026-05-08", "hits": 0, "ab": 4},
+        ]}
+        out = backfill_outcomes(signals, game_logs={}, batter_logs=logs)
+        assert "player_hits" in out
+        assert sorted(out["player_hits"]) == [(7.0, 0), (60.0, 1)]

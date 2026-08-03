@@ -16,7 +16,7 @@ from slugger.models import (
     HITS_LAMBDA_DEFLATOR, HITS_MIN_PITCHER_IP,
     HIT_PARK_FACTORS,
     LEAGUE_AVG_WHIP, MAX_PITCHER_WHIP_ADJ,
-    expected_ab, expected_ks, poisson_ge, shrink_avg,
+    binomial_ge, expected_ab, expected_ks, poisson_ge, shrink_avg,
 )
 from slugger.signal_pipeline import evaluate_markets
 from slugger.tickers import kalshi_team, ks_event_ticker, hit_event_ticker
@@ -222,13 +222,16 @@ def strategy_player_hits(
     else:
         blended_avg = eff_avg
 
-    lam = blended_avg * ab_est
+    # Every adjustment below is a statement about the chance a given at-bat
+    # becomes a hit, not about how many at-bats the batter gets, so they scale
+    # the per-AB probability. ab_est stays the binomial trial count.
+    hit_p = blended_avg
 
     pitcher_adj = 1.0
     if opp_whip > 0 and opp_ip >= HITS_MIN_PITCHER_IP:
         raw_whip = opp_whip / LEAGUE_AVG_WHIP
         pitcher_adj = min(1.0 + 0.5 * (raw_whip - 1.0), MAX_PITCHER_WHIP_ADJ)
-        lam *= pitcher_adj
+        hit_p *= pitcher_adj
 
     # Hard hit rate adjustment (dampened)
     _LEAGUE_AVG_HHR = 0.370
@@ -236,16 +239,21 @@ def strategy_player_hits(
     if batter_profile.hard_hit_rate > 0:
         raw_hhr = batter_profile.hard_hit_rate / _LEAGUE_AVG_HHR
         hhr_adj = 1.0 + 0.25 * (raw_hhr - 1.0)
-        lam *= hhr_adj
+        hit_p *= hhr_adj
 
     home_kalshi = kalshi_team(game_info.home_abbrev)
     park_factor = HIT_PARK_FACTORS.get(
         home_kalshi, HIT_PARK_FACTORS.get(game_info.home_abbrev.upper(), 1.0),
     )
-    lam *= park_factor
+    hit_p *= park_factor
 
-    # Calibration deflation — model over-predicts hit probability
-    lam *= HITS_LAMBDA_DEFLATOR
+    # Calibration deflation. Retained for continuity with the fitted calibration
+    # curve, which was built from signals generated with it applied — dropping it
+    # here would double-correct until the curve is refit. Most of what it was
+    # compensating for was the Poisson tail, now gone; re-derive it next.
+    hit_p *= HITS_LAMBDA_DEFLATOR
+    hit_p = min(max(hit_p, 0.0), 1.0)
+    lam = hit_p * ab_est
 
     log.debug(
         "%s (#%d)  split=%s %dH/%dAB  eff_avg=%.3f  xba=%.3f  ab_est=%.1f"
@@ -268,13 +276,14 @@ def strategy_player_hits(
     def hits_model(title: str, threshold: Optional[int], price: int) -> Optional[ModelResult]:
         if threshold is None:
             return None
-        prob_pct = round(poisson_ge(threshold, lam) * 100)
+        prob_pct = round(binomial_ge(threshold, ab_est, hit_p) * 100)
         reason = (
             f"{batter_profile.name}"
             f"  {split_h}H/{split_ab}AB({platoon_note})"
             f"  eff_avg={eff_avg:.3f}"
             f"  xba={batter_profile.xba:.3f}"
             f"  park={park_factor:.2f}"
+            f"  p={hit_p:.3f}×{ab_est:.1f}AB"
             f"  λ={lam:.2f}"
             f"  P({threshold}+H)={prob_pct}%"
             f"{pitcher_note}"

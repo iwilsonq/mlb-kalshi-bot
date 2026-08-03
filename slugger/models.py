@@ -197,6 +197,52 @@ def poisson_ge(n: int, lam: float) -> float:
     return max(0.01, min(0.99, 1.0 - cumulative))
 
 
+def binomial_ge(n: int, trials: float, p: float) -> float:
+    """P(X >= n) for X ~ Binomial(trials, p), with fractional trials supported.
+
+    Hits in a game are binomial, not Poisson: a batter gets a bounded number of
+    at-bats and each is one Bernoulli trial. Poisson is overdispersed relative to
+    binomial at the same mean — too much mass at zero *and* too much in the tail —
+    so using it for hit props biased every threshold in a predictable direction.
+    Measured against 7157 real markets with recorded asks and actual outcomes:
+
+      thr   Poisson  Binomial  market   ACTUAL
+       1+     58.5%     62.5%   62.6c    62.2%
+       2+     23.3%     22.9%   24.6c    24.9%
+       3+      7.1%      4.9%    5.5c     5.7%
+       4+      2.0%      0.6%    2.1c     1.2%
+
+    Poisson understated 1+ by 4 points and overstated 3+/4+ by 1.3-1.7x. The
+    overstatement is what generated phantom edge on longshot props, and is what
+    HITS_LAMBDA_DEFLATOR was bolted on to hide.
+
+    `trials` is fractional because expected_ab returns a lineup-weighted average;
+    the result blends the two neighbouring integer trial counts.
+
+    Clamped to [0.01, 0.99] to match poisson_ge and avoid degenerate prices.
+    """
+    if trials <= 0 or p <= 0:
+        return 0.01
+    p = min(p, 1.0)
+    if n <= 0:
+        return 0.99
+
+    def _exact(k_trials: int) -> float:
+        if k_trials <= 0:
+            return 0.0
+        if n > k_trials:
+            return 0.0
+        return sum(
+            math.comb(k_trials, k) * (p ** k) * ((1.0 - p) ** (k_trials - k))
+            for k in range(n, k_trials + 1)
+        )
+
+    lo = int(math.floor(trials))
+    frac = trials - lo
+    value = (1.0 - frac) * _exact(lo) + frac * _exact(lo + 1)
+    return max(0.01, min(0.99, value))
+
+
 def expected_ab(batting_order: int) -> float:
     """Return expected at-bats per game adjusted for lineup position.
 
