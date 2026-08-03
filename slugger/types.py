@@ -189,12 +189,14 @@ class OrderResult:
     action: str           # "buy" or "sell"
     side: str             # "yes" or "no"
     count: int
-    price: int            # in cents (1-99)
+    price: int            # limit price in cents (1-99)
     status: str
     created_at: str
     client_order_id: str = ""
     error: str = ""
     detail: Dict[str, Any] = field(default_factory=dict)
+    fill_count: int = 0           # contracts filled (if known)
+    fill_price_cents: int = 0     # avg fill price in cents (0 = unknown)
 
 
 @runtime_checkable
@@ -260,9 +262,17 @@ class TradeSignal:
     price: int            # limit price in cents (1-99)
     strategy: str         # e.g. "game_winner"
     confidence: float     # 0.0-1.0
-    edge_cents: float     # expected edge in cents
+    edge_cents: float     # cost-adjusted (net) edge in cents
     reason: str = ""      # human-readable rationale
     model_prob_pct: float = 0.0  # calibrated model probability (0-100)
+    # Microstructure / measurement (Phase 1)
+    raw_model_prob_pct: float = 0.0
+    gross_edge_cents: float = 0.0
+    cost_buffer_cents: int = 0
+    bid_cents: int = 0
+    ask_cents: int = 0
+    mid_cents: float = 0.0
+    spread_cents: int = 0
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

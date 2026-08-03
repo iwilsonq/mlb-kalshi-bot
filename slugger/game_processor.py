@@ -19,6 +19,7 @@ import requests
 
 from slugger.calibration import CalibrationLayer
 from slugger.config import Config
+from slugger.kalshi_client import market_quotes
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
 from slugger.signal_pipeline import load_calibration
 from slugger.strategies import STRATEGY_PIPELINE
@@ -260,11 +261,17 @@ def execute_signals(
                     yes_price=signal.price,
                 )
             if result.status in ("accepted", "executed", "resting", "partially_filled"):
-                cost_usd = signal.count * signal.price / 100
+                fill_px = getattr(result, "fill_price_cents", 0) or 0
+                fill_n = getattr(result, "fill_count", 0) or 0
+                # Cost uses fill price when known, else limit
+                px_for_cost = fill_px if fill_px > 0 else signal.price
+                cost_usd = signal.count * px_for_cost / 100
                 status_icon = "✅" if result.status == "executed" else "🕐"
                 log.info(
-                    "     %s Order placed: %s (status: %s) cost=$%.2f",
+                    "     %s Order placed: %s (status: %s) cost=$%.2f"
+                    " fill=%s¢ n=%s",
                     status_icon, result.order_id, result.status, cost_usd,
+                    fill_px or "—", fill_n or "—",
                 )
                 held_tickers.add(signal.ticker)
                 placed_tickers.add(signal.ticker)
@@ -281,6 +288,18 @@ def execute_signals(
                     edge_cents=signal.edge_cents,
                     reason=signal.reason,
                     order_id=result.order_id,
+                    raw_model_prob_pct=signal.raw_model_prob_pct,
+                    model_prob_pct=signal.model_prob_pct,
+                    gross_edge_cents=signal.gross_edge_cents,
+                    cost_buffer_cents=signal.cost_buffer_cents,
+                    bid_cents=signal.bid_cents,
+                    ask_cents=signal.ask_cents,
+                    mid_cents=signal.mid_cents,
+                    spread_cents=signal.spread_cents,
+                    fill_price_cents=fill_px,
+                    fill_count=fill_n,
+                    fill_status=result.status,
+                    filled_at=result.created_at or "",
                 )
             else:
                 log.warning(
@@ -419,6 +438,12 @@ def settle_pending(
         fee         = float(s.get("fee_cost", 0))
         settled_at  = s.get("settled_time", "")
 
+        settlement_price = None
+        if result == "yes":
+            settlement_price = 100
+        elif result == "no":
+            settlement_price = 0
+
         journal.record_settlement(
             log_dir=config.log_dir,
             ticker=ticker,
@@ -427,6 +452,7 @@ def settle_pending(
             yes_cost_usd=yes_cost,
             fee_usd=fee,
             settled_at=settled_at,
+            settlement_price_cents=settlement_price,
         )
         pnl = revenue_usd - yes_cost - fee
         if circuit is not None:
@@ -435,6 +461,115 @@ def settle_pending(
         found += 1
 
     return found
+
+
+# ─── CLV snapshots ────────────────────────────────────────────────────────────
+
+CLV_MIN_HOURS = 1.0
+CLV_MAX_HOURS = 48.0  # stop trying after 2 days
+
+
+def snapshot_pending_clv(
+    client: MarketClient,
+    config: Config,
+    min_hours: float = CLV_MIN_HOURS,
+    max_hours: float = CLV_MAX_HOURS,
+) -> int:
+    """Fetch mid/bid/ask for trades that are ≥ min_hours old and lack a CLV row.
+
+    Returns number of new CLV records written.  Safe to call every bot loop.
+    Requires client.get_market(ticker) when available.
+    """
+    get_market = getattr(client, "get_market", None)
+    if not callable(get_market):
+        return 0
+
+    records = journal.load_journal(config.log_dir)
+    if not records:
+        return 0
+
+    trades = [r for r in records if r.get("type") == "trade"]
+    clv_done = {r["ticker"] for r in records if r.get("type") == "clv"}
+    settled = {r["ticker"] for r in records if r.get("type") == "settlement"}
+
+    now = datetime.now(timezone.utc)
+    written = 0
+
+    for trade in trades:
+        ticker = trade.get("ticker", "")
+        if not ticker or ticker in clv_done:
+            continue
+        # Still useful after settlement for research, but prefer pre-settle CLV
+        placed_raw = trade.get("placed_at") or ""
+        if not placed_raw:
+            continue
+        try:
+            placed = datetime.fromisoformat(placed_raw.replace("Z", "+00:00"))
+            if placed.tzinfo is None:
+                placed = placed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        hours = (now - placed).total_seconds() / 3600.0
+        if hours < min_hours:
+            continue
+        if hours > max_hours and ticker in settled:
+            continue  # give up on ancient settled trades without CLV
+
+        try:
+            market = get_market(ticker)
+        except Exception as exc:
+            log.debug("CLV: get_market(%s) failed: %s", ticker, exc)
+            continue
+        entry_mid = float(trade.get("mid_cents") or 0)
+        if entry_mid <= 0:
+            entry_ask = float(trade.get("ask_cents") or trade.get("price_cents") or 0)
+            entry_bid = float(trade.get("bid_cents") or 0)
+            entry_mid = (entry_bid + entry_ask) / 2.0 if entry_bid and entry_ask else entry_ask
+
+        if not market:
+            # Market gone (likely settled). After max_hours, still emit a CLV
+            # stub so we do not poll forever; mid=0 marks unavailable.
+            if hours <= max_hours:
+                continue
+            journal.record_clv(
+                log_dir=config.log_dir,
+                ticker=ticker,
+                strategy=trade.get("strategy", ""),
+                placed_at=placed_raw,
+                bid_cents=0,
+                ask_cents=0,
+                mid_cents=0.0,
+                spread_cents=0,
+                entry_mid_cents=entry_mid,
+                hours_after_entry=hours,
+            )
+            written += 1
+            clv_done.add(ticker)
+            continue
+
+        q = market_quotes(market)
+        if q["mid_cents"] <= 0 and q["ask_cents"] <= 0:
+            continue
+
+        journal.record_clv(
+            log_dir=config.log_dir,
+            ticker=ticker,
+            strategy=trade.get("strategy", ""),
+            placed_at=placed_raw,
+            bid_cents=int(q["bid_cents"]),
+            ask_cents=int(q["ask_cents"]),
+            mid_cents=float(q["mid_cents"] or q["ask_cents"]),
+            spread_cents=int(q["spread_cents"]),
+            entry_mid_cents=entry_mid,
+            hours_after_entry=hours,
+        )
+        written += 1
+        clv_done.add(ticker)
+
+    if written:
+        log.info("📈 Recorded %d CLV snapshot(s)", written)
+    return written
 
 
 # ─── Main bot loop ────────────────────────────────────────────────────────────
@@ -476,6 +611,12 @@ def run(config: Config, game_filter: Optional[str] = None):
         if circuit.is_tripped():
             log.error("⚡ Circuit breaker tripped — halting bot.")
             break
+
+        # ── CLV snapshots for open trades ≥1h old ─────────────────────────
+        try:
+            snapshot_pending_clv(client, config)
+        except Exception as exc:
+            log.debug("CLV snapshot pass failed: %s", exc)
 
         # ── Fetch live balance ──────────────────────────────────────────────
         try:

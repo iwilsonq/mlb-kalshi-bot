@@ -329,6 +329,7 @@ class KalshiClient:
             filled      = float(fill_count) if fill_count else 0.0
             status      = "executed" if float(remaining) == 0 else (
                           "resting"  if filled == 0 else "partially_filled")
+            fill_px = fill_price_cents_from_order(result, side, price_cents)
             return OrderResult(
                 order_id=order_id,
                 ticker=ticker,
@@ -337,9 +338,11 @@ class KalshiClient:
                 count=count,
                 price=price_cents,
                 status=status,
-                created_at="",
+                created_at=result.get("created_time", result.get("created_at", "")),
                 client_order_id=result.get("client_order_id", client_order_id),
                 detail=result,
+                fill_count=int(filled) if filled else 0,
+                fill_price_cents=fill_px or 0,
             )
         except requests.HTTPError as e:
             error_body = {}
@@ -678,6 +681,77 @@ class KalshiClient:
 
 # ─── Market price extraction ──────────────────────────────────────────────────
 
+def _price_field_to_cents(value) -> int:
+    """Convert a Kalshi price field to integer cents.
+
+    Accepts dollar strings ("0.35"), cents ints, or nested {"price": N}.
+    Returns 0 if unparseable.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, dict):
+        return _price_field_to_cents(value.get("price", value.get("dollars")))
+    if isinstance(value, str):
+        try:
+            f = float(value)
+        except (ValueError, TypeError):
+            return 0
+        # Dollar strings are typically 0–1; integers as strings are cents
+        if "." in value or f <= 1.0:
+            return int(round(f * 100))
+        return int(round(f))
+    if isinstance(value, float):
+        if 0.0 <= value <= 1.0:
+            return int(round(value * 100))
+        return int(round(value))
+    if isinstance(value, int):
+        return value
+    return 0
+
+
+def market_quotes(market: dict) -> Dict[str, float]:
+    """Extract YES bid/ask/mid/spread (cents) from a Kalshi market dict.
+
+    Returns dict with keys: bid_cents, ask_cents, mid_cents, spread_cents.
+    Missing sides are 0; mid is 0 if either side is missing.
+    """
+    ask = 0
+    if "yes_ask_dollars" in market:
+        ask = _price_field_to_cents(market.get("yes_ask_dollars"))
+    if ask <= 0:
+        ask = _price_field_to_cents(market.get("yes_ask"))
+    if ask <= 0:
+        ask = _price_field_to_cents(market.get("ask"))
+
+    bid = 0
+    if "yes_bid_dollars" in market:
+        bid = _price_field_to_cents(market.get("yes_bid_dollars"))
+    if bid <= 0:
+        bid = _price_field_to_cents(market.get("yes_bid"))
+    if bid <= 0:
+        bid = _price_field_to_cents(market.get("bid"))
+
+    if bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+        spread = max(0, ask - bid)
+    elif ask > 0:
+        mid = float(ask)
+        spread = 0
+    elif bid > 0:
+        mid = float(bid)
+        spread = 0
+    else:
+        mid = 0.0
+        spread = 0
+
+    return {
+        "bid_cents": int(bid),
+        "ask_cents": int(ask),
+        "mid_cents": float(mid),
+        "spread_cents": int(spread),
+    }
+
+
 def market_price(market: dict) -> int:
     """Extract YES ask price in cents from a Kalshi market dict.
 
@@ -685,18 +759,48 @@ def market_price(market: dict) -> int:
       - Flat dollar string: {"yes_ask_dollars": "0.35"} → 35
       - Nested dict:        {"ask": {"price": 35}}      → 35
       - Numeric:            {"ask": 35}                  → 35
+
+    Prefer market_quotes() when bid/mid/spread are needed for measurement.
     """
-    if "yes_ask_dollars" in market:
-        try:
-            return int(float(market["yes_ask_dollars"]) * 100)
-        except (ValueError, TypeError):
-            pass
-    ask = market.get("ask")
-    if isinstance(ask, dict):
-        return int(ask.get("price", 0))
-    if isinstance(ask, (int, float)):
-        return int(ask)
-    return 0
+    q = market_quotes(market)
+    return int(q["ask_cents"]) if q["ask_cents"] > 0 else 0
+
+
+def fill_price_cents_from_order(detail: dict, side: str, limit_cents: int) -> Optional[int]:
+    """Best-effort average fill price (cents) from a Kalshi order response detail.
+
+    Falls back to None if the API did not report a fill price (e.g. resting).
+    """
+    if not detail:
+        return None
+    for key in (
+        "avg_price", "average_fill_price", "yes_price", "no_price",
+        "fill_price", "price",
+    ):
+        if key not in detail:
+            continue
+        raw = detail[key]
+        # Dollar strings like "0.42"
+        if isinstance(raw, str) and "." in raw:
+            cents = _price_field_to_cents(raw)
+            if 1 <= cents <= 99:
+                return cents
+        cents = _price_field_to_cents(raw)
+        if 1 <= cents <= 99:
+            return cents
+    # Nested fill objects
+    fills = detail.get("fills") or detail.get("fill")
+    if isinstance(fills, list) and fills:
+        prices = []
+        for f in fills:
+            if not isinstance(f, dict):
+                continue
+            p = fill_price_cents_from_order(f, side, limit_cents)
+            if p is not None:
+                prices.append(p)
+        if prices:
+            return int(round(sum(prices) / len(prices)))
+    return None
 
 
 # ─── Test adapter ─────────────────────────────────────────────────────────────
@@ -771,3 +875,11 @@ class FixtureMarketClient:
         if ticker:
             return [s for s in self._settlements if s.get("ticker") == ticker]
         return list(self._settlements[:limit])
+
+    def get_market(self, ticker: str) -> Optional[Dict]:
+        """Lookup a market by ticker across all event buckets."""
+        for markets in self._markets.values():
+            for m in markets:
+                if m.get("ticker") == ticker:
+                    return m
+        return None

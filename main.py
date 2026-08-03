@@ -17,11 +17,10 @@ import sys
 from slugger.config import Config
 from slugger.mlb_data import get_todays_games
 from slugger.game_processor import (
-    CircuitBreaker,
     game_markets,
-    process_game,
     run as run_bot,
     settle_pending,
+    snapshot_pending_clv,
 )
 import slugger.journal as journal
 
@@ -93,7 +92,7 @@ def cmd_run(config: Config, game_filter=None):
 
 
 def cmd_settle(config: Config):
-    """Manually fetch and record settlements for all unsettled journal trades."""
+    """Manually fetch settlements and CLV snapshots for journal trades."""
     records = journal.load_journal(config.log_dir)
     if not records:
         log.info("Journal is empty — nothing to settle.")
@@ -103,12 +102,19 @@ def cmd_settle(config: Config):
     settled_tickers = {r["ticker"] for r in records if r.get("type") == "settlement"}
     pending         = trade_tickers - settled_tickers
 
+    client = config.create_kalshi_client()
+    try:
+        clv_n = snapshot_pending_clv(client, config)
+        if clv_n:
+            log.info("Recorded %d CLV snapshot(s).", clv_n)
+    except Exception as exc:
+        log.warning("CLV snapshot pass failed: %s", exc)
+
     if not pending:
         log.info("All %d trade(s) already settled.", len(trade_tickers))
         return
 
     log.info("Checking %d unsettled ticker(s)...", len(pending))
-    client = config.create_kalshi_client()
     found = settle_pending(client, config)
     log.info("Recorded %d new settlement(s). Run 'stats' to see updated P&L.", found)
 

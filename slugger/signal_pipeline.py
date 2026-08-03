@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Set
 from slugger.calibration import CalibrationLayer
 from slugger.config import Config
 from slugger.journal import record_signal
-from slugger.kalshi_client import market_price
+from slugger.kalshi_client import market_price, market_quotes
 from slugger.sizing import kelly_count
 from slugger.types import MarketClient, MarketSpec, ModelFn, ModelResult, TradeSignal
 
@@ -197,10 +197,14 @@ def evaluate_markets(
             if not ticker.upper().endswith(f"-{spec.ticker_suffix.upper()}"):
                 continue
 
-        # ── Price validation ───────────────────────────────────────────────
-        price = market_price(m)
+        # ── Price / microstructure ─────────────────────────────────────────
+        quotes = market_quotes(m)
+        price = int(quotes["ask_cents"]) or market_price(m)
         if price <= 0 or price >= 100:
             continue
+        bid = int(quotes["bid_cents"])
+        mid = float(quotes["mid_cents"])
+        spread = int(quotes["spread_cents"])
 
         # ── Parse threshold ────────────────────────────────────────────────
         threshold: Optional[int] = None
@@ -251,6 +255,14 @@ def evaluate_markets(
             edge_cents=float(gross_edge),
             traded=traded,
             reason=result.reason,
+            calibrated_prob_pct=float(prob_pct),
+            bid_cents=bid,
+            ask_cents=price,
+            mid_cents=mid,
+            spread_cents=spread,
+            cost_buffer_cents=cost_buffer,
+            gross_edge_cents=float(gross_edge),
+            net_edge_cents=float(net_edge),
         )
 
         # ── Build TradeSignal if cost-adjusted edge is sufficient ──────────
@@ -273,6 +285,13 @@ def evaluate_markets(
                     edge_cents=float(net_edge),
                     reason=result.reason,
                     model_prob_pct=float(prob_pct),
+                    raw_model_prob_pct=float(raw_prob_pct),
+                    gross_edge_cents=float(gross_edge),
+                    cost_buffer_cents=cost_buffer,
+                    bid_cents=bid,
+                    ask_cents=price,
+                    mid_cents=mid,
+                    spread_cents=spread,
                 ))
 
     # ── NO-side evaluation (opt-in) ────────────────────────────────────────
@@ -373,9 +392,13 @@ def _evaluate_no_side(
             if threshold is None or threshold < spec.min_threshold:
                 continue
 
-        yes_price = market_price(m)
+        quotes = market_quotes(m)
+        yes_price = int(quotes["ask_cents"]) or market_price(m)
         if yes_price <= 0 or yes_price >= 100:
             continue
+        bid = int(quotes["bid_cents"])
+        mid = float(quotes["mid_cents"])
+        spread = int(quotes["spread_cents"])
 
         # Get model's YES probability
         result = model(title, threshold, yes_price)
@@ -410,11 +433,19 @@ def _evaluate_no_side(
             config.log_dir,
             ticker,
             spec.strategy_name,
-            model_prob_pct=model_yes_pct,
+            model_prob_pct=raw_yes_pct,
             market_price_cents=yes_price,
             edge_cents=float(gross_no_edge),
             traded=True,
             reason=no_reason,
+            calibrated_prob_pct=float(model_yes_pct),
+            bid_cents=bid,
+            ask_cents=yes_price,
+            mid_cents=mid,
+            spread_cents=spread,
+            cost_buffer_cents=cost_buffer,
+            gross_edge_cents=float(gross_no_edge),
+            net_edge_cents=float(no_edge),
         )
 
         count = kelly_count(
@@ -435,6 +466,13 @@ def _evaluate_no_side(
                 edge_cents=float(no_edge),
                 reason=no_reason,
                 model_prob_pct=float(100 - model_yes_pct),
+                raw_model_prob_pct=float(100 - raw_yes_pct),
+                gross_edge_cents=float(gross_no_edge),
+                cost_buffer_cents=cost_buffer,
+                bid_cents=bid,
+                ask_cents=yes_price,
+                mid_cents=mid,
+                spread_cents=spread,
             ))
 
     return no_signals
