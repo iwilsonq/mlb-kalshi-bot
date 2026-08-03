@@ -490,30 +490,41 @@ def _isotonic_regression(x: List[float], y: List[float]) -> List[Tuple[float, fl
 def _interpolate(breakpoints: List[Tuple[float, float]], x: float) -> float:
     """Linearly interpolate a calibrated value from PAVA breakpoints.
 
-    Below the curve's domain: linearly extrapolate from the first two
-    breakpoints toward the origin (0, 0).  This prevents low raw
-    probabilities from being inflated to the first breakpoint's y-value,
-    which was causing phantom edge on sub-5% signals.
+    Outside the curve's fitted domain we have no observations, so both ends
+    extrapolate toward the certain outcome rather than flattening:
 
-    Above the curve's domain: clamp to the last breakpoint (unchanged).
+      Below: straight line from (0, 0) to the first breakpoint. A raw 0% must
+      calibrate to 0%. Flattening here inflated sub-5% signals into phantom edge.
+
+      Above: straight line from the last breakpoint to (100, 100). A raw 100%
+      must calibrate to 100%.
+
+    The top end used to clamp to the last breakpoint, which asserts the true
+    probability never exceeds it. For player_hits the last breakpoint is
+    (37.5 → 31.25), so every raw value from 40% to 100% collapsed to 31% and
+    every batter's "1+ hits" market reported the same number — Ohtani (raw 67%)
+    and Betts (raw 46%) both read 31% against a market of 67¢ and 64¢. The model
+    could not distinguish them, and a genuinely ~65% event was priced at half
+    that. Clamping is only defensible if the curve's domain covers the range you
+    trade; this one was fit almost entirely on longshot 2+/3+ props.
     """
     if not breakpoints:
         return x
 
     # Below the curve: extrapolate toward the origin.
-    # The calibration curve has no data below its first breakpoint, so we
-    # cannot trust it to be accurate there.  The safest assumption is a
-    # straight line from (0, 0) to the first breakpoint — a raw 0% should
-    # always calibrate to 0%, and values in between scale proportionally.
     if x <= breakpoints[0][0]:
         x0, y0 = breakpoints[0]
         if x0 <= 0:
             return y0
         return y0 * (x / x0)
 
-    # Above the curve: clamp to the last breakpoint.
+    # Above the curve: extrapolate toward certainty at (100, 100).
     if x >= breakpoints[-1][0]:
-        return breakpoints[-1][1]
+        xn, yn = breakpoints[-1]
+        if xn >= 100.0:
+            return yn
+        t = (x - xn) / (100.0 - xn)
+        return yn + t * (100.0 - yn)
 
     # Find the two surrounding breakpoints
     for i in range(len(breakpoints) - 1):

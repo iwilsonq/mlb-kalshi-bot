@@ -1,4 +1,6 @@
 """Tests for CalibrationLayer — fit, interpolate, and calibrate."""
+import pytest
+
 from slugger.calibration import (
     CalibrationLayer, _interpolate, _parse_ks_signal, backfill_outcomes,
     parse_team_hitting_splits,
@@ -340,8 +342,14 @@ class TestCalibrateDoesNotInflateLowProbabilities:
         )
 
 
-class TestInterpolateExtrapolatesBelowCurve:
-    """_interpolate must extrapolate toward origin below the curve."""
+class TestInterpolateExtrapolatesOutsideCurve:
+    """_interpolate must extrapolate toward certainty at both ends.
+
+    Outside the fitted domain there are no observations, so flattening asserts
+    something the data cannot support. Below, flattening inflated sub-5% signals
+    into phantom edge. Above, it collapsed every raw value over the last
+    breakpoint to one number (mlb-kalshi-bot-dbr).
+    """
 
     def test_zero_returns_zero(self):
         bp = [(20.0, 15.0), (50.0, 40.0)]
@@ -361,9 +369,35 @@ class TestInterpolateExtrapolatesBelowCurve:
                 f"_interpolate({x}) = {y}, exceeds first breakpoint y=17.56"
             )
 
-    def test_above_curve_clamps_to_last(self):
+    def test_one_hundred_returns_one_hundred(self):
         bp = [(20.0, 15.0), (50.0, 40.0)]
-        assert _interpolate(bp, 80.0) == 40.0
+        assert _interpolate(bp, 100.0) == 100.0
+
+    def test_above_last_breakpoint_scales_toward_certainty(self):
+        bp = [(20.0, 15.0), (50.0, 40.0)]
+        # x=80 is 60% of the way from 50 to 100, so y is 60% of the way 40 -> 100
+        assert _interpolate(bp, 80.0) == pytest.approx(76.0)
+
+    def test_above_curve_stays_monotone_and_bounded(self):
+        bp = [(15.0, 5.56), (25.0, 14.59), (32.5, 19.57), (37.5, 31.25)]
+        ys = [_interpolate(bp, float(x)) for x in range(0, 101)]
+        assert ys == sorted(ys), "calibration must stay monotone"
+        assert all(0.0 <= y <= 100.0 for y in ys)
+
+    def test_high_raw_probabilities_are_distinguishable(self):
+        """The player_hits curve must stop reporting one number for every batter.
+
+        Regression: with the real fitted curve, Ohtani (raw 67%) and Betts
+        (raw 46%) both calibrated to 31% against markets of 67¢ and 64¢.
+        """
+        bp = [(15.0, 5.56), (25.0, 14.59), (32.5, 19.57), (37.5, 31.25)]
+        ohtani = _interpolate(bp, 67.0)
+        betts = _interpolate(bp, 46.0)
+        assert ohtani > betts + 10, (
+            f"raw 67% and 46% must differ materially, got {ohtani:.1f} vs {betts:.1f}"
+        )
+        # And a ~65% event must no longer be priced at half its value
+        assert ohtani > 50.0
 
 
 class TestFitDeduplicatesByTicker:
