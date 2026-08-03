@@ -336,7 +336,14 @@ def _fetch_all_game_logs(
             stat = g.get("stat", {})
             game_date = g.get("date", "")
             ks = int(stat.get("strikeOuts", 0))
-            games.append({"date": game_date, "strikeouts": ks})
+            # Opponent comes free in the same split and is needed to rebuild
+            # point-in-time opponent K% for the Ks model's third feature.
+            opp = (g.get("opponent") or {}).get("name", "")
+            games.append({
+                "date": game_date,
+                "strikeouts": ks,
+                "opponent": opp,
+            })
 
         log.debug("Backfill: %s — %d starts", full_name, len(games))
         return full_name, games
@@ -357,6 +364,76 @@ def _fetch_all_game_logs(
         len(game_logs), len(pitcher_names),
     )
     return game_logs
+
+
+def parse_team_hitting_splits(splits: List[dict]) -> List[dict]:
+    """Extract per-game K and PA from an MLB team hitting gameLog response.
+
+    Split out from the fetch so it can be tested without network access.
+    """
+    games: List[dict] = []
+    for g in splits:
+        stat = g.get("stat", {})
+        d = (g.get("date") or "")[:10]
+        if not d:
+            continue
+        pa = int(stat.get("plateAppearances", 0) or 0)
+        if pa <= 0:
+            continue
+        games.append({
+            "date": d,
+            "strikeouts": int(stat.get("strikeOuts", 0) or 0),
+            "plate_appearances": pa,
+        })
+    return games
+
+
+def fetch_team_hitting_game_logs(season: Optional[int] = None) -> Dict[str, List[dict]]:
+    """Per-game batting K/PA for every MLB team, keyed by full team name.
+
+    One request per team (30 total). Needed because team season totals from the
+    API are current-day snapshots, so using them as a feature for a start three
+    months ago leaks information the bot did not have.
+    """
+    import requests
+    import statsapi
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import date
+
+    if season is None:
+        season = date.today().year
+    MLB_API = "https://statsapi.mlb.com/api/v1"
+
+    try:
+        teams = statsapi.get("teams", {"sportId": 1}).get("teams", [])
+    except Exception as exc:
+        log.warning("Could not list MLB teams for opponent K%%: %s", exc)
+        return {}
+
+    def _fetch(team: dict) -> Tuple[str, List[dict]]:
+        name = team.get("name", "")
+        try:
+            url = (
+                f"{MLB_API}/teams/{team['id']}/stats"
+                f"?stats=gameLog&group=hitting&season={season}"
+            )
+            resp = requests.get(url, timeout=10)
+            splits = resp.json().get("stats", [{}])[0].get("splits", [])
+        except Exception as exc:
+            log.debug("Team hitting log fetch failed for %s: %s", name, exc)
+            return name, []
+        return name, parse_team_hitting_splits(splits)
+
+    out: Dict[str, List[dict]] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_fetch, t) for t in teams if t.get("id")]
+        for fut in as_completed(futures):
+            name, games = fut.result()
+            if games:
+                out[name] = games
+
+    log.info("Fetched hitting game logs for %d/%d teams", len(out), len(teams))
+    return out
 
 
 # ─── Isotonic regression (PAVA) ──────────────────────────────────────────────

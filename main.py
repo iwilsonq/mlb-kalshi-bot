@@ -239,13 +239,24 @@ def cmd_calibrate(config: Config, fit: bool = False):
                 fit_ks_model,
                 samples_from_pitcher_game_logs,
             )
-            from slugger.calibration import _fetch_all_game_logs
+            from slugger.calibration import (
+                _fetch_all_game_logs,
+                fetch_team_hitting_game_logs,
+            )
             from datetime import date, timedelta
 
             print("Building Ks training samples from MLB game logs (actual Ks)...")
             game_logs = _fetch_all_game_logs(signals)
             as_of = (date.today() - timedelta(days=DEFAULT_CALIBRATION_LAG_DAYS)).isoformat()
-            samples = samples_from_pitcher_game_logs(game_logs, as_of=as_of)
+            # Point-in-time opponent K%: without per-team game logs every row
+            # carries the league constant, the feature has no training variance,
+            # and the fit zeroes it — so opponent strength would be ignored.
+            team_logs = fetch_team_hitting_game_logs()
+            samples = samples_from_pitcher_game_logs(
+                game_logs, as_of=as_of, team_game_logs=team_logs or None,
+            )
+            n_opp = len({round(s["opp_k_rate"], 5) for s in samples})
+            print(f"  opponent K% resolved to {n_opp} distinct values")
             print(f"  {len(samples)} point-in-time start samples (date < {as_of})")
             if len(samples) >= 20:
                 from slugger.ks_model import (

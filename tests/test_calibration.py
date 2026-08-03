@@ -1,7 +1,34 @@
 """Tests for CalibrationLayer — fit, interpolate, and calibrate."""
 from slugger.calibration import (
     CalibrationLayer, _interpolate, _parse_ks_signal, backfill_outcomes,
+    parse_team_hitting_splits,
 )
+
+
+class TestParseTeamHittingSplits:
+    """Per-game K/PA extraction for point-in-time opponent K% (mlb-kalshi-bot-iwt)."""
+
+    def test_extracts_k_and_pa(self):
+        games = parse_team_hitting_splits([
+            {"date": "2026-04-01", "stat": {"strikeOuts": 10, "plateAppearances": 38}},
+            {"date": "2026-04-02", "stat": {"strikeOuts": 7, "plateAppearances": 41}},
+        ])
+        assert games == [
+            {"date": "2026-04-01", "strikeouts": 10, "plate_appearances": 38},
+            {"date": "2026-04-02", "strikeouts": 7, "plate_appearances": 41},
+        ]
+
+    def test_skips_rows_that_cannot_anchor_a_rate(self):
+        games = parse_team_hitting_splits([
+            {"date": "", "stat": {"strikeOuts": 5, "plateAppearances": 38}},
+            {"date": "2026-04-02", "stat": {"strikeOuts": 5, "plateAppearances": 0}},
+            {"date": "2026-04-03", "stat": {}},
+            {"date": "2026-04-04", "stat": {"strikeOuts": 9, "plateAppearances": 38}},
+        ])
+        assert [g["date"] for g in games] == ["2026-04-04"]
+
+    def test_empty_input(self):
+        assert parse_team_hitting_splits([]) == []
 
 
 class TestParseKsSignal:

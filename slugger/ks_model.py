@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from slugger.models import poisson_ge
+from slugger.models import LEAGUE_AVG_K_RATE, poisson_ge
 
 log = logging.getLogger(__name__)
 
@@ -109,19 +109,70 @@ class KsModel:
             return None
 
 
+def team_k_rate_as_of(
+    team_game_logs: Dict[str, List[dict]],
+    team: str,
+    as_of: str,
+    *,
+    min_pa: int = 100,
+    default: float = LEAGUE_AVG_K_RATE,
+) -> float:
+    """Batting K% for `team` using only games strictly before `as_of`.
+
+    Season totals from the MLB API reflect *current* standings, not what was
+    known on the date of the start, so opponent strength has to be rebuilt from
+    per-game logs or it leaks the future.
+
+    team_game_logs: team key → [{"date", "strikeouts", "plate_appearances"}, ...]
+    Falls back to `default` below min_pa, where the estimate is mostly noise.
+    """
+    if not team:
+        return default
+    games = team_game_logs.get(team)
+    if games is None:
+        # Tolerate abbreviation vs full-name key mismatches
+        want = team.strip().lower()
+        for key, val in team_game_logs.items():
+            if key.strip().lower() == want:
+                games = val
+                break
+    if not games:
+        return default
+
+    ks = 0
+    pa = 0
+    for g in games:
+        d = (g.get("date") or "")[:10]
+        if not d or d >= as_of:
+            continue
+        pa += int(g.get("plate_appearances", g.get("pa", 0)) or 0)
+        ks += int(g.get("strikeouts", g.get("k", 0)) or 0)
+    if pa < min_pa:
+        return default
+    return ks / pa
+
+
 def samples_from_pitcher_game_logs(
     game_logs: Dict[str, List[dict]],
     *,
     as_of: Optional[str] = None,
-    opp_k_rate: float = 0.225,
+    opp_k_rate: float = LEAGUE_AVG_K_RATE,
     min_prior_starts: int = 2,
+    team_game_logs: Optional[Dict[str, List[dict]]] = None,
 ) -> List[dict]:
     """Build training rows from historical starts with point-in-time features.
 
     For each start on date D, features use only starts with date < D.
     actual_k is the true strikeout count on D (not model output).
 
-    game_logs: pitcher_name → [{"date": "YYYY-MM-DD", "strikeouts": int}, ...]
+    game_logs: pitcher_name → [{"date": "YYYY-MM-DD", "strikeouts": int,
+                                "opponent": "ABC"}, ...]
+
+    opp_k_rate is only a fallback. Pass team_game_logs to resolve each start's
+    real opponent K% as of that date; without it every row carries the same
+    constant, the feature has zero training variance, and the fit correctly
+    assigns it a coefficient of 0 — meaning opponent strength is ignored at
+    inference even though the live path supplies a real value.
     """
     samples: List[dict] = []
     for name, games in game_logs.items():
@@ -140,12 +191,18 @@ def samples_from_pitcher_game_logs(
             recent = prior[-5:]
             recent_k = sum(int(x.get("strikeouts", x.get("k", 0)) or 0) for x in recent) / len(recent)
             season_k = sum(int(x.get("strikeouts", x.get("k", 0)) or 0) for x in prior) / len(prior)
+            row_opp = opp_k_rate
+            if team_game_logs is not None:
+                row_opp = team_k_rate_as_of(
+                    team_game_logs, g.get("opponent") or "", d, default=opp_k_rate,
+                )
             samples.append({
                 "date": d,
                 "pitcher": name,
+                "opponent": g.get("opponent") or "",
                 "recent_k": recent_k,
                 "season_k": season_k,
-                "opp_k_rate": opp_k_rate,
+                "opp_k_rate": row_opp,
                 "actual_k": float(actual),
             })
     return samples

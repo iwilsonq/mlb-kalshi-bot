@@ -5,6 +5,7 @@ import pytest
 
 from slugger.ks_model import (
     LAMBDA_MAX,
+    LEAGUE_AVG_K_RATE,
     KsModel,
     build_holdout_props_from_signals,
     clear_ks_model_cache,
@@ -14,6 +15,7 @@ from slugger.ks_model import (
     journal_roi_for_strategy,
     model_roi_vs_phase0_baseline,
     samples_from_pitcher_game_logs,
+    team_k_rate_as_of,
 )
 from slugger.models import expected_ks
 from slugger.types import PitcherProfile
@@ -130,13 +132,123 @@ def test_ridge_keeps_collinear_coefficients_bounded():
 
 
 def test_constant_feature_gets_zero_coefficient():
-    """opp_k_rate is constant across training rows, so it must not absorb noise."""
+    """Without team logs opp_k_rate is constant, so it must not absorb noise."""
     samples = samples_from_pitcher_game_logs(
         _multi_pitcher_logs(), as_of="2026-05-01", min_prior_starts=2
     )
     assert len({s["opp_k_rate"] for s in samples}) == 1
     model = fit_ks_model(samples, as_of="2026-05-01", holdout_frac=0.0)
     assert model.coef[2] == 0.0
+
+
+# ── point-in-time opponent K% ─────────────────────────────────────────────────
+
+def _team_logs(k_per_game: dict, days: int = 40) -> dict:
+    """team → per-game K/PA logs at a fixed strikeout rate (38 PA per game)."""
+    return {
+        team: [
+            {"date": f"2026-03-{d:02d}" if d <= 31 else f"2026-04-{d - 31:02d}",
+             "strikeouts": ks, "plate_appearances": 38}
+            for d in range(1, days + 1)
+        ]
+        for team, ks in k_per_game.items()
+    }
+
+
+def test_team_k_rate_uses_only_prior_games():
+    logs = {
+        "Whiffers": [
+            {"date": "2026-04-01", "strikeouts": 15, "plate_appearances": 38},
+            {"date": "2026-04-02", "strikeouts": 15, "plate_appearances": 38},
+            {"date": "2026-04-03", "strikeouts": 15, "plate_appearances": 38},
+            # Games on/after the as_of date must not count
+            {"date": "2026-04-04", "strikeouts": 0, "plate_appearances": 38},
+        ]
+    }
+    rate = team_k_rate_as_of(logs, "Whiffers", "2026-04-04", min_pa=100)
+    assert rate == pytest.approx(45 / 114)
+    # Same team, earlier cutoff, less data than min_pa → fall back
+    assert team_k_rate_as_of(logs, "Whiffers", "2026-04-02", min_pa=100) == LEAGUE_AVG_K_RATE
+
+
+def test_team_k_rate_falls_back_on_unknown_team():
+    logs = _team_logs({"Known": 10})
+    assert team_k_rate_as_of(logs, "", "2026-05-01") == LEAGUE_AVG_K_RATE
+    assert team_k_rate_as_of(logs, "Nobody", "2026-05-01") == LEAGUE_AVG_K_RATE
+    assert team_k_rate_as_of({}, "Known", "2026-05-01") == LEAGUE_AVG_K_RATE
+    # Key matching tolerates case/whitespace drift between data sources
+    assert team_k_rate_as_of(logs, "  known ", "2026-05-01") != LEAGUE_AVG_K_RATE
+
+
+def test_samples_resolve_real_opponent_k_rate():
+    """With team logs, each start carries its own opponent K% instead of 0.225."""
+    team_logs = _team_logs({"Whiffers": 15, "Contact": 5})
+    pitcher_logs = {
+        "Paul Ace": [
+            {"date": f"2026-04-{d:02d}", "strikeouts": 6,
+             "opponent": "Whiffers" if d % 2 else "Contact"}
+            for d in range(1, 21)
+        ]
+    }
+    samples = samples_from_pitcher_game_logs(
+        pitcher_logs, as_of="2026-05-01", min_prior_starts=2, team_game_logs=team_logs
+    )
+    rates = {round(s["opp_k_rate"], 6) for s in samples}
+    assert len(rates) == 2, rates
+    assert max(rates) == pytest.approx(15 / 38)
+    assert min(rates) == pytest.approx(5 / 38)
+    assert all(s["opponent"] in ("Whiffers", "Contact") for s in samples)
+
+
+def test_unresolvable_opponent_falls_back_to_league_average():
+    team_logs = _team_logs({"Whiffers": 15})
+    pitcher_logs = {
+        "Paul Ace": [
+            {"date": f"2026-04-{d:02d}", "strikeouts": 6, "opponent": "Mystery"}
+            for d in range(1, 21)
+        ]
+    }
+    samples = samples_from_pitcher_game_logs(
+        pitcher_logs, as_of="2026-05-01", min_prior_starts=2, team_game_logs=team_logs
+    )
+    assert samples
+    assert all(s["opp_k_rate"] == LEAGUE_AVG_K_RATE for s in samples)
+
+
+def test_opp_k_rate_becomes_a_live_feature_when_it_varies():
+    """The point of iwt: with real variance the fit must actually use opp K%.
+
+    Regression: samples_from_pitcher_game_logs hardcoded opp_k_rate for every
+    row, so the column had zero variance and the ridge zeroed it — opponent
+    strength had no effect on λ even though the live path passes a real value.
+    """
+    team_logs = _team_logs({"Whiffers": 15, "Contact": 5})
+    # Same pitcher quality throughout; only the opponent differs, and actual Ks
+    # track the opponent, so opp_k_rate is the only feature that can explain it.
+    pitcher_logs = {}
+    for p in range(4):
+        games = []
+        for d in range(1, 25):
+            vs_whiffers = (d + p) % 2 == 0
+            games.append({
+                "date": f"2026-04-{d:02d}",
+                "strikeouts": 9 if vs_whiffers else 4,
+                "opponent": "Whiffers" if vs_whiffers else "Contact",
+            })
+        pitcher_logs[f"Pitcher {p}"] = games
+
+    samples = samples_from_pitcher_game_logs(
+        pitcher_logs, as_of="2026-05-01", min_prior_starts=2, team_game_logs=team_logs
+    )
+    assert len({round(s["opp_k_rate"], 6) for s in samples}) == 2
+    model = fit_ks_model(samples, as_of="2026-05-01", holdout_frac=0.0)
+
+    assert model.coef[2] != 0.0, "opp_k_rate still ignored by the fit"
+    # Higher opponent strikeout rate must raise λ, not lower it
+    assert model.coef[2] > 0
+    lam_vs_whiffers = model.predict_lambda(6.5, 6.5, 15 / 38)
+    lam_vs_contact = model.predict_lambda(6.5, 6.5, 5 / 38)
+    assert lam_vs_whiffers > lam_vs_contact
 
 
 def test_fitted_lambda_is_plausible_and_monotone():
