@@ -9,7 +9,9 @@ from slugger.ks_model import (
     KsModel,
     build_holdout_props_from_signals,
     clear_ks_model_cache,
+    fit_and_save_ks_model,
     fit_ks_model,
+    format_ks_fit_report,
     get_trained_ks_model,
     holdout_brier_vs_market,
     journal_roi_for_strategy,
@@ -515,6 +517,93 @@ def test_journal_roi_edge_filter():
     assert base["n"] == 10
     assert gated["n"] == 5
     assert gated["roi_pct"] > base["roi_pct"]
+
+
+# ── end-to-end fit orchestration (the path that writes ks_model.json) ─────────
+
+def test_fit_and_save_writes_a_usable_model(tmp_path):
+    """The whole calibrate --fit Ks path, with the network fetches injected.
+
+    logs/ks_model.json is the only thing that puts a trained model in front of
+    the live bot; without it models.expected_ks silently uses the hand-tuned
+    fallback. This asserts the orchestration actually produces a loadable file.
+    """
+    team_logs = _team_logs({"Whiffers": 15, "Contact": 5})
+    game_logs = {}
+    for p in range(4):
+        game_logs[f"Pitcher {p}"] = [
+            {"date": f"2026-04-{d:02d}",
+             "strikeouts": 9 if (d + p) % 2 == 0 else 4,
+             "opponent": "Whiffers" if (d + p) % 2 == 0 else "Contact"}
+            for d in range(1, 25)
+        ]
+    path = tmp_path / "ks_model.json"
+
+    report = fit_and_save_ks_model(
+        signals=[],
+        journal_records=[],
+        game_logs=game_logs,
+        team_game_logs=team_logs,
+        as_of="2026-05-01",
+        model_path=str(path),
+        cost_buffer_cents=5.0,
+    )
+
+    assert report["status"] == "ok"
+    assert report["distinct_opp_k_rates"] == 2
+    assert path.exists(), "no model file written"
+
+    clear_ks_model_cache()
+    loaded = KsModel.load(str(path))
+    assert loaded is not None
+    assert loaded.n_samples == report["model"].n_samples
+    assert loaded.coef[2] != 0.0  # opponent K% survived the round trip
+    assert 0.0 < loaded.predict_lambda(6.5, 6.5, 0.25) <= LAMBDA_MAX
+
+    text = format_ks_fit_report(report)
+    assert "Ks model saved to" in text
+    assert "MODEL_ROI" in text
+    # No real market prices were supplied, so no Brier verdict may be claimed
+    assert loaded.holdout_beats_market is None
+    assert "does not beat market Brier" in text
+
+
+def test_fit_and_save_reports_no_samples_instead_of_writing_junk(tmp_path):
+    path = tmp_path / "ks_model.json"
+    report = fit_and_save_ks_model(
+        signals=[],
+        journal_records=[],
+        game_logs={"Solo": [{"date": "2026-04-01", "strikeouts": 5}]},
+        team_game_logs=None,
+        as_of="2026-05-01",
+        model_path=str(path),
+    )
+    assert report["status"] == "no_samples"
+    assert not path.exists(), "must not persist a model it could not fit"
+    assert "Not enough game-log samples" in format_ks_fit_report(report)
+
+
+def test_fit_report_flags_a_model_that_loses_to_the_market():
+    """The report must say so plainly when there is no demonstrated edge."""
+    beaten = KsModel(
+        intercept=1.0, coef=[0.5, 0.3, 0.0], n_samples=50,
+        holdout_model_brier=0.30, holdout_market_brier=0.20,
+        holdout_beats_market=False,
+    )
+    report = {
+        "status": "ok", "model": beaten, "model_path": "x.json",
+        "n_samples": 50, "distinct_opp_k_rates": 3, "n_holdout_props": 40,
+        "roi": {
+            "status": "worse_than_baseline", "n_cells_scored": 40,
+            "n_in_sample_dropped": 0, "not_worse_than_baseline": False,
+            "model": {"n": 12.0, "roi_pct": -30.0},
+            "baseline": {"n": 100.0, "roi_pct": -15.0},
+        },
+    }
+    text = format_ks_fit_report(report)
+    assert "beats_market=False" in text
+    assert "does not beat market Brier" in text
+    assert "Do not re-enable" in text
 
 
 def test_expected_ks_uses_trained_model(tmp_path, monkeypatch):

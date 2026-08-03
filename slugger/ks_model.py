@@ -707,6 +707,105 @@ def fit_ks_model(
     return model
 
 
+def fit_and_save_ks_model(
+    signals: Sequence[dict],
+    journal_records: Sequence[dict],
+    *,
+    game_logs: Dict[str, List[dict]],
+    team_game_logs: Optional[Dict[str, List[dict]]],
+    as_of: str,
+    model_path: str,
+    cost_buffer_cents: float = 5.0,
+    holdout_frac: float = 0.2,
+    min_samples: int = 20,
+) -> Dict[str, object]:
+    """Fit the Ks model from game logs, persist it, and report holdout evidence.
+
+    Pure orchestration with the network fetches injected, so the whole path that
+    produces logs/ks_model.json is testable offline. This is the only thing that
+    puts a trained model in front of the live bot; if it silently no-ops the bot
+    quietly keeps using the hand-tuned fallback in models.expected_ks.
+
+    Returns a report dict with status:
+      no_samples        — game logs produced fewer than min_samples rows
+      ok                — model fitted and written to model_path
+    """
+    samples = samples_from_pitcher_game_logs(
+        game_logs, as_of=as_of, team_game_logs=team_game_logs or None,
+    )
+    distinct_opp = len({round(float(s["opp_k_rate"]), 5) for s in samples})
+
+    if len(samples) < min_samples:
+        return {
+            "status": "no_samples",
+            "n_samples": len(samples),
+            "min_samples": min_samples,
+            "distinct_opp_k_rates": distinct_opp,
+        }
+
+    holdout_props = build_holdout_props_from_signals(signals, game_logs, as_of=as_of)
+    model = fit_ks_model(
+        samples, as_of=as_of, holdout_frac=holdout_frac, holdout_props=holdout_props,
+    )
+    model.save(model_path)
+    clear_ks_model_cache()
+
+    roi = model_roi_vs_phase0_baseline(
+        model,
+        holdout_props,
+        journal_records,
+        min_n=10,
+        cost_buffer_cents=cost_buffer_cents,
+    )
+    return {
+        "status": "ok",
+        "model": model,
+        "model_path": model_path,
+        "n_samples": len(samples),
+        "distinct_opp_k_rates": distinct_opp,
+        "n_holdout_props": len(holdout_props),
+        "roi": roi,
+    }
+
+
+def format_ks_fit_report(report: Dict[str, object]) -> str:
+    """Human-readable summary of fit_and_save_ks_model, for the calibrate CLI."""
+    status = report.get("status")
+    if status == "no_samples":
+        return (
+            f"  Not enough game-log samples to fit Ks model "
+            f"({report['n_samples']} < {report['min_samples']})"
+        )
+    m: KsModel = report["model"]  # type: ignore[assignment]
+    roi: Dict[str, object] = report["roi"]  # type: ignore[assignment]
+    model_stats = roi["model"]  # type: ignore[index]
+    baseline = roi["baseline"]  # type: ignore[index]
+    lines = [
+        f"  {report['n_samples']} point-in-time start samples, "
+        f"opponent K% resolved to {report['distinct_opp_k_rates']} distinct values",
+        f"  {report['n_holdout_props']} holdout props with real market prices",
+        f"Ks model saved to {report['model_path']} n={m.n_samples} "
+        f"coef={[round(c, 3) for c in m.coef]} holdout_from={m.holdout_from} "
+        f"holdout_mae={m.holdout_mae}",
+        f"  BRIER model={m.holdout_model_brier} market={m.holdout_market_brier} "
+        f"beats_market={m.holdout_beats_market}",
+        f"  MODEL_ROI status={roi.get('status')} "
+        f"cells={roi['n_cells_scored']} "  # type: ignore[index]
+        f"(dropped_in_sample={roi['n_in_sample_dropped']}) "  # type: ignore[index]
+        f"model_n={model_stats['n']:.0f} "  # type: ignore[index]
+        f"model_roi={model_stats['roi_pct']:+.1f}% | "  # type: ignore[index]
+        f"baseline_n={baseline['n']:.0f} "  # type: ignore[index]
+        f"baseline_roi={baseline['roi_pct']:+.1f}% | "  # type: ignore[index]
+        f"not_worse={roi['not_worse_than_baseline']}",  # type: ignore[index]
+    ]
+    if m.holdout_beats_market is not True:
+        lines.append(
+            "  ⚠️  Model does not beat market Brier on holdout — pitcher_ks has no "
+            "demonstrated edge. Do not re-enable on the strength of this fit."
+        )
+    return "\n".join(lines)
+
+
 _LOADED: Optional[KsModel] = None
 
 

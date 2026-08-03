@@ -233,12 +233,11 @@ def cmd_calibrate(config: Config, fit: bool = False):
 
         # Fit trained Ks lambda model from **actual** game-log strikeouts
         # (point-in-time features). Holdout reports Brier vs market when prices known.
+        # This is the only thing that puts a trained Ks model in front of the
+        # live bot. If it fails, models.expected_ks silently falls back to the
+        # hand-tuned blend + KS_LAMBDA_DEFLATOR, so the failure must be loud.
         try:
-            from slugger.ks_model import (
-                clear_ks_model_cache,
-                fit_ks_model,
-                samples_from_pitcher_game_logs,
-            )
+            from slugger.ks_model import fit_and_save_ks_model, format_ks_fit_report
             from slugger.calibration import (
                 _fetch_all_game_logs,
                 fetch_team_hitting_game_logs,
@@ -247,68 +246,27 @@ def cmd_calibrate(config: Config, fit: bool = False):
 
             print("Building Ks training samples from MLB game logs (actual Ks)...")
             game_logs = _fetch_all_game_logs(signals)
-            as_of = (date.today() - timedelta(days=DEFAULT_CALIBRATION_LAG_DAYS)).isoformat()
             # Point-in-time opponent K%: without per-team game logs every row
             # carries the league constant, the feature has no training variance,
             # and the fit zeroes it — so opponent strength would be ignored.
             team_logs = fetch_team_hitting_game_logs()
-            samples = samples_from_pitcher_game_logs(
-                game_logs, as_of=as_of, team_game_logs=team_logs or None,
+            as_of = (date.today() - timedelta(days=DEFAULT_CALIBRATION_LAG_DAYS)).isoformat()
+            report = fit_and_save_ks_model(
+                signals,
+                records,
+                game_logs=game_logs,
+                team_game_logs=team_logs,
+                as_of=as_of,
+                model_path=str(Path(config.log_dir) / "ks_model.json"),
+                cost_buffer_cents=float(config.edge_cost_buffer_cents),
             )
-            n_opp = len({round(s["opp_k_rate"], 5) for s in samples})
-            print(f"  opponent K% resolved to {n_opp} distinct values")
-            print(f"  {len(samples)} point-in-time start samples (date < {as_of})")
-            if len(samples) >= 20:
-                from slugger.ks_model import (
-                    build_holdout_props_from_signals,
-                    model_roi_vs_phase0_baseline,
-                )
-                # Real market prices from signals.jsonl joined to actual Ks
-                holdout_props = build_holdout_props_from_signals(
-                    signals, game_logs, as_of=as_of,
-                )
-                print(f"  {len(holdout_props)} holdout props with real market prices")
-                ks_m = fit_ks_model(
-                    samples,
-                    as_of=as_of,
-                    holdout_frac=0.2,
-                    holdout_props=holdout_props,
-                )
-                ks_path = str(Path(config.log_dir) / "ks_model.json")
-                ks_m.save(ks_path)
-                clear_ks_model_cache()
-                print(
-                    f"Ks model saved to {ks_path} n={ks_m.n_samples} "
-                    f"coef={[round(c, 3) for c in ks_m.coef]} "
-                    f"holdout_from={ks_m.holdout_from} "
-                    f"holdout_mae={ks_m.holdout_mae} "
-                    f"brier_model={ks_m.holdout_model_brier} "
-                    f"brier_mkt={ks_m.holdout_market_brier} "
-                    f"beats_mkt={ks_m.holdout_beats_market}"
-                )
-                # Model-scored ROI vs journal Phase-0 baseline (uses KsModel.prob_ge).
-                # holdout_only=True: only starts after the walk-forward boundary count.
-                roi_cmp = model_roi_vs_phase0_baseline(
-                    ks_m,
-                    holdout_props,
-                    records,
-                    min_n=10,
-                    cost_buffer_cents=float(config.edge_cost_buffer_cents),
-                )
-                print(
-                    f"  MODEL_ROI status={roi_cmp.get('status')} "
-                    f"cells={roi_cmp['n_cells_scored']} "
-                    f"(dropped_in_sample={roi_cmp['n_in_sample_dropped']}) "
-                    f"model_n={roi_cmp['model']['n']:.0f} "
-                    f"model_roi={roi_cmp['model']['roi_pct']:+.1f}% | "
-                    f"baseline_n={roi_cmp['baseline']['n']:.0f} "
-                    f"baseline_roi={roi_cmp['baseline']['roi_pct']:+.1f}% | "
-                    f"not_worse={roi_cmp['not_worse_than_baseline']}"
-                )
-            else:
-                print("  Not enough game-log samples to fit Ks model")
-        except Exception as exc:
-            print(f"Ks model fit skipped: {exc}")
+            print(format_ks_fit_report(report))
+        except Exception:
+            import traceback
+            print("\n❌ Ks model fit FAILED — no ks_model.json written.")
+            print("   models.expected_ks will keep using the hand-tuned fallback.")
+            traceback.print_exc()
+            return 1
         return
 
     # Bucket signals by strategy and probability band
