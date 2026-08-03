@@ -217,30 +217,34 @@ def expected_ab(batting_order: int) -> float:
 def expected_ks(
     profile: PitcherProfile,
     opp_k_rate: float = 0.0,
+    *,
+    use_trained: bool = True,
 ) -> float:
-    """Estimate the expected number of strikeouts for a pitcher in today's start.
+    """Estimate expected strikeouts (Poisson lambda) for today's start.
 
-    Combines:
-      - Recent K/start (last 5 starts) -- weighted 70%
-      - Season K/9 x expected IP        -- weighted 30%
-      - Opponent team K rate adjustment  (dampened -- half-weight)
-      - Statcast whiff rate adjustment   (dampened -- half-weight)
-      - Hard ceiling from demonstrated max Ks
-
-    The opponent and whiff adjustments are dampened toward 1.0 to prevent
-    multiplicative compounding inflating lambda beyond what the pitcher
-    has ever demonstrated.
-
-    Returns lambda for the Poisson model.
+    Prefer a walk-forward trained log-linear model (slugger.ks_model) when
+    logs/ks_model.json exists. Falls back to a reduced hand model without
+    multiplicative Statcast stacking.
     """
-    # Base: recent K/start
     recent_k  = profile.recent_k_per_start   # 0 if not populated
     recent_ip = profile.recent_ip_per_start or DEFAULT_IP
-
-    # Season rate: K/9 x expected IP
     season_k_per_9 = profile.k_per_9 or 0.0
     season_k = (season_k_per_9 / 9.0) * recent_ip
 
+    if use_trained:
+        try:
+            from slugger.ks_model import get_trained_ks_model
+            trained = get_trained_ks_model()
+            if trained is not None and trained.n_samples >= 5:
+                lam = trained.predict_lambda(recent_k, season_k, opp_k_rate)
+                max_k = getattr(profile, "max_k_in_start", 0)
+                if max_k > 0:
+                    lam = min(lam, float(max_k + 1))
+                return max(0.0, lam)
+        except Exception as exc:
+            log.debug("Trained Ks model unavailable: %s", exc)
+
+    # Fallback: blend recent/season only + single dampened opp adj (no Statcast stack)
     if recent_k > 0 and season_k > 0:
         lam = 0.70 * recent_k + 0.30 * season_k
     elif recent_k > 0:
@@ -250,40 +254,17 @@ def expected_ks(
     else:
         return 0.0
 
-    # Opponent K rate adjustment (dampened)
     if opp_k_rate > 0:
         raw_opp = opp_k_rate / LEAGUE_AVG_K_RATE
         lam *= 1.0 + 0.5 * (raw_opp - 1.0)
 
-    # Statcast whiff rate adjustment (dampened)
-    if profile.whiff_rate > 0:
-        raw_whiff = profile.whiff_rate / LEAGUE_AVG_WHIFF
-        lam *= 1.0 + 0.5 * (raw_whiff - 1.0)
-
-    # Statcast chase rate adjustment (dampened)
-    if profile.chase_rate > 0:
-        raw_chase = profile.chase_rate / LEAGUE_AVG_CHASE
-        lam *= 1.0 + 0.3 * (raw_chase - 1.0)
-
-    # Fastball velocity adjustment
-    if profile.avg_fastball_velo > 0:
-        velo_diff = profile.avg_fastball_velo - LEAGUE_AVG_FB_VELO
-        lam *= 1.0 + 0.01 * velo_diff
-
-    # Hard ceiling: cap lambda at max Ks observed + 1
     max_k = getattr(profile, "max_k_in_start", 0)
     if max_k > 0:
         ceiling = max_k + 1
         if lam > ceiling:
-            log.debug(
-                "%s: capping lambda from %.1f to %d (max K in any start: %d)",
-                profile.name, lam, ceiling, max_k,
-            )
             lam = float(ceiling)
 
-    # Calibration deflation
     lam *= KS_LAMBDA_DEFLATOR
-
     return max(0.0, lam)
 
 
