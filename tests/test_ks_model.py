@@ -13,13 +13,14 @@ from slugger.ks_model import (
     fit_ks_model,
     format_ks_fit_report,
     get_trained_ks_model,
+    holdout_brier_vs_incumbent,
     holdout_brier_vs_market,
     journal_roi_for_strategy,
     model_roi_vs_phase0_baseline,
     samples_from_pitcher_game_logs,
     team_k_rate_as_of,
 )
-from slugger.models import expected_ks
+from slugger.models import expected_ks, poisson_ge
 from slugger.types import PitcherProfile
 
 # Phase-0 band the ROI harness enforces; fixtures must sit inside it.
@@ -396,6 +397,16 @@ def test_model_roi_respects_phase0_gates():
     assert result["model"]["n"] == 0
     assert result["status"] == "insufficient_data"
 
+    # Each cell must be attributed to the gate that actually rejected it,
+    # otherwise a zero-trade result is indistinguishable from a broken model.
+    gates = result["rejected_by_gate"]
+    assert gates["threshold_below_min"] == 1
+    assert gates["no_market_price"] == 1
+    assert gates["synthetic_market"] == 1
+    assert gates["edge_below_min"] == 1
+    assert gates["prob_below_band"] == 1
+    assert sum(gates.values()) == len(rejected)
+
 
 def test_model_roi_reports_worse_than_baseline():
     """A model that trades but loses must be reported worse, not waved through."""
@@ -604,6 +615,131 @@ def test_fit_report_flags_a_model_that_loses_to_the_market():
     assert "beats_market=False" in text
     assert "does not beat market Brier" in text
     assert "Do not re-enable" in text
+
+
+def test_unknown_opponent_serves_league_average_not_zero(tmp_path, monkeypatch):
+    """opp_k_rate=0.0 means "unknown", and the trained model must read it that way.
+
+    Regression: strategies.py initialises opp_k_rate=0.0 and only overwrites it
+    if get_team_profile succeeds. The hand model treats 0.0 as "skip the
+    adjustment", but the trained model has a real positive coefficient on the
+    feature, so a failed team fetch looked like a lineup that never strikes out
+    and cost roughly 30% of λ.
+    """
+    import slugger.ks_model as ks_module
+
+    trained = KsModel(
+        intercept=-0.722, coef=[0.475, 0.543, 1.591], n_samples=2315,
+    )
+    path = tmp_path / "ks_model.json"
+    trained.save(str(path))
+    monkeypatch.setattr(ks_module, "DEFAULT_MODEL_PATH", str(path))
+    clear_ks_model_cache()
+
+    profile = PitcherProfile(
+        player_id=1, name="T", recent_k_per_start=10.0, recent_ip_per_start=6.0,
+        k_per_9=15.0, max_k_in_start=12,
+    )
+    lam_unknown = expected_ks(profile, 0.0, use_trained=True)
+    lam_league = expected_ks(profile, LEAGUE_AVG_K_RATE, use_trained=True)
+    assert lam_unknown == pytest.approx(lam_league), (
+        "unknown opponent must be served as the league average, "
+        "matching the fallback training used"
+    )
+    # And a real opponent value still moves λ
+    lam_high = expected_ks(profile, 0.30, use_trained=True)
+    assert lam_high > lam_league
+    clear_ks_model_cache()
+
+
+def test_get_trained_model_path_is_overridable(tmp_path, monkeypatch):
+    """DEFAULT_MODEL_PATH must be resolved at call time, not frozen at import."""
+    import slugger.ks_model as ks_module
+
+    clear_ks_model_cache()
+    monkeypatch.setattr(
+        ks_module, "DEFAULT_MODEL_PATH", str(tmp_path / "nope.json")
+    )
+    assert get_trained_ks_model() is None
+
+    model = KsModel(intercept=1.0, coef=[0.5, 0.3, 0.2], n_samples=99)
+    real = tmp_path / "yes.json"
+    model.save(str(real))
+    clear_ks_model_cache()
+    monkeypatch.setattr(ks_module, "DEFAULT_MODEL_PATH", str(real))
+    loaded = get_trained_ks_model()
+    assert loaded is not None and loaded.n_samples == 99
+    clear_ks_model_cache()
+
+
+def test_incumbent_brier_scores_the_live_fallback_formula():
+    """The incumbent baseline must score models.fallback_ks_lambda itself."""
+    from slugger.models import fallback_ks_lambda
+
+    props = [
+        {"recent_k": 6.0, "season_k": 6.0, "opp_k_rate": 0.225, "threshold": 6,
+         "actual_k": 7.0, "market_price_cents": 40.0, "synthetic_market": False}
+        for _ in range(10)
+    ]
+    brier, n = holdout_brier_vs_incumbent(props)
+    assert n == 10
+    lam = fallback_ks_lambda(6.0, 6.0, 0.225)
+    expected = (poisson_ge(6, lam) - 1.0) ** 2
+    assert brier == pytest.approx(expected)
+
+
+def test_incumbent_brier_needs_enough_rows():
+    props = [{"recent_k": 6.0, "season_k": 6.0, "opp_k_rate": 0.225,
+              "threshold": 6, "actual_k": 7.0, "market_price_cents": 40.0}]
+    assert holdout_brier_vs_incumbent(props) == (None, 1)
+
+
+def test_fit_records_beats_incumbent_verdict():
+    samples = samples_from_pitcher_game_logs(
+        _multi_pitcher_logs(), as_of="2026-05-01", min_prior_starts=2
+    )
+    props = [
+        {**s, "threshold": 6 + (i % 3), "market_price_cents": 20.0 + i * 3,
+         "synthetic_market": False}
+        for i, s in enumerate(samples[-10:])
+    ]
+    model = fit_ks_model(
+        samples, as_of="2026-05-01", holdout_frac=0.25, holdout_props=props
+    )
+    assert model.holdout_incumbent_brier is not None
+    assert model.holdout_beats_incumbent is (
+        model.holdout_model_brier < model.holdout_incumbent_brier
+    )
+    # Verdict must survive the round trip so `calibrate --fit` output is auditable
+    import tempfile, os
+    p = os.path.join(tempfile.mkdtemp(), "m.json")
+    model.save(p)
+    reloaded = KsModel.load(p)
+    assert reloaded.holdout_incumbent_brier == model.holdout_incumbent_brier
+    assert reloaded.holdout_beats_incumbent == model.holdout_beats_incumbent
+
+
+def test_report_says_delete_the_artifact_when_worse_than_incumbent():
+    losing = KsModel(
+        intercept=1.0, coef=[0.5, 0.3, 0.0], n_samples=50,
+        holdout_model_brier=0.30, holdout_market_brier=0.20,
+        holdout_beats_market=False,
+        holdout_incumbent_brier=0.25, holdout_beats_incumbent=False,
+    )
+    report = {
+        "status": "ok", "model": losing, "model_path": "logs/ks_model.json",
+        "n_samples": 50, "distinct_opp_k_rates": 3, "n_holdout_props": 40,
+        "roi": {
+            "status": "insufficient_data", "n_cells_scored": 40,
+            "n_in_sample_dropped": 0, "not_worse_than_baseline": False,
+            "model": {"n": 0.0, "roi_pct": 0.0},
+            "baseline": {"n": 512.0, "roi_pct": -15.2},
+        },
+    }
+    text = format_ks_fit_report(report)
+    assert "beats_incumbent=False" in text
+    assert "worse than the hand-tuned fallback" in text
+    assert "delete logs/ks_model.json" in text
 
 
 def test_expected_ks_uses_trained_model(tmp_path, monkeypatch):

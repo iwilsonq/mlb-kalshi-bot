@@ -235,7 +235,15 @@ def expected_ks(
             from slugger.ks_model import get_trained_ks_model
             trained = get_trained_ks_model()
             if trained is not None and trained.n_samples >= 5:
-                lam = trained.predict_lambda(recent_k, season_k, opp_k_rate)
+                # 0.0 means "opponent unknown" to callers, and the hand model
+                # below reads it that way by skipping the adjustment. The trained
+                # model cannot: it has a real positive coefficient on opp_k_rate,
+                # so a 0.0 sentinel is indistinguishable from a lineup that never
+                # strikes out and costs ~30% of lambda. Training used the league
+                # average whenever the opponent could not be resolved
+                # (team_k_rate_as_of), so serving must do the same.
+                opp = opp_k_rate if opp_k_rate > 0 else LEAGUE_AVG_K_RATE
+                lam = trained.predict_lambda(recent_k, season_k, opp)
                 max_k = getattr(profile, "max_k_in_start", 0)
                 if max_k > 0:
                     lam = min(lam, float(max_k + 1))
@@ -243,7 +251,30 @@ def expected_ks(
         except Exception as exc:
             log.debug("Trained Ks model unavailable: %s", exc)
 
-    # Fallback: blend recent/season only + single dampened opp adj (no Statcast stack)
+    lam = fallback_ks_lambda(recent_k, season_k, opp_k_rate)
+    if lam <= 0:
+        return 0.0
+
+    max_k = getattr(profile, "max_k_in_start", 0)
+    if max_k > 0:
+        ceiling = max_k + 1
+        if lam > ceiling:
+            lam = float(ceiling)
+
+    return max(0.0, lam)
+
+
+def fallback_ks_lambda(
+    recent_k: float,
+    season_k: float,
+    opp_k_rate: float = 0.0,
+) -> float:
+    """Hand-tuned strikeout lambda: recent/season blend + one dampened opp adj.
+
+    This is the incumbent that the trained model has to beat to be worth
+    shipping. Kept as a standalone function so the holdout comparison scores the
+    *same* formula the live fallback uses, rather than a copy that can drift.
+    """
     if recent_k > 0 and season_k > 0:
         lam = 0.70 * recent_k + 0.30 * season_k
     elif recent_k > 0:
@@ -254,17 +285,9 @@ def expected_ks(
         return 0.0
 
     if opp_k_rate > 0:
-        raw_opp = opp_k_rate / LEAGUE_AVG_K_RATE
-        lam *= 1.0 + 0.5 * (raw_opp - 1.0)
+        lam *= 1.0 + 0.5 * (opp_k_rate / LEAGUE_AVG_K_RATE - 1.0)
 
-    max_k = getattr(profile, "max_k_in_start", 0)
-    if max_k > 0:
-        ceiling = max_k + 1
-        if lam > ceiling:
-            lam = float(ceiling)
-
-    lam *= KS_LAMBDA_DEFLATOR
-    return max(0.0, lam)
+    return max(0.0, lam * KS_LAMBDA_DEFLATOR)
 
 
 def parse_k_threshold(title: str) -> Optional[int]:

@@ -45,6 +45,11 @@ class KsModel:
     holdout_model_brier: Optional[float] = None
     holdout_market_brier: Optional[float] = None
     holdout_beats_market: Optional[bool] = None
+    # Brier of the hand-tuned models.fallback_ks_lambda on the same holdout.
+    # Beating the market is the bar for having an edge; beating the incumbent is
+    # the bar for this artifact being worth shipping at all.
+    holdout_incumbent_brier: Optional[float] = None
+    holdout_beats_incumbent: Optional[bool] = None
 
     def features(self, recent_k: float, season_k: float, opp_k_rate: float) -> List[float]:
         return [
@@ -84,6 +89,8 @@ class KsModel:
             "holdout_model_brier": self.holdout_model_brier,
             "holdout_market_brier": self.holdout_market_brier,
             "holdout_beats_market": self.holdout_beats_market,
+            "holdout_incumbent_brier": self.holdout_incumbent_brier,
+            "holdout_beats_incumbent": self.holdout_beats_incumbent,
         }, indent=2))
 
     @classmethod
@@ -103,6 +110,8 @@ class KsModel:
                 holdout_model_brier=d.get("holdout_model_brier"),
                 holdout_market_brier=d.get("holdout_market_brier"),
                 holdout_beats_market=d.get("holdout_beats_market"),
+                holdout_incumbent_brier=d.get("holdout_incumbent_brier"),
+                holdout_beats_incumbent=d.get("holdout_beats_incumbent"),
             )
         except Exception as exc:
             log.warning("Could not load KsModel from %s: %s", path, exc)
@@ -299,6 +308,37 @@ def brier_score(probs: Sequence[float], outcomes: Sequence[int]) -> Optional[flo
     if not probs or len(probs) != len(outcomes):
         return None
     return sum((p - y) ** 2 for p, y in zip(probs, outcomes)) / len(probs)
+
+
+def holdout_brier_vs_incumbent(
+    holdout_props: Sequence[dict],
+) -> Tuple[Optional[float], int]:
+    """Brier of the hand-tuned fallback on the same holdout rows.
+
+    Scores models.fallback_ks_lambda — the exact formula expected_ks uses when
+    no trained model is on disk — so "is the trained model an improvement?" can
+    be answered instead of assumed.
+    """
+    from slugger.models import fallback_ks_lambda
+
+    ps: List[float] = []
+    ys: List[int] = []
+    for row in holdout_props:
+        thr = int(row.get("threshold", 0) or 0)
+        if thr <= 0 or row.get("market_price_cents") is None:
+            continue
+        if row.get("synthetic_market"):
+            continue
+        lam = fallback_ks_lambda(
+            float(row.get("recent_k", 0) or 0),
+            float(row.get("season_k", 0) or 0),
+            float(row.get("opp_k_rate", 0) or 0),
+        )
+        ps.append(poisson_ge(thr, lam))
+        ys.append(1 if float(row.get("actual_k", 0) or 0) >= thr else 0)
+    if len(ys) < 5:
+        return None, len(ys)
+    return brier_score(ps, ys), len(ys)
 
 
 def holdout_brier_vs_market(
@@ -532,15 +572,28 @@ def model_roi_vs_phase0_baseline(
     pnl = 0.0
     n = 0
     traded_details: List[dict] = []
+    # Which gate rejected each cell. When model_n is 0 this is the only thing
+    # that says whether the model never finds edge or the gates are too tight.
+    rejected = {
+        "threshold_below_min": 0,
+        "no_market_price": 0,
+        "synthetic_market": 0,
+        "prob_below_band": 0,
+        "prob_above_band": 0,
+        "edge_below_min": 0,
+    }
 
     for cell in scored:
         thr = int(cell.get("threshold", 0) or 0)
         if thr < _PHASE0_MIN_THRESHOLD:
+            rejected["threshold_below_min"] += 1
             continue
         mkt = cell.get("market_price_cents")
         if mkt is None or float(mkt) <= 0 or float(mkt) >= 100:
+            rejected["no_market_price"] += 1
             continue
         if cell.get("synthetic_market"):
+            rejected["synthetic_market"] += 1
             continue
         recent = float(cell.get("recent_k", 0) or 0)
         season = float(cell.get("season_k", 0) or 0)
@@ -553,9 +606,14 @@ def model_roi_vs_phase0_baseline(
         price = float(mkt)
         net_edge = model_pct - price - float(cost_buffer_cents)
 
-        if model_pct < _PHASE0_MIN_MODEL_PROB or model_pct > _PHASE0_MAX_MODEL_PROB:
+        if model_pct < _PHASE0_MIN_MODEL_PROB:
+            rejected["prob_below_band"] += 1
+            continue
+        if model_pct > _PHASE0_MAX_MODEL_PROB:
+            rejected["prob_above_band"] += 1
             continue
         if net_edge < _PHASE0_MIN_EDGE_CENTS:
+            rejected["edge_below_min"] += 1
             continue
 
         # Trade 1 unit sized so cost ≈ stake_usd at market price
@@ -600,6 +658,7 @@ def model_roi_vs_phase0_baseline(
         "n_in_sample_dropped": n_in_sample_dropped,
         "holdout_from": model.holdout_from,
         "cost_buffer_cents": cost_buffer_cents,
+        "rejected_by_gate": rejected,
     }
 
     if n < min_n:
@@ -703,6 +762,10 @@ def fit_ks_model(
         model.holdout_model_brier = mb
         model.holdout_market_brier = kb
         model.holdout_beats_market = beats
+        ib, _n = holdout_brier_vs_incumbent(scoped)
+        model.holdout_incumbent_brier = ib
+        if mb is not None and ib is not None:
+            model.holdout_beats_incumbent = mb < ib
 
     return model
 
@@ -788,7 +851,9 @@ def format_ks_fit_report(report: Dict[str, object]) -> str:
         f"coef={[round(c, 3) for c in m.coef]} holdout_from={m.holdout_from} "
         f"holdout_mae={m.holdout_mae}",
         f"  BRIER model={m.holdout_model_brier} market={m.holdout_market_brier} "
-        f"beats_market={m.holdout_beats_market}",
+        f"incumbent={m.holdout_incumbent_brier} "
+        f"beats_market={m.holdout_beats_market} "
+        f"beats_incumbent={m.holdout_beats_incumbent}",
         f"  MODEL_ROI status={roi.get('status')} "
         f"cells={roi['n_cells_scored']} "  # type: ignore[index]
         f"(dropped_in_sample={roi['n_in_sample_dropped']}) "  # type: ignore[index]
@@ -798,10 +863,28 @@ def format_ks_fit_report(report: Dict[str, object]) -> str:
         f"baseline_roi={baseline['roi_pct']:+.1f}% | "  # type: ignore[index]
         f"not_worse={roi['not_worse_than_baseline']}",  # type: ignore[index]
     ]
+    gates = roi.get("rejected_by_gate") or {}  # type: ignore[union-attr]
+    if gates and not model_stats["n"]:  # type: ignore[index]
+        why = ", ".join(f"{k}={v}" for k, v in gates.items() if v)
+        lines.append(
+            f"  No cell cleared the Phase-0 gates — rejections: {why}. "
+            "pitcher_ks would place ~zero trades even if re-enabled."
+        )
     if m.holdout_beats_market is not True:
         lines.append(
             "  ⚠️  Model does not beat market Brier on holdout — pitcher_ks has no "
             "demonstrated edge. Do not re-enable on the strength of this fit."
+        )
+    if m.holdout_beats_incumbent is False:
+        lines.append(
+            "  ⚠️  Model is also worse than the hand-tuned fallback it replaces. "
+            "Writing it to disk makes live pricing worse, not better — delete "
+            f"{report['model_path']} to revert to models.fallback_ks_lambda."
+        )
+    elif m.holdout_beats_incumbent is True:
+        lines.append(
+            "  ✓ Model beats the hand-tuned fallback, so shipping the artifact "
+            "is an improvement even though it does not beat the market."
         )
     return "\n".join(lines)
 
@@ -809,11 +892,17 @@ def format_ks_fit_report(report: Dict[str, object]) -> str:
 _LOADED: Optional[KsModel] = None
 
 
-def get_trained_ks_model(path: str = DEFAULT_MODEL_PATH) -> Optional[KsModel]:
+def get_trained_ks_model(path: Optional[str] = None) -> Optional[KsModel]:
+    """Load and memoise the trained model, or None when no artifact exists.
+
+    The path is resolved at call time rather than as a default argument, so
+    DEFAULT_MODEL_PATH can actually be overridden — binding it in the signature
+    freezes it at import and makes the lookup untestable.
+    """
     global _LOADED
     if _LOADED is not None:
         return _LOADED
-    _LOADED = KsModel.load(path)
+    _LOADED = KsModel.load(path if path is not None else DEFAULT_MODEL_PATH)
     return _LOADED
 
 
