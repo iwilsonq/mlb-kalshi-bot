@@ -285,3 +285,78 @@ is real but it is the second-order cost here; the spread is first-order.
   1000-contract obligations vs a $13.93 account, and `limit_price_cents` cannot
   rest an order). The story is consistent: the only viable edge on this venue
   requires providing liquidity, and we cannot.
+
+---
+
+## 12. Parlay markets are grossly mispriced — and the profitable side cannot be taken
+
+Ran the series calibration audit (2026-08-03): pull settled markets, compare
+last traded price to realised outcome, per series. No model, no odds key, no
+capital required. 12,000 settled markets collected; the feed is recency-ordered
+so only 4 series appeared, but two had enough data to test — both multivariate
+"combo"/parlay series.
+
+`KXMVESPORTSMULTIGAMEEXTENDED` (n=3029) and `KXMVECROSSCATEGORY` (n=1093) show
+enormous systematic **overpricing**:
+
+| last price | n | priced | ACTUAL | bias |
+|---|---:|---:|---:|---:|
+| 0–10¢ | 2137 | 2.9% | **0.0%** | +2.9 |
+| 10–20¢ | 416 | 14.0% | **1.0%** | **+13.0** |
+| 20–30¢ | 162 | 24.5% | **5.6%** | **+18.9** |
+| 30–40¢ | 115 | 34.3% | **7.8%** | **+26.5** |
+| 40–50¢ | 57 | 45.4% | **17.5%** | **+27.8** |
+| 50–60¢ | 37 | 54.2% | **29.7%** | **+24.5** |
+| 70–100¢ | 79 | — | — | −3 to −11 (underpriced) |
+
+That is the classic retail parlay bias, and it is 20–30 points wide — far larger
+than anything in MLB props. The second series replicates it independently
+(+12 to +31).
+
+### Why it is not tradeable by us
+
+The exploitable direction is short/NO. Checked 3000 live combo markets: **the
+book is entirely one-sided.**
+
+```
+yes_ask + no_bid = 1.0000 exactly    (they are the same order)
+no_ask  = 1.0000   -> cannot buy NO at any sensible price
+yes_bid = 0.0000   -> cannot sell YES
+```
+
+2756 of 3000 markets had *only* a NO bid. The one executable action is **buying
+YES — the side overpriced by 20–30 points.** The profitable side can only be
+*posted*, never taken.
+
+Whoever is posting those offers is running exactly this trade: selling
+overpriced parlays to retail. That is also why §3's incentive query found
+`KXMVESPORTSMULTIGAMEEXTENDED` among the subsidised series — Kalshi pays to
+attract that liquidity.
+
+### The conclusion this session keeps reaching
+
+Three independent routes — MLB prop modelling (§1, §7), cross-venue consensus
+(§11), and now a market-wide mispricing screen (§12) — all terminate at the same
+wall: **the available edge on this venue belongs to liquidity providers, and
+provision requires capital and resting-order logic we do not have** (§3:
+1000-contract obligations, fees on maker fills, `limit_price_cents` cannot rest).
+
+That is a coherent finding rather than a series of failures. It also sharpens
+what would actually change the picture, in order of leverage:
+1. Capital and a two-sided quoting engine (turns §12 from observation into a
+   business).
+2. A series that is **both** two-sided **and** mispriced. MLB props are
+   two-sided but efficient; parlays are mispriced but one-sided. The audit
+   method in this section is the cheap screen for finding one — it needs a
+   proper series enumeration, since the settled feed is recency-dominated.
+3. Nothing else measured this session moved the needle.
+
+### Caveats on the method
+
+- `last_price` is the last *trade*, not an executable quote. Good enough as a
+  screen; not proof of tradeability. §12's own conclusion came from checking
+  live quotes separately, which is the step that mattered.
+- Requires `result in (yes,no)`, `volume > 0`, `0 < last_price < 100`.
+- Favourite–longshot bias is near-universal in prediction markets. Finding it is
+  not finding edge; the magnitude has to beat spread plus fees, and the side has
+  to be executable.
