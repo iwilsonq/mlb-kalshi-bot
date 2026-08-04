@@ -38,6 +38,13 @@ class Config:
     # and the observed half-spread are computed per contract in signal_pipeline
     # (mlb-kalshi-bot-hyr); this no longer needs to stand in for them.
     edge_cost_buffer_cents: int = 2
+    # Parallel relative floor: post-fee edge must be worth at least this
+    # fraction of stake. 0.20 reproduces the historical 10c floor at 50c and
+    # tightens above it, where an absolute floor is lenient in return terms.
+    min_edge_frac_of_price: float = 0.20
+    # Reject quotes wider than this. Not a calibrated parameter - a guard
+    # against non-markets (Gate 0 saw bid 2c / ask 93c present as 37.7c edge).
+    max_spread_cents: int = 40
     kelly_fraction: float = 0.25  # Quarter-Kelly
     # Max fraction of live bankroll that may be risked across all trades in one day.
     # 0 disables the daily fraction cap (per-trade max_position_usd still applies).
@@ -106,6 +113,8 @@ class Config:
             max_contracts_per_trade=int(os.getenv("MAX_CONTRACTS_PER_TRADE", "10")),
             min_edge_cents=int(os.getenv("MIN_EDGE_CENTS", "5")),
             edge_cost_buffer_cents=int(os.getenv("EDGE_COST_BUFFER_CENTS", "2")),
+            min_edge_frac_of_price=float(os.getenv("MIN_EDGE_FRAC_OF_PRICE", "0.20")),
+            max_spread_cents=int(os.getenv("MAX_SPREAD_CENTS", "40")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             max_bankroll_fraction_per_day=float(
                 os.getenv("MAX_BANKROLL_FRACTION_PER_DAY", "0.20")

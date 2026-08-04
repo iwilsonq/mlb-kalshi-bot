@@ -56,6 +56,10 @@ def test_signal_records_microstructure(tmp_path):
     config.min_edge_cents = 3
     config.edge_cost_buffer_cents = 5
     config.min_liquidity_dollars = 0
+    # Mirror real Config: MagicMock would otherwise yield float()==1.0 here,
+    # making the relative floor 100% of price.
+    config.min_edge_frac_of_price = 0.20
+    config.max_spread_cents = 40
     config.kelly_fraction = 0.25
     config.max_position_usd = 50.0
     config.max_contracts_per_trade = 100
@@ -78,10 +82,11 @@ def test_signal_records_microstructure(tmp_path):
     assert signals[0].spread_cents == 5
     assert signals[0].raw_model_prob_pct == 50
     assert signals[0].gross_edge_cents == 20.0  # 50 - 30
-    # net = 20 - fee(30c)=2 - half-spread ceil(5/2)=3 - residual buffer 5 = 10.
-    # The flat buffer used to stand in for fee+spread+adverse-selection; fee and
-    # half-spread are now exact per contract (mlb-kalshi-bot-hyr).
-    assert signals[0].edge_cents == 10.0
+    # net = 20 - fee(30c)=2 - residual buffer 5 = 13.
+    # No half-spread term: gross_edge is measured against the ASK, so the spread
+    # is already paid by transacting there. Charging half of it again
+    # double-counted, overcharging ~8c on live MLB props (mlb-kalshi-bot-4v6).
+    assert signals[0].edge_cents == 13.0
 
     data = json.loads((tmp_path / "signals.jsonl").read_text().strip().splitlines()[0])
     assert data["bid_cents"] == 25
@@ -89,9 +94,9 @@ def test_signal_records_microstructure(tmp_path):
     assert data["mid_cents"] == 27.5
     assert data["spread_cents"] == 5
     assert data["fee_cents"] == 2.0
-    assert data["cost_buffer_cents"] == 10  # fee 2 + half-spread 3 + residual 5
+    assert data["cost_buffer_cents"] == 7  # fee 2 + residual 5
     assert data["gross_edge_cents"] == 20.0
-    assert data["net_edge_cents"] == 10.0
+    assert data["net_edge_cents"] == 13.0
     assert data["calibrated_prob_pct"] == 50
     assert data["model_prob_pct"] == 50  # raw for calibration
     assert data["traded"] is True

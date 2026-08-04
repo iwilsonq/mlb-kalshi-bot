@@ -154,10 +154,21 @@ def evaluate_markets(
     if not markets:
         return signals
 
-    # Effective edge floor: max of config global and strategy-specific.
-    # Floor is applied to *cost-adjusted* edge (after EDGE_COST_BUFFER_CENTS).
+    # Absolute edge floor: max of config global and strategy-specific, applied to
+    # post-fee edge. This is deliberately a longshot ban as well as an edge
+    # requirement: 10¢ is 23% of stake at 62¢ but 400% at 3¢, and the journal
+    # showed fee drag of 7.7% of stake at 0-20¢ entries versus 0.6% at 60-80¢.
+    # Keeping it absolute is the choice, not an accident (mlb-kalshi-bot-4v6).
     edge_floor = max(config.min_edge_cents, spec.min_edge_cents)
     cost_buffer = max(0, int(getattr(config, "edge_cost_buffer_cents", 0) or 0))
+    # Relative floor, applied in parallel: require the post-fee edge to be worth
+    # at least this fraction of stake. At 50¢ it reproduces the historical 10¢
+    # floor exactly; above that it tightens, where an absolute floor was lenient
+    # in return terms (10¢ on a 90¢ contract is an 11% return).
+    rel_frac = max(0.0, float(getattr(config, "min_edge_frac_of_price", 0.0) or 0.0))
+    # Reject unusable quotes outright. A bid of 2¢ against an ask of 93¢ is not a
+    # market, and its ask presented as 37.7¢ of "edge" in the Gate 0 audit.
+    max_spread = int(getattr(config, "max_spread_cents", 0) or 0)
     confidence_fn = spec.confidence_fn or _default_confidence
 
     player_last = ""
@@ -231,15 +242,19 @@ def evaluate_markets(
         # then use calibrated probability for edge/trade decisions.
         prob_pct = cal.calibrate(spec.strategy_name, raw_prob_pct)
         gross_edge = prob_pct - price
-        # True cost of taking, per contract, in cents:
-        #   exact Kalshi fee at this price + half the observed spread
-        #   + a residual buffer for adverse selection (config).
-        # Previously one flat buffer stood in for all three, which understated
-        # cost at low prices — fees alone were 7.7% of stake at 0-20c entries
-        # and 29% of the journal's total losses.
+        # `price` is the ASK, so gross_edge is already measured against what we
+        # would actually pay — the spread is paid by transacting here. Charging
+        # half the spread on top of that double-counts it, which is what an
+        # earlier version did: on live MLB props that overcharged by ~8¢ (median
+        # half-spread 11¢ against a true ask-minus-fair distance of 2.8¢, with
+        # de-vigged book fair sitting at 0.88 of the bid-ask range, not the mid).
+        #
+        # Real remaining costs are the exact fee, plus a residual haircut for
+        # adverse selection. Spread is handled as a *reject* rule below rather
+        # than a graduated charge, because a wide spread means the quote is
+        # unreliable, not that it is proportionally expensive.
         fee_cents = kalshi_fee_cents_per_contract(price)
-        half_spread = math.ceil(spread / 2) if spread > 0 else 0
-        trade_cost = fee_cents + half_spread + cost_buffer
+        trade_cost = fee_cents + cost_buffer
         net_edge = gross_edge - trade_cost
         evaluated.append((threshold, prob_pct, price, gross_edge, net_edge))
 
@@ -248,9 +263,19 @@ def evaluate_markets(
         if spec.max_model_prob > 0 and prob_pct > spec.max_model_prob:
             in_prob_band = False
 
+        # ── Quote usability + effective floor ──────────────────────────────
+        quote_ok = True
+        if max_spread > 0 and bid > 0 and spread > max_spread:
+            log.debug(
+                "%s spread %d¢ > max %d¢ (bid %d / ask %d) — quote unusable",
+                ticker, spread, max_spread, bid, price,
+            )
+            quote_ok = False
+        required_edge = max(edge_floor, math.ceil(rel_frac * price))
+
         # ── Record signal (raw model prob for calibration data) ────────────
         # Journal keeps *gross* edge for research continuity; trade uses net.
-        traded = net_edge >= edge_floor and in_prob_band
+        traded = net_edge >= required_edge and in_prob_band and quote_ok
         record_signal(
             config.log_dir,
             ticker,

@@ -55,6 +55,10 @@ def _make_config(
     config.min_edge_cents = min_edge
     config.edge_cost_buffer_cents = cost_buffer
     config.min_liquidity_dollars = 0
+    # Mirror real Config: MagicMock would otherwise yield float()==1.0 here,
+    # making the relative floor 100% of price.
+    config.min_edge_frac_of_price = 0.20
+    config.max_spread_cents = 40
     config.kelly_fraction = 0.25
     config.max_position_usd = max_position
     config.max_contracts_per_trade = 100
@@ -490,3 +494,89 @@ class TestUnparsedTitleTracking:
             "pitcher_ks": ["Smith over 6.5 strikeouts"],
         }
         clear_unparsed_titles()
+
+
+# ─── Cost model: no half-spread double-count; relative floor; spread gate ────
+
+class TestCostModelAndFloors:
+    """gross_edge is measured at the ASK, so the spread is already paid.
+
+    An earlier version subtracted half the spread on top, which double-counted
+    and overcharged ~8c on live MLB props: median half-spread was 11c against a
+    true ask-minus-fair distance of 2.8c, because de-vigged book fair value sits
+    at 0.88 of the bid-ask range rather than the mid (mlb-kalshi-bot-4v6).
+    """
+
+    def _spec(self, min_edge=3, min_prob=0):
+        return MarketSpec(
+            event_ticker="TEST",
+            strategy_name="pitcher_ks",
+            title_keywords=["strikeout"],
+            player_name="John Smith",
+            threshold_pattern=r'(\d+)\s*\+',
+            min_threshold=6,
+            min_edge_cents=min_edge,
+            min_model_prob=min_prob,
+        )
+
+    def _run(self, tmp_path, prob, ask, bid=None, **cfg):
+        m = _make_market("TEST-7", "Smith 7+ strikeouts", f"{ask/100:.2f}")
+        if bid is not None:
+            m["yes_bid_dollars"] = f"{bid/100:.2f}"
+        config = _make_config(str(tmp_path), min_edge=cfg.pop("min_edge", 3),
+                              cost_buffer=cfg.pop("cost_buffer", 0))
+        for k, v in cfg.items():
+            setattr(config, k, v)
+        return evaluate_markets(
+            self._spec(min_edge=3),
+            lambda t, th, p: ModelResult(prob_pct=prob, reason="t"),
+            _make_client([m]), config,
+        )
+
+    def test_wide_spread_does_not_reduce_edge(self):
+        """A wide spread must not be charged as a graduated cost."""
+        import tempfile
+        tight = self._run(tempfile.mkdtemp(), prob=45, ask=30, bid=29)
+        wide = self._run(tempfile.mkdtemp(), prob=45, ask=30, bid=5)
+        assert len(tight) == 1 and len(wide) == 1
+        # Same ask, same model prob -> identical net edge regardless of the bid
+        assert tight[0].edge_cents == wide[0].edge_cents == 13.0
+
+    def test_spread_gate_rejects_unusable_quote(self, tmp_path):
+        """bid 2c / ask 93c is not a market; Gate 0 saw it present as 37.7c edge."""
+        sig = self._run(tmp_path, prob=90, ask=93, bid=2, max_spread_cents=40)
+        assert sig == []
+
+    def test_spread_gate_ignores_absent_bid(self, tmp_path):
+        """No bid at all is not evidence of a bad quote, so do not reject on it."""
+        sig = self._run(tmp_path, prob=45, ask=30, max_spread_cents=40)
+        assert len(sig) == 1
+
+    def test_relative_floor_matches_absolute_at_fifty_cents(self):
+        """0.20 x 50c == the historical 10c floor, so behaviour is continuous."""
+        import math as _m
+        assert _m.ceil(0.20 * 50) == 10
+
+    def test_relative_floor_tightens_at_high_prices(self, tmp_path):
+        """10c on a 90c contract is an 11% return; the relative floor blocks it."""
+        # prob 99, ask 90 -> gross 9, fee(90)=1, net 8. Absolute floor 3 would
+        # pass; relative floor ceil(0.20*90)=18 must block.
+        sig = self._run(tmp_path, prob=99, ask=90, bid=88,
+                        min_edge_frac_of_price=0.20, max_spread_cents=40)
+        assert sig == []
+        # With the relative floor disabled it trades, proving that gate is the cause
+        sig2 = self._run(tmp_path, prob=99, ask=90, bid=88,
+                         min_edge_frac_of_price=0.0, max_spread_cents=40)
+        assert len(sig2) == 1
+
+    def test_absolute_floor_still_bans_longshots(self, tmp_path):
+        """At 5c the relative floor is only 1c, so the absolute floor must bind.
+
+        Fee drag was 7.7% of stake at 0-20c entries versus 0.6% at 60-80c, so
+        keeping the absolute floor as a longshot ban is deliberate.
+        """
+        # prob 20, ask 5 -> gross 15, fee(5)=1, net 14. relative floor = 1.
+        # Absolute floor of 20 must block it.
+        sig = self._run(tmp_path, prob=20, ask=5, bid=4, min_edge=20,
+                        min_edge_frac_of_price=0.20, max_spread_cents=40)
+        assert sig == []
