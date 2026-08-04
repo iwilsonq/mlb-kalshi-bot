@@ -360,3 +360,49 @@ what would actually change the picture, in order of leverage:
 - Favourite–longshot bias is near-universal in prediction markets. Finding it is
   not finding edge; the magnitude has to beat spread plus fees, and the side has
   to be executable.
+
+---
+
+## 13. Incentivised-series audit: every quotable series is well calibrated
+
+The final screen (2026-08-03): if a series is *both* two-sided *and* mispriced,
+market making there has a subsidised learning curve. Scanned all 199 series in
+Kalshi's incentive program (the only clean enumeration available —
+`/series/list` 404s and the settled feed is recency-dominated), 12,903 usable
+settled markets, 24 series with n≥100.
+
+Pre-committed kill criterion: report negative unless some series shows ≥10pt
+overall bias or a ≥15pt bucket on n≥20. **Zero candidates.**
+
+| series (top by n) | n | price | actual | bias | Brier |
+|---|---:|---:|---:|---:|---:|
+| KXTRUMPMENTION | 1000 | 41.4¢ | 41.2% | +0.2 | 0.0002 |
+| KXTEMPAUSH (weather) | 917 | 62.8¢ | 62.9% | −0.1 | 0.0008 |
+| KXAAAGASD (gas price) | 989 | 53.4¢ | 52.1% | +1.3 | 0.0207 |
+| KXUSDJPY | 375 | 15.2¢ | 12.8% | +2.4 | 0.0185 |
+| KXUST2AD (treasuries) | 186 | 59.3¢ | 55.4% | +4.0 | 0.0395 |
+| …19 more, all within ±4pt | | | | | |
+
+Worst single bucket anywhere: +11.2pt on n=47 (KXAAAGASD 10–20¢) — noise-sized.
+Weather series are calibrated to a tenth of a point across 3,400+ markets;
+mention markets have Briers of 0.0001–0.0002 (near-deterministic and priced as
+such).
+
+Confirms the anti-correlation §12 predicted: **the incentive program works.**
+Paid quoters produce calibrated books. Mispricing survives only where no one is
+paid to quote (parlays, §12) — and there the book is one-sided by construction.
+
+### Session verdict
+
+Every route is now measured, none is tradeable for us:
+
+| route | finding | why not tradeable |
+|---|---|---|
+| MLB prop modelling | market efficient (§1) | 0.007 Brier behind, friction on top |
+| Cross-venue consensus | venues agree (§11) | fair sits at Kalshi's ask |
+| Parlay mispricing | 20–30pt (§12) | one-sided book; can only post |
+| Incentivised series | all calibrated (§13) | professionals already quote them |
+
+The remaining edge on this venue is liquidity provision, which requires capital
+and a quoting engine (§3, §12). The bot should not trade
+(`DRY_RUN=true` permanently); it remains a sound measurement instrument.
