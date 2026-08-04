@@ -231,3 +231,57 @@ Useful schema details found while auditing (`GET /markets`):
   as the depth proxy.
 - p90 spreads are far worse than medians (23–25¢ hits, 48–76¢ Ks), so any
   spread gate must be per-market, not per-cell.
+
+---
+
+## 11. Consensus/de-vig is dead: Kalshi's spread is ~3× the book's vig
+
+Gate 0 run 2026-08-03 with a real Odds API key, one game (TOR@HOU), 18
+de-viggable cells joined to live Kalshi quotes. Cost: 4 of 500 credits.
+
+```
+book vig (DK/BetMGM/FD/BetRivers)   median  7.6%   (range 7.0-8.1)
+Kalshi spread, same cells           median   22c   (range 7-91)
+
+de-vigged book fair vs Kalshi MID   median  +7.9c   <- ~half the spread
+de-vigged book fair vs Kalshi ASK   median  -2.9c   best +1.8c
+required edge (halfspread+fee+10c)          16-27c
+cells clearing it                            0 / 18
+```
+
+**The de-vigged book price lands almost exactly on Kalshi's mid.** The two
+venues agree on fair value; there is no disagreement to arbitrage. Kalshi's ask
+sits above fair by roughly half the spread — which is what an ask is supposed to
+do.
+
+### Correction to earlier reasoning in this file
+
+§1 argued consensus was the most promising direction because "books charge 6–10%
+vig, Kalshi charges ~2% fee plus spread, so the venues have different cost
+structures and should persistently disagree on displayed price." **That was
+wrong.** It treated Kalshi's cost as fee-dominated. On these props Kalshi's
+*spread* is 10–45%, which dwarfs both its fee and the book's vig. The
+cheap-fee venue is the expensive venue once you cross its spread. Fee drag (§2)
+is real but it is the second-order cost here; the spread is first-order.
+
+### Supporting details
+
+- **`_alternate` ladders are Over-only** — `sides=['Over']` at every alternate
+  threshold, so they cannot be de-vigged (no overround to remove). Only the main
+  lines are two-sided: hits 0.5/1.5 and Ks 4.5. That eliminates most of the
+  ladder, including the Ks 5.5/6.5 cells §10 identified as targets.
+- **No shared player ID.** `description` is a plain name; `sid` is
+  bookmaker-internal. The Sportradar-join hope from §10 is dead — name matching
+  with unicode normalisation is required ("Yandy Díaz" → "yandy diaz").
+- **"Consensus" is mostly one book.** 13 of 18 cells had a single two-sided
+  quote (DraftKings). It is DK's opinion, not a consensus.
+- **Garbage quotes masquerade as edge.** Varsho 1.5 showed bid 2¢ / ask 93¢ — a
+  91¢ spread — presenting as −37.7¢ "edge". Any live use needs a hard
+  per-market spread gate, and the apparent outliers will almost always be
+  illiquidity rather than opportunity.
+- The one place the arithmetic works is **earning mid rather than paying the
+  ask** (+7.9¢). That is market making, closed off in §3 for independent
+  reasons (fees on maker fills, no liquidity incentive on these series,
+  1000-contract obligations vs a $13.93 account, and `limit_price_cents` cannot
+  rest an order). The story is consistent: the only viable edge on this venue
+  requires providing liquidity, and we cannot.
