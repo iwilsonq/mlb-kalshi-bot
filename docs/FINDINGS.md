@@ -191,3 +191,43 @@ number for half a day before catching it.
   on walk-forward holdout, *then* re-derive gates from the model's own
   probabilities. Never widen gates to force trades — the below-band cells are
   longshots, where journal ROI was worst.
+
+---
+
+## 10. Kalshi prop microstructure is inversely aligned with model reliability
+
+Audited 547 open MLB prop markets (2026-08-03). Median spread by cell, with the
+gross edge required to clear the 10¢ net floor after half-spread and fee:
+
+| cell | price | spread | gross needed | as % of price |
+|---|---:|---:|---:|---:|
+| hits Over 0.5 | 62¢ | 4¢ | 14¢ | 23% |
+| hits Over 1.5 | 25¢ | 9¢ | 17¢ | 68% |
+| hits Over 2.5 | 6¢ | 2¢ | 12¢ | **200%** |
+| hits Over 3.5 | 3¢ | 1¢ | 12¢ | **400%** |
+| Ks Over 4.5 | 45¢ | 8¢ | 16¢ | 36% |
+| Ks Over 5.5 | 30¢ | 7¢ | 16¢ | 53% |
+| Ks Over 6.5 | 20¢ | 6¢ | 15¢ | 75% |
+
+Two structural facts:
+
+1. **The tight-spread cells are the ones we shouldn't trade.** Longshot hit
+   props (Over 2.5/3.5) quote 1–2¢ wide, but carry the worst fee drag
+   (§2) and were where the model was least reliable (§4). The cells where the
+   model is most trustworthy carry 4–8¢ spreads.
+2. **The 10¢ edge floor is absolute, so it is a de facto longshot ban** — 400%
+   relative edge at 3¢, 23% at 62¢. Defensible given §2, but it should be
+   deliberate rather than an artifact of measuring in cents. Bead filed.
+
+Useful schema details found while auditing (`GET /markets`):
+- **`floor_strike` is already in book form** (0.5, 1.5, 2.5 …), so the
+  Kalshi-`N+` ↔ book-`Over N−0.5` translation needs no code — read the field
+  instead of parsing the ticker suffix.
+- **`custom_strike.baseball_player` is a UUID** (plus `baseball_team`), very
+  likely Sportradar given Kalshi's live-data API uses Sportradar. If an odds
+  provider keys on the same IDs, player mapping is an exact join instead of the
+  name matching we currently limp along with. Verify before writing a matcher.
+- `liquidity_dollars` reads `0.0000` on every market; use `open_interest_fp`
+  as the depth proxy.
+- p90 spreads are far worse than medians (23–25¢ hits, 48–76¢ Ks), so any
+  spread gate must be per-market, not per-cell.
