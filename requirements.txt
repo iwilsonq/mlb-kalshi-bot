@@ -9,3 +9,6 @@ pybaseball
 
 # Kalshi (cryptography for RSA-PSS signing)
 cryptography
+
+# Phase 0 live recorder (Kalshi websocket streams)
+websockets>=12

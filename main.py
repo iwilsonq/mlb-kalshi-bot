@@ -353,7 +353,7 @@ def main():
     parser = argparse.ArgumentParser(prog="slugger", description="MLB Kalshi trading bot")
     parser.add_argument(
         "command",
-        choices=["run", "status", "check", "settle", "stats", "calibrate", "report"],
+        choices=["run", "status", "check", "settle", "stats", "calibrate", "report", "record"],
         help="Command",
     )
     parser.add_argument("--env", default=".env", help="Path to .env file")
@@ -369,7 +369,7 @@ def main():
     )
     parser.add_argument(
         "--date", metavar="YYYY-MM-DD",
-        help='(stats only) Filter to trades placed on this date. Use "today" for today.',
+        help='(stats/record) Filter to this date. Use "today" for today (stats only).',
     )
     parser.add_argument(
         "--ask", action="store_true",
@@ -405,6 +405,9 @@ def main():
         cmd_status(config)
     elif args.command == "settle":
         cmd_settle(config)
+    elif args.command == "record":
+        from slugger.recorder import run_recorder
+        run_recorder(config, target_date=args.date)
 
 
 if __name__ == "__main__":
