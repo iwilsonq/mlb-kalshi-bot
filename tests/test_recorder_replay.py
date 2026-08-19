@@ -222,3 +222,77 @@ def test_load_gumbo_sorts_by_receive_time(tmp_path):
     ]) + "\n")
     states, _ = load_gumbo(g)
     assert [s.recv_ts for s in states[1]] == [4.0, 9.0]
+
+
+# ─── Mid-slate starts ────────────────────────────────────────────────────────
+
+def _gumbo_with_backfill(tmp_path):
+    """A recorder launched mid-game: GUMBO's first poll returns allPlays."""
+    g = tmp_path / "gumbo.jsonl"
+    live = {"inning": 3, "half": "Top", "is_top": True, "outs": 1,
+            "home_runs": 1, "away_runs": 0,
+            "on_first": False, "on_second": False, "on_third": False}
+    start = 2000.0
+    g.write_text("\n".join(json.dumps(x) for x in [
+        {"recv_ts": start, "type": "gumbo_state", "game_pk": 1,
+         "status": "Live", "state": live},
+        # backlog: finished long before we started watching, but emitted now
+        {"recv_ts": start, "type": "gumbo_play", "game_pk": 1,
+         "at_bat_index": 1, "inning": 1, "half": "top",
+         "end_time": "1970-01-01T00:16:00.0Z",   # epoch 960 << start
+         "event": "Single", "event_type": "single", "description": "old",
+         "away_score": 0, "home_score": 0},
+        # genuinely observed live
+        {"recv_ts": start + 30, "type": "gumbo_play", "game_pk": 1,
+         "at_bat_index": 9, "inning": 3, "half": "top",
+         "end_time": "1970-01-01T00:33:40.0Z",   # epoch 2020 > start
+         "event": "Home Run", "event_type": "home_run", "description": "new",
+         "away_score": 0, "home_score": 1},
+    ]) + "\n")
+    return g
+
+
+def test_backfilled_plays_are_dropped(tmp_path):
+    """Plays that finished before recording started are not observations.
+
+    Kept, they look like plays seen ~17 minutes late and wreck the latency
+    and reaction-timing measurements (median 25s -> 443s on a real slate).
+    """
+    _, plays = load_gumbo(_gumbo_with_backfill(tmp_path))
+    assert [p.event for p in plays[1]] == ["Home Run"]
+
+
+def test_backfill_filter_can_be_disabled(tmp_path):
+    _, plays = load_gumbo(_gumbo_with_backfill(tmp_path), drop_backfill=False)
+    assert [p.event for p in plays[1]] == ["Single", "Home Run"]
+
+
+def test_nothing_dropped_when_recording_started_before_first_pitch(tmp_path):
+    """The normal case: the filter must be a no-op."""
+    g = tmp_path / "gumbo.jsonl"
+    live = {"inning": 1, "half": "Top", "is_top": True, "outs": 0,
+            "home_runs": 0, "away_runs": 0,
+            "on_first": False, "on_second": False, "on_third": False}
+    g.write_text("\n".join(json.dumps(x) for x in [
+        {"recv_ts": 1000.0, "type": "gumbo_state", "game_pk": 1,
+         "status": "Live", "state": live},
+        {"recv_ts": 1100.0, "type": "gumbo_play", "game_pk": 1,
+         "at_bat_index": 0, "inning": 1, "half": "top",
+         "end_time": "1970-01-01T00:18:00.0Z",   # epoch 1080 > 1000
+         "event": "Strikeout", "event_type": "strikeout", "description": "d",
+         "away_score": 0, "home_score": 0},
+    ]) + "\n")
+    _, plays = load_gumbo(g)
+    assert len(plays[1]) == 1
+
+
+def test_epoch_parses_mlbs_variable_length_fractional_seconds(tmp_path):
+    """MLB emits 5-digit fractions; Python 3.9 fromisoformat wants 3 or 6."""
+    from slugger.recorder.replay import _epoch
+    assert _epoch("2026-08-19T04:18:54.92285Z") == pytest.approx(
+        _epoch("2026-08-19T04:18:54.922850Z"))
+    assert _epoch("2026-08-19T04:18:54.9Z") == pytest.approx(
+        _epoch("2026-08-19T04:18:54.900000Z"))
+    # no fractional part at all
+    assert _epoch("2026-08-19T04:18:54Z") == pytest.approx(
+        _epoch("2026-08-19T04:18:54.000000Z"))

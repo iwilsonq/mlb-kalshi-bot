@@ -70,14 +70,23 @@ def _cache_path(day_dir: Path) -> Path:
 def extract(day_dir: Path, rebuild: bool = False) -> dict:
     """Pull the game-winner book series + scored game states out of a slate."""
     cache = _cache_path(day_dir)
-    if cache.exists() and not rebuild:
-        with cache.open("rb") as f:
-            return pickle.load(f)
-
     kalshi = day_dir / "kalshi.jsonl"
     gumbo = day_dir / "gumbo.jsonl"
     if not kalshi.exists() or not gumbo.exists():
         raise FileNotFoundError(f"incomplete recording in {day_dir}")
+
+    # Stamp the cache with the source sizes. Analysing today's slate mid-game
+    # is useful, but the recording keeps growing, and a cache that silently
+    # served this morning's four innings for the rest of the season is the
+    # kind of bug that never announces itself.
+    stamp = (kalshi.stat().st_size, gumbo.stat().st_size)
+    if cache.exists() and not rebuild:
+        with cache.open("rb") as f:
+            data = pickle.load(f)
+        if data.get("source_sizes") == stamp:
+            return data
+        print(f"  {day_dir.name}: recording grew since the cache was built "
+              f"— re-extracting", flush=True)
 
     print(f"  extracting {day_dir.name} "
           f"({kalshi.stat().st_size / 1e9:.1f} GB) ...", flush=True)
@@ -96,6 +105,7 @@ def extract(day_dir: Path, rebuild: bool = False) -> dict:
         "states": states,
         "plays": plays,
         "quotes": dict(quotes),
+        "source_sizes": stamp,
     }
     with cache.open("wb") as f:
         pickle.dump(data, f)
@@ -230,10 +240,15 @@ def report_latency(events: Sequence[Event], data_list: Sequence[dict]) -> float:
     )
     print(f"\nSanity check — our clock vs Kalshi's exchange timestamps "
           f"(n={len(skew):,}):")
-    print(f"    p25 {pct(skew, .25):+.3f}s   p50 {pct(skew, .50):+.3f}s   "
+    med = pct(skew, .50)
+    print(f"    p25 {pct(skew, .25):+.3f}s   p50 {med:+.3f}s   "
           f"p99 {pct(skew, .99):+.3f}s")
-    print("    Sub-second. The lag above is real information delay, not a "
-          "clock artifact.")
+    if abs(med) < 1.0:
+        print("    Median is sub-second, so the lag above is real information "
+              "delay, not clock skew.")
+    else:
+        print("    !! Median skew is over a second — the latency figures above "
+              "are suspect until this is explained.")
     return statistics.median(lat)
 
 

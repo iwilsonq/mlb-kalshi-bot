@@ -31,6 +31,20 @@ def _cents(price_dollars: str) -> int:
     return int(round(float(price_dollars) * CENTS))
 
 
+def _epoch(iso: str) -> float:
+    """Parse an MLB/Kalshi ISO timestamp to epoch seconds.
+
+    Python 3.9's fromisoformat only accepts 3- or 6-digit fractional seconds,
+    and MLB emits whatever length it feels like ('...:54.92285Z').
+    """
+    import datetime as _dt
+    s = iso.strip().rstrip("Z")
+    if "." in s:
+        head, frac = s.split(".", 1)
+        s = f"{head}.{frac[:6].ljust(6, '0')}"
+    return _dt.datetime.fromisoformat(s).replace(tzinfo=_dt.timezone.utc).timestamp()
+
+
 # ─── Manifest ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -272,18 +286,33 @@ class PlaySample:
 
 def load_gumbo(
     gumbo_path: Path,
+    *,
+    drop_backfill: bool = True,
 ) -> Tuple[Dict[int, List[StateSample]], Dict[int, List[PlaySample]]]:
-    """Load per-game state and play series, states scored by the WP anchor."""
+    """Load per-game state and play series, states scored by the WP anchor.
+
+    `drop_backfill` discards plays that finished before recording started.
+    GUMBO's first poll returns the game's entire `allPlays` history, so a
+    recorder launched mid-slate emits every completed play at once with a
+    receive time of "now". Kept, those look like plays we observed 40 minutes
+    late, and they destroy any latency or reaction-timing measurement — on a
+    recorder started 90 minutes into 2026-08-19 they moved median observed
+    latency from 25s to 443s. We were not watching when they happened, so
+    they are not observations.
+    """
     from slugger.wp import get_wp
 
     states: Dict[int, List[StateSample]] = {}
     plays: Dict[int, List[PlaySample]] = {}
+    started_at: Optional[float] = None
 
     with Path(gumbo_path).open("rb") as f:
         for raw in f:
             r = json.loads(raw)
             pk = r.get("game_pk")
             kind = r.get("type")
+            if started_at is None and r.get("recv_ts"):
+                started_at = float(r["recv_ts"])
             if kind == "gumbo_state":
                 st = r.get("state") or {}
                 # Pre-first-pitch snapshots have no innings played and no
@@ -299,6 +328,10 @@ def load_gumbo(
                     wp=get_wp(st),
                 ))
             elif kind == "gumbo_play":
+                if drop_backfill and started_at is not None:
+                    end = r.get("end_time") or ""
+                    if end and _epoch(end) < started_at:
+                        continue
                 plays.setdefault(pk, []).append(PlaySample(
                     recv_ts=r["recv_ts"],
                     game_pk=pk,
