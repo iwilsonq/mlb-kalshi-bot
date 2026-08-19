@@ -55,6 +55,12 @@ half_spread − 2¢ residual` (commit `0165637`); prefer higher-priced contracts
 structurally; fee rate is per-series configurable on Kalshi
 (`GET /series/{ticker}/fee_changes`) so check it before entering any new series.
 
+> **Amended by §15 (bead `81s`):** the fee ceiling applies once per *order*,
+> not per contract, so the drag figures in the table above are overstated —
+> most of all in the 0–20¢ bucket, where the old per-contract rounding
+> inflated the fee by up to 46%. The ranking across price buckets, and the
+> conclusion that price level dominates, both survive.
+
 ---
 
 ## 3. Market making on Kalshi is closed off (bead `33s`)
@@ -505,3 +511,69 @@ The reusable parts survive: `slugger/recorder/replay.py` (order-book
 reconstruction from the raw feed) and `scripts/overshoot_analysis.py` re-run on
 any recorded slate in ~1 minute. Any future in-game idea must first answer the
 latency question, because on this venue it dominates every model question.
+
+---
+
+## 15. The fee model was wrong twice, and Kalshi's advertised discount is not charged (bead `81s`)
+
+Re-audited against **390 of our own fills on 2026-08-19** (335 taker, 55 maker,
+using the explicit `is_taker` and `fee_cost` fields the API now returns).
+Reproduce with `python3 scripts/analyze_maker_fees.py`.
+
+### The ceiling applies once per order, not once per contract
+
+`ceil_to_cent(0.07 × P × (1−P))` per contract, multiplied by count — what
+`models.py` did since the beginning — reproduced **1 of 335** taker fills. The
+real formula ceilings the order total to a hundredth of a cent:
+
+```
+fee = ceil_to_$0.0001( rate × P × (1−P) × count )
+```
+
+which reproduces **287 of 335 (86%)**. The old form overcharged worst exactly
+where we traded most: 10 contracts at 11¢ cost **$0.0686**, not $0.10 — a 46%
+overstatement, because every single contract got rounded up to a full cent.
+§2's table was directionally right and quantitatively too pessimistic.
+
+A second, smaller bug hid inside the fix: `0.07 × 0.40 × 0.60 × 10` evaluates
+to `0.16800000000000004` in binary floating point, and ceiling that unguarded
+bills $0.1681 for a $0.1680 fee. Rounding before the ceiling recovered 14
+fills (81% → 86%).
+
+### Maker fees are per-series, and confirmed exactly
+
+| `fee_type` | series | maker fee | n |
+|---|---|---|---:|
+| `quadratic` | KXMLBTOTAL/KS/HIT/HR/SPREAD/F5 | **exactly $0** | 50/50 |
+| `quadratic_with_maker_fees` | KXMLBGAME | **25% of taker** (0.250–0.257) | 5/5 |
+
+An unrecognised `fee_type` now falls back to *charging* makers the full taker
+rate. Guessing "makers are free" understates cost, and understated cost is
+indistinguishable from edge.
+
+### `fee_multiplier` is reported but not charged — do not apply it
+
+Every MLB series reports `fee_multiplier: 0.5`. The premise of bead `81s` was
+that our fee model therefore overstates by ~2×. **It does not, and applying the
+multiplier would have understated fees by 2×:**
+
+| taker fills reproduced exactly | n=335 |
+|---|---:|
+| rate 0.07, no multiplier | **287 (86%)** |
+| rate 0.07 × `fee_multiplier` | 79 (24%) |
+
+Every MLB taker fill on 2026-08-19 — *after* the field appeared — matched the
+full 0.07 (KXMLBGAME at 3¢/50¢/59¢, KXMLBSPREAD, KXMLBTOTAL). Only
+2026-08-18's five fills matched 0.035, and the same series reverted the next
+day: a one-day promotion, not a rate change. The multiplier is recorded on
+`SeriesFees.reported_multiplier` and `analyze_maker_fees.py` prints both match
+rates side by side, so if Kalshi starts charging it the audit says so.
+
+**Decision:** ship the corrected rounding and the per-series maker rates; do
+not apply `fee_multiplier`. Net effect on live edge math is a **relaxation** of
+about 0.5¢ per contract (the fee at 30¢ is 1.47¢, not a ceil'd 2¢), which is
+real money at `MIN_EDGE_CENTS=5`. `slugger/fees.py` owns the series lookup and
+resolves every failure path to the most expensive terms; `slugger/models.py`
+stays pure math. `kalshi_fee_dollars` is exact once `count` is known;
+`kalshi_fee_cents_per_contract` is the unrounded rate for edge math evaluated
+before sizing.

@@ -19,7 +19,10 @@ Helpers:
   - expected_ab:                    Expected at-bats per lineup position
   - shrink_avg:                     Bayesian batting average shrinkage
   - pitcher_quality:                Pitcher rating vs league average
-  - kalshi_fee_cents_per_contract:  Exact taker fee at a given price
+  - kalshi_fee_dollars:             Exact fee for an order (ceiling applies to
+                                    the order total, not per contract)
+  - kalshi_fee_cents_per_contract:  Unrounded per-contract fee, for edge math
+                                    evaluated before position size is known
 """
 from __future__ import annotations
 
@@ -42,6 +45,26 @@ log = logging.getLogger(__name__)
 LEAGUE_AVG_K_RATE  = 0.225   # ~22.5% of PAs end in strikeout (2024 MLB avg)
 DEFAULT_IP         = 5.5     # default expected IP when recent data is missing
 KS_LAMBDA_DEFLATOR = 0.85    # calibration: model over-predicts by ~15-20%, deflate lambda
+
+# ── Kalshi fees ───────────────────────────────────────────────────────────────
+# Taker rate. Verified on 335 taker fills across 2026-06-13..2026-08-19.
+#
+# Deliberately NOT scaled by the `fee_multiplier` that GET /series/{ticker}
+# now reports (0.5 on every MLB series as of 2026-08-19). Every MLB taker
+# fill on 2026-08-19 — after that field appeared — matched the full 0.07;
+# only 2026-08-18's five fills matched 0.035, and the same series reverted
+# the next day. Applying the multiplier reproduced 24% of fills against 86%
+# without it. A halved fee is the pleasant assumption, so it needs better
+# evidence than one day, not less: understating fees is what makes a bot
+# take negative-edge trades. Re-check with scripts/analyze_maker_fees.py.
+KALSHI_TAKER_FEE_RATE = 0.07
+
+FEE_TYPE_QUADRATIC = "quadratic"                                # makers free
+FEE_TYPE_QUADRATIC_WITH_MAKER_FEES = "quadratic_with_maker_fees"
+
+# Makers pay this fraction of the taker rate on quadratic_with_maker_fees.
+# Observed 0.250, 0.251, 0.251, 0.251, 0.257 on five KXMLBGAME maker fills.
+MAKER_FEE_FRACTION = 0.25
 
 # ── Lineup position ───────────────────────────────────────────────────────────
 AVG_AB_PER_GAME = 3.9  # MLB average ABs per player per game (fallback)
@@ -145,24 +168,83 @@ def poisson_ge(n: int, lam: float) -> float:
     return max(0.01, min(0.99, 1.0 - cumulative))
 
 
-def kalshi_fee_cents_per_contract(price_cents: float, fee_rate: float = 0.07) -> float:
-    """Kalshi trading fee in cents for one contract at a given price.
+def kalshi_fee_dollars(
+    price_cents: float,
+    count: float,
+    *,
+    maker: bool = False,
+    fee_type: str = FEE_TYPE_QUADRATIC,
+    fee_rate: float = KALSHI_TAKER_FEE_RATE,
+) -> float:
+    """Exact Kalshi trading fee in dollars for `count` contracts at a price.
 
-    Formula (verified against 724/1042 of our own settled fills exactly):
-      fee = ceil_to_cent(fee_rate * P * (1 - P))  per contract
+        fee = ceil_to_hundredth_of_a_cent(rate * P * (1 - P) * count)
 
-    The fee is symmetric in P, so it is a roughly fixed cost in *notional* but a
-    savagely price-dependent cost as a share of *stake*: measured on the journal,
-    fee drag was 7.7% of stake at 0-20c entries and 0.6% at 60-80c. Fees were
-    $40.24 of a $140.82 total loss — 29% — so this belongs in the edge math,
-    not in a flat buffer. A flat 5c buffer is 25% of stake on a 20c contract
-    and 6% on an 80c one; the true fee at both is ~1c.
+    Two things here were wrong for a long time and both were verified against
+    390 of our own fills on 2026-08-19 (`scripts/analyze_maker_fees.py`):
 
-    fee_rate is per-series configurable on Kalshi's side (see
-    GET /series/{ticker}/fee_changes); 0.07 is what our MLB fills matched.
+    1. The ceiling applies **once to the order total**, not per contract.
+       Rounding per contract and multiplying reproduced 1 of 335 taker fills;
+       this formula reproduces 287 (86%). The error is large at longshot
+       prices, where every contract used to be rounded up to a full cent:
+       10 contracts at 11c cost $0.0686, not $0.10.
+    2. The rounding increment is $0.0001, not $0.01.
+
+    Maker fees depend on the series' `fee_type` (from GET /series/{ticker}):
+    `quadratic` charges makers nothing (50/50 of our maker fills were exactly
+    $0), `quadratic_with_maker_fees` charges 25% of the taker rate (5/5 fills
+    at 0.250-0.257).
+
+    The fee is symmetric in P, so it is roughly fixed in *notional* but
+    savage as a share of *stake*: 7.7% at 0-20c entries against 0.6% at
+    60-80c, and $40.24 of a $140.82 total loss. That is why it is priced
+    exactly rather than buffered.
     """
     p = min(max(float(price_cents) / 100.0, 0.0), 1.0)
-    return math.ceil(fee_rate * p * (1.0 - p) * 100.0)
+    rate = maker_fee_rate(fee_type, fee_rate) if maker else fee_rate
+    raw = rate * p * (1.0 - p) * float(count)
+    # Round before ceiling. Without this, 0.07*0.40*0.60*10 evaluates to
+    # 0.16800000000000004 and gets rounded *up* to $0.1681 — a fake fee that
+    # cost 14 of 335 fills their exact match.
+    return math.ceil(round(raw * 10000.0, 6)) / 10000.0
+
+
+def maker_fee_rate(
+    fee_type: str, taker_rate: float = KALSHI_TAKER_FEE_RATE
+) -> float:
+    """Maker fee rate for a series' fee_type. Unknown types pay the taker rate.
+
+    An unrecognised fee_type must fall back to the *taker* rate: guessing
+    "makers are free" on a series that charges them understates cost, and an
+    understated cost is what makes a bot trade at negative edge.
+    """
+    if fee_type == FEE_TYPE_QUADRATIC:
+        return 0.0
+    if fee_type == FEE_TYPE_QUADRATIC_WITH_MAKER_FEES:
+        return taker_rate * MAKER_FEE_FRACTION
+    return taker_rate
+
+
+def kalshi_fee_cents_per_contract(
+    price_cents: float,
+    *,
+    maker: bool = False,
+    fee_type: str = FEE_TYPE_QUADRATIC,
+    fee_rate: float = KALSHI_TAKER_FEE_RATE,
+) -> float:
+    """Per-contract fee in cents, **unrounded**, for pre-sizing edge math.
+
+    Edge is evaluated per contract before position size is known, so the
+    order-level ceiling in kalshi_fee_dollars cannot be applied yet. Use the
+    unrounded rate: at any realistic size the ceiling amortises to nothing
+    (a tenth of a cent over 10 contracts), whereas the old ceil-to-cent
+    charged up to a full cent per contract of fee that Kalshi never bills.
+
+    Once `count` is known, use kalshi_fee_dollars — it is exact.
+    """
+    p = min(max(float(price_cents) / 100.0, 0.0), 1.0)
+    rate = maker_fee_rate(fee_type, fee_rate) if maker else fee_rate
+    return rate * p * (1.0 - p) * 100.0
 
 
 def negbinom_ge(n: int, lam: float, dispersion: float) -> float:

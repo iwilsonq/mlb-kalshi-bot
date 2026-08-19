@@ -19,7 +19,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from slugger.config import Config
-from slugger.models import kalshi_fee_cents_per_contract
+from slugger.fees import FALLBACK_FEE_TYPE
+from slugger.models import kalshi_fee_cents_per_contract, kalshi_fee_dollars
 from slugger.execution import classify_fill_role
 
 JOURNAL = Path(__file__).resolve().parent.parent / "logs" / "journal.jsonl"
@@ -160,7 +161,7 @@ def main():
         p = px / 100.0
         base = p * (1 - p) * count
         return {
-            "A_percontract_ceil_7pct": kalshi_fee_cents_per_contract(px) * count,
+            "A_percontract_ceil_7pct": math.ceil(0.07 * p * (1 - p) * 100) * count,
             "B_total_7pct_ceil4dp": math.ceil(0.07 * base * 10000) / 100.0,
             "C_total_3.5pct_ceil4dp": math.ceil(0.035 * base * 10000) / 100.0,
             "D_total_7pct_ceilcent": math.ceil(0.07 * base * 100),
@@ -276,11 +277,9 @@ def main():
         for m in mismatches:
             print(f"  {m}")
 
-    # ── per-series-aware fee model ────────────────────────────────────────
-    # series metadata exposes fee_multiplier and fee_type
-    # (quadratic vs quadratic_with_maker_fees). Test:
-    #   expected = ceil_4dp(fee_multiplier * 0.07 * P * (1-P) * C) for takers
-    #   makers: 0 on 'quadratic', formula on 'quadratic_with_maker_fees'?
+    # ── per-series fee terms ──────────────────────────────────────────────
+    # GET /series/{ticker} exposes fee_type (quadratic vs
+    # quadratic_with_maker_fees) and fee_multiplier.
     series_info = {}
     for s in sorted({r[0].split("-")[0] for r in rows if r[0]}):
         try:
@@ -293,21 +292,31 @@ def main():
         except Exception:
             series_info[s] = {"mult": 1.0, "type": "?"}
 
-    def expected_fee_c(px, count, mult):
-        p = px / 100.0
-        return math.ceil(mult * 0.07 * p * (1 - p) * count * 10000) / 100.0
+    # ── does the SHIPPED model reproduce what Kalshi actually charged? ───
+    # This is the regression check on slugger/fees.py + slugger/models.py.
+    # It deliberately does NOT apply fee_multiplier — see below and the
+    # module docstring of slugger/fees.py.
+    def shipped(px, count, ftype, is_maker):
+        return kalshi_fee_dollars(
+            px, count, maker=is_maker, fee_type=ftype) * 100.0   # cents
 
-    print("\n=== SERIES-AWARE FEE MODEL: ceil_4dp(mult * 0.07 * P(1-P) * C) ===")
+    def with_multiplier(px, count, mult):
+        p = px / 100.0
+        return math.ceil(round(mult * 0.07 * p * (1 - p) * count * 10000, 6)) / 100.0
+
+    print("\n=== SHIPPED FEE MODEL vs CHARGED FEE (slugger/models.py) ===")
     from collections import defaultdict as dd
-    stats = dd(lambda: [0, 0, 0, 0.0, 0.0])  # n, match_formula, match_zero, act, exp
+    stats = dd(lambda: [0, 0, 0, 0.0, 0.0])   # n, match, zero, actual, expected
+    mult_match = dd(lambda: [0, 0])           # n, match-with-multiplier
     maker_nonzero = []
     ts_mismatch = []
     for ticker, role, _, count, px, fee_a, _ in rows:
         if fee_a is None:
             continue
-        s = ticker.split("-")[0]
-        info = series_info.get(s, {"mult": 1.0, "type": "?"})
-        exp = expected_fee_c(px, count, info["mult"])
+        s_ = ticker.split("-")[0]
+        info = series_info.get(s_, {"mult": 1.0, "type": FALLBACK_FEE_TYPE})
+        ftype = info["type"] if info["type"] != "?" else FALLBACK_FEE_TYPE
+        exp = shipped(px, count, ftype, role == "maker")
         key = (info["type"], role)
         st = stats[key]
         st[0] += 1
@@ -319,12 +328,27 @@ def main():
             st[2] += 1
         else:
             ts_mismatch.append((ticker, role, count, px, fee_a, exp, info))
+        if role == "taker":
+            m = mult_match[role]
+            m[0] += 1
+            if abs(fee_a - with_multiplier(px, count, info["mult"])) < 0.005:
+                m[1] += 1
         if role == "maker" and fee_a > 0:
             maker_nonzero.append((ticker, count, px, fee_a, exp, info))
     for (ftype, role), (n, mf, mz, act, exp) in sorted(stats.items()):
         print(f"  fee_type={ftype:28s} role={role:6s} n={n:4d}  "
-              f"match_formula={mf:4d}  fee_zero={mz:4d}  "
-              f"actual=${act/100:.2f}  formula=${exp/100:.2f}")
+              f"match={mf:4d}  fee_zero={mz:4d}  "
+              f"actual=${act/100:.2f}  model=${exp/100:.2f}")
+    n_tak = sum(v[0] for k, v in stats.items() if k[1] == "taker")
+    m_tak = sum(v[1] for k, v in stats.items() if k[1] == "taker")
+    mm = mult_match["taker"]
+    print(f"\n  taker fills reproduced exactly:")
+    print(f"    shipped model (no fee_multiplier):  {m_tak}/{n_tak}"
+          f"  ({100*m_tak/n_tak if n_tak else 0:.0f}%)")
+    print(f"    same, scaled by fee_multiplier:     {mm[1]}/{mm[0]}"
+          f"  ({100*mm[1]/mm[0] if mm[0] else 0:.0f}%)")
+    print("  If the second line ever overtakes the first, Kalshi has started")
+    print("  charging the multiplier and KALSHI_TAKER_FEE_RATE should change.")
     if maker_nonzero:
         print("\nMaker fills with NONZERO fee:")
         for m in maker_nonzero:

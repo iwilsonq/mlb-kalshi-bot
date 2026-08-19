@@ -118,36 +118,97 @@ class TestNegbinomGe:
 
 
 class TestKalshiFee:
-    """Fee model verified against 724/1042 of our own settled fills exactly."""
+    """Fee model verified against 390 of our own fills on 2026-08-19.
 
-    def test_matches_observed_fills(self):
+    See scripts/analyze_maker_fees.py for the audit and slugger/fees.py for
+    why the per-series fee_multiplier is recorded but not applied.
+    """
+
+    def test_ceiling_applies_to_the_order_not_each_contract(self):
+        """The bug this replaced: 10 contracts at 11c cost $0.0686, not $0.10.
+
+        Kalshi ceilings 0.07 * P * (1-P) * count once, to $0.0001. Rounding
+        per contract and multiplying reproduced 1 of 335 taker fills; this
+        reproduces 287. Every case below is an actual charged fee.
+        """
+        from slugger.models import kalshi_fee_dollars
+        assert kalshi_fee_dollars(11, 10) == pytest.approx(0.0686)
+        assert kalshi_fee_dollars(58, 16.74) == pytest.approx(0.2855)
+        assert kalshi_fee_dollars(35, 27.32) == pytest.approx(0.4351)
+        assert kalshi_fee_dollars(26, 18.28) == pytest.approx(0.2462)
+        assert kalshi_fee_dollars(3, 31.21) == pytest.approx(0.0636)
+
+    def test_floating_point_noise_does_not_invent_a_fee(self):
+        """0.07*0.40*0.60*10 is 0.16800000000000004 in binary floating point.
+
+        Ceiling that unguarded bills $0.1681 for a $0.1680 fee, and cost 14
+        of 335 fills their exact match.
+        """
+        from slugger.models import kalshi_fee_dollars
+        assert kalshi_fee_dollars(40, 10) == pytest.approx(0.1680)
+
+    def test_ceiling_still_rounds_up_when_it_should(self):
+        from slugger.models import kalshi_fee_dollars
+        # 0.07 * 0.11 * 0.89 * 10 = 0.068530 -> next $0.0001 up is 0.0686
+        assert kalshi_fee_dollars(11, 10) > 0.06853
+
+    def test_per_contract_fee_is_unrounded(self):
+        """Edge math runs before sizing, so it cannot apply the order ceiling.
+
+        A ceil-to-cent per contract overstated the fee by up to a full cent,
+        which is material against a MIN_EDGE_CENTS of 5.
+        """
         from slugger.models import kalshi_fee_cents_per_contract as fee
-        # ceil(0.07 * P * (1-P) * 100) in cents
-        assert fee(50) == 2   # ceil(1.75)
-        assert fee(30) == 2   # ceil(1.47)
-        assert fee(20) == 2   # ceil(1.12)
-        assert fee(10) == 1   # ceil(0.63)
-        assert fee(70) == 2   # symmetric with 30
-        assert fee(95) == 1
+        assert fee(50) == pytest.approx(1.75)
+        assert fee(30) == pytest.approx(1.47)
+        assert fee(20) == pytest.approx(1.12)
+        assert fee(10) == pytest.approx(0.63)
 
     def test_symmetric_in_price(self):
         from slugger.models import kalshi_fee_cents_per_contract as fee
         for p in (5, 15, 25, 35, 45):
-            assert fee(p) == fee(100 - p)
+            assert fee(p) == pytest.approx(fee(100 - p))
+
+    def test_makers_are_free_on_quadratic_series(self):
+        """50 of 50 maker fills on quadratic series were charged exactly $0."""
+        from slugger.models import FEE_TYPE_QUADRATIC, kalshi_fee_dollars
+        assert kalshi_fee_dollars(
+            42, 20, maker=True, fee_type=FEE_TYPE_QUADRATIC) == 0.0
+
+    def test_makers_pay_a_quarter_on_quadratic_with_maker_fees(self):
+        """Observed 0.250-0.257 of the taker formula on 5 KXMLBGAME fills."""
+        from slugger.models import (
+            FEE_TYPE_QUADRATIC_WITH_MAKER_FEES, kalshi_fee_dollars,
+        )
+        taker = kalshi_fee_dollars(42, 20)
+        maker = kalshi_fee_dollars(
+            42, 20, maker=True, fee_type=FEE_TYPE_QUADRATIC_WITH_MAKER_FEES)
+        assert maker == pytest.approx(0.0853)      # the actual charged fee
+        assert maker / taker == pytest.approx(0.25, abs=0.002)
+
+    def test_unknown_fee_type_charges_makers_the_taker_rate(self):
+        """Guessing "makers are free" on an unrecognised series understates
+        cost, and understated cost is what makes a bot trade at negative edge.
+        """
+        from slugger.models import (
+            KALSHI_TAKER_FEE_RATE, kalshi_fee_dollars, maker_fee_rate,
+        )
+        assert maker_fee_rate("something_new") == KALSHI_TAKER_FEE_RATE
+        assert kalshi_fee_dollars(42, 20, maker=True, fee_type="brand_new") \
+            == kalshi_fee_dollars(42, 20)
 
     def test_share_of_stake_is_what_kills_longshots(self):
-        """Fee as % of stake is several times worse at 10c than at 80c.
+        """Fee as a share of stake is several times worse at 10c than at 80c.
 
-        (10% vs 2.5% with ceiling rounding; the journal's realized 7.7% vs 0.6%
-        gap is wider still because multi-contract fills round once, not per
-        contract.)
+        This is why price level dominated model quality in the journal: 7.7%
+        of stake at 0-20c entries against 0.6% at 60-80c.
         """
         from slugger.models import kalshi_fee_cents_per_contract as fee
-        drag_10 = fee(10) / 10
-        drag_80 = fee(80) / 80
-        assert drag_10 >= 4 * drag_80
+        assert fee(10) / 10 >= 4 * (fee(80) / 80)
 
     def test_degenerate_prices(self):
         from slugger.models import kalshi_fee_cents_per_contract as fee
+        from slugger.models import kalshi_fee_dollars
         assert fee(0) == 0
         assert fee(100) == 0
+        assert kalshi_fee_dollars(50, 0) == 0.0

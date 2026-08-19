@@ -26,7 +26,8 @@ Every evaluated market (traded or not) appends one JSON object:
   ask_cents            YES ask at evaluation
   mid_cents            (bid+ask)/2 when both present
   spread_cents         ask − bid
-  cost_buffer_cents    EDGE_COST_BUFFER applied to edge
+  cost_buffer_cents    total modelled cost charged to edge (exact fee +
+                       EDGE_COST_BUFFER residual); fractional
   gross_edge_cents     calibrated_prob − ask (YES) before buffer
   edge_cents           gross_edge (legacy); same as gross for research continuity
   net_edge_cents       gross − cost_buffer (what trade/size uses)
@@ -267,7 +268,7 @@ def record_signal(
     ask_cents: int = 0,
     mid_cents: float = 0.0,
     spread_cents: int = 0,
-    cost_buffer_cents: int = 0,
+    cost_buffer_cents: float = 0.0,
     fee_cents: float = 0.0,
     gross_edge_cents: Optional[float] = None,
     net_edge_cents: Optional[float] = None,
@@ -298,7 +299,10 @@ def record_signal(
             (bid_cents + ask) / 2.0 if bid_cents and ask else float(ask or 0)
         ),
         "spread_cents": int(spread_cents) if spread_cents or not bid_cents else max(0, ask - bid_cents),
-        "cost_buffer_cents": int(cost_buffer_cents),
+        # Fractional since the fee stopped being ceil-to-cent
+        # (mlb-kalshi-bot-81s). int() here truncated ~0.5c of cost out of
+        # the research record on every signal.
+        "cost_buffer_cents": round(float(cost_buffer_cents), 2),
         "fee_cents": float(fee_cents),
         "gross_edge_cents": round(gross, 1),
         "edge_cents": round(gross, 1),  # legacy alias = gross

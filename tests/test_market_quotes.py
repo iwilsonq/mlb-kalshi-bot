@@ -5,6 +5,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
+import pytest
+
 from slugger.game_processor import snapshot_pending_clv
 from slugger.kalshi_client import (
     fill_price_cents_from_order,
@@ -82,21 +84,24 @@ def test_signal_records_microstructure(tmp_path):
     assert signals[0].spread_cents == 5
     assert signals[0].raw_model_prob_pct == 50
     assert signals[0].gross_edge_cents == 20.0  # 50 - 30
-    # net = 20 - fee(30c)=2 - residual buffer 5 = 13.
+    # net = 20 - fee(30c)=1.47 - residual buffer 5.
     # No half-spread term: gross_edge is measured against the ASK, so the spread
     # is already paid by transacting there. Charging half of it again
     # double-counted, overcharging ~8c on live MLB props (mlb-kalshi-bot-4v6).
-    assert signals[0].edge_cents == 13.0
+    # The fee is exact and unrounded (mlb-kalshi-bot-81s): Kalshi ceilings the
+    # order total, so a per-contract ceil-to-cent overcharged every contract.
+    assert signals[0].edge_cents == pytest.approx(13.53)
 
     data = json.loads((tmp_path / "signals.jsonl").read_text().strip().splitlines()[0])
     assert data["bid_cents"] == 25
     assert data["ask_cents"] == 30
     assert data["mid_cents"] == 27.5
     assert data["spread_cents"] == 5
-    assert data["fee_cents"] == 2.0
-    assert data["cost_buffer_cents"] == 7  # fee 2 + residual 5
+    assert data["fee_cents"] == pytest.approx(1.47)   # 0.07*0.30*0.70*100
+    assert data["cost_buffer_cents"] == pytest.approx(6.47)  # fee + residual 5
     assert data["gross_edge_cents"] == 20.0
-    assert data["net_edge_cents"] == 13.0
+    # journal rounds edges to 0.1c; the TradeSignal above carries full precision
+    assert data["net_edge_cents"] == pytest.approx(13.5)
     assert data["calibrated_prob_pct"] == 50
     assert data["model_prob_pct"] == 50  # raw for calibration
     assert data["traded"] is True

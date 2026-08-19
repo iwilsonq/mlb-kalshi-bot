@@ -274,6 +274,22 @@ class KalshiClient:
                 return None
             raise
 
+    def get_series(self, series_ticker: str) -> Optional[Dict]:
+        """Get a series' metadata, including its fee terms.
+
+        Carries `fee_type` ("quadratic" | "quadratic_with_maker_fees"), which
+        determines whether maker fills are free, and `fee_multiplier`. See
+        slugger/fees.py for how those are (and are not) applied.
+        """
+        try:
+            data = self._get(f"/series/{series_ticker}")
+            return data.get("series")
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                log.warning("Series %s not found", series_ticker)
+                return None
+            raise
+
     # ── Order placement (V2 API) ──────────────────────────────────────────
 
     def create_order(

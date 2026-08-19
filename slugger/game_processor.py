@@ -21,7 +21,7 @@ from slugger.calibration import CalibrationLayer
 from slugger.config import Config
 from slugger.kalshi_client import market_quotes
 from slugger.mlb_data import LiveMLBDataProvider, get_todays_games
-from slugger.models import kalshi_fee_cents_per_contract
+from slugger.fees import SeriesFeeCache
 from slugger.signal_pipeline import load_calibration, unparsed_titles
 from slugger.consensus import consensus_allows_trade, load_consensus_prices
 from slugger.execution import (
@@ -526,6 +526,10 @@ def settle_pending(
     if not pending:
         return 0
 
+    # One series-metadata lookup per series, only touched on the rare
+    # settlement that arrives without a fee_cost.
+    series_fees = SeriesFeeCache(client)
+
     found = 0
     for ticker in sorted(pending):
         try:
@@ -550,13 +554,25 @@ def settle_pending(
             # fee_cost was absent on 27 of 1042 historical settlements and the
             # old float(s.get("fee_cost", 0)) silently recorded $0, understating
             # total fee drag. Estimate from the fee formula instead of zeroing.
+            #
+            # The ceiling applies to the order total, so this must be one
+            # kalshi_fee_dollars call for the whole fill — `count *
+            # per_contract_fee` rounded up every single contract and
+            # overstated the estimate by up to 46% at longshot prices.
             t = trades_by_ticker.get(ticker, {})
             count = int(t.get("count") or 0)
             px = float(t.get("price_cents") or 0)
-            fee = count * kalshi_fee_cents_per_contract(px) / 100.0
+            role = classify_fill_role(
+                int(t.get("price_cents") or 0),
+                int(t.get("fill_price_cents") or t.get("price_cents") or 0),
+                int(t.get("ask_cents") or 0),
+            )
+            terms = series_fees.for_ticker(ticker)
+            fee = terms.fee_dollars(px, count, maker=(role == "maker"))
             log.warning(
-                "%s settlement missing fee_cost — estimated $%.2f from "
-                "%d contracts @ %.0f¢", ticker, fee, count, px,
+                "%s settlement missing fee_cost — estimated $%.4f from "
+                "%d contracts @ %.0f¢ (%s, %s)",
+                ticker, fee, count, px, role, terms.fee_type,
             )
 
         settlement_price = None

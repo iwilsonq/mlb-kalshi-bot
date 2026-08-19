@@ -96,8 +96,11 @@ class TestEvaluateMarkets:
         assert len(signals) == 1
         assert signals[0].side == "yes"
         assert signals[0].strategy == "pitcher_ks"
-        # net edge = 45 - 30 - fee(30c)=2c - half-spread(0) - buffer(0) = 13
-        assert signals[0].edge_cents == 13.0
+        # net edge = 45 - 30 - fee(30c) - half-spread(0) - buffer(0)
+        # fee is the exact unrounded 0.07*0.30*0.70*100 = 1.47c, not a
+        # ceil-to-cent 2c: the ceiling applies once per order, so charging it
+        # per contract invented ~0.5c of fee Kalshi never bills.
+        assert signals[0].edge_cents == pytest.approx(13.53)
         assert signals[0].ticker == "KXMLBKS-TEST-SMITH-7"
 
     def test_no_signal_when_no_edge(self, tmp_path):
@@ -389,8 +392,8 @@ class TestEvaluateMarkets:
         )
         signals = evaluate_markets(spec, model, client, config)
         assert len(signals) == 1
-        # net edge = 50 - 30 - fee(30c)=2c - buffer(5) = 13
-        assert signals[0].edge_cents == 13.0
+        # net edge = 50 - 30 - fee(30c)=1.47c - buffer(5)
+        assert signals[0].edge_cents == pytest.approx(13.53)
 
     def test_max_model_prob_band(self, tmp_path):
         """Probabilities above max_model_prob should not trade."""
@@ -540,7 +543,7 @@ class TestCostModelAndFloors:
         wide = self._run(tempfile.mkdtemp(), prob=45, ask=30, bid=5)
         assert len(tight) == 1 and len(wide) == 1
         # Same ask, same model prob -> identical net edge regardless of the bid
-        assert tight[0].edge_cents == wide[0].edge_cents == 13.0
+        assert tight[0].edge_cents == wide[0].edge_cents == pytest.approx(13.53)
 
     def test_spread_gate_rejects_unusable_quote(self, tmp_path):
         """bid 2c / ask 93c is not a market; Gate 0 saw it present as 37.7c edge."""
