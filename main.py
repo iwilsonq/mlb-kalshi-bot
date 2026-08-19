@@ -25,6 +25,7 @@ from slugger.game_processor import (
     snapshot_pending_clv,
 )
 import slugger.journal as journal
+from slugger.instance_lock import AlreadyRunning, InstanceLock, format_status
 from slugger.reporting import build_report, format_report
 
 log = logging.getLogger("slugger")
@@ -61,6 +62,11 @@ def cmd_check(config: Config):
 
 def cmd_status(config: Config):
     """Show today's MLB games and relevant market info."""
+    # First, because it answers "is something trading right now, and against
+    # what config?" — which the .env on disk does not, since a running
+    # instance holds its own copy in memory (mlb-kalshi-bot-19v).
+    log.info("%s", format_status(config))
+
     games = get_todays_games()
     if not games:
         log.info("No games scheduled today.")
@@ -90,8 +96,22 @@ def cmd_status(config: Config):
 
 
 def cmd_run(config: Config, game_filter=None):
-    """Delegate to game_processor.run()."""
-    run_bot(config, game_filter=game_filter)
+    """Delegate to game_processor.run(), holding the single-instance lock.
+
+    Two concurrent instances would double-trade every signal — neither reads
+    the other's placed-ticker ledger, and both risk budgets are per-process,
+    so every cap would silently double.
+    """
+    try:
+        lock = InstanceLock.acquire(config)
+    except AlreadyRunning as exc:
+        log.error("%s", exc)
+        log.error("Refusing to start a second instance. "
+                  "Stop the running one, or run `main.py status`.")
+        sys.exit(1)
+
+    with lock:
+        run_bot(config, game_filter=game_filter)
 
 
 def cmd_settle(config: Config):

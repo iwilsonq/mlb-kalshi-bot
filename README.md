@@ -108,6 +108,32 @@ Set `DRY_RUN=false` in `.env`, then:
 python3 main.py run
 ```
 
+### Only one instance can trade at a time
+
+`main.py run` takes an exclusive lock on `logs/bot.lock` and refuses to
+start if another instance holds it. Two concurrent bots would double-trade
+every signal: neither reads the other's `logs/placed_<date>.json`, and the
+per-game and daily risk budgets live in process memory, so every cap would
+silently double.
+
+`main.py status` prints what the running instance started with:
+
+```
+bot instance: RUNNING — pid 28479 on host · started 2026-08-19T18:42:39+00:00
+              · DRY-RUN · prod · 2b6cbd6+dirty · [pitcher_ks,player_hits]
+```
+
+That line matters more than the lock. A running bot holds its `.env` and its
+code in memory, so editing `DRY_RUN` or a gate mid-session does *not* affect
+it — while `logs/calibration.json` and `logs/ks_model.json` **are** re-read
+from disk, so a live bot can pick up a half-finished model change. The git
+commit is what ties a fill to the code that produced it (`+dirty` means it
+does not).
+
+The lock is an `flock`, so the kernel releases it if the process is killed —
+a stale lock cannot block a restart. The file is left behind on an unclean
+exit, and `status` reports that as "exited without releasing the lock".
+
 ### Use specific strategies
 Edit `ENABLED_STRATEGIES` in `.env`. Entries not registered in
 `STRATEGY_PIPELINE` are inert (a test enforces the default allowlist is a
