@@ -431,6 +431,74 @@ def report_tradable(events: Sequence[Event], books) -> None:
     print("    bar: a null result here is informative, not merely underpowered.")
 
 
+def report_who_is_right(data_list: Sequence[dict]) -> None:
+    """Score the anchor and the market against what actually happened.
+
+    Section 4 shows the market moving ~a third as far as the anchor. Which
+    of the two is wrong decides whether there is a trade at all: "market
+    under-responds" is an edge, "model over-responds" is not. Both make a
+    probability claim about the same event and the games finished, so this
+    is answerable rather than arguable.
+    """
+    h("8. WHO IS ACTUALLY RIGHT — ANCHOR vs MARKET, SCORED ON OUTCOMES")
+    model_sq: Dict[int, List[float]] = collections.defaultdict(list)
+    market_sq: Dict[int, List[float]] = collections.defaultdict(list)
+
+    for data in data_list:
+        by_pk = data["manifest"].by_pk()
+        books = {tk: Book(rows) for tk, rows in data["quotes"].items()}
+        for pk, samples in data["states"].items():
+            game = by_pk.get(pk)
+            if not game or game.home_market not in books or not samples:
+                continue
+            final = samples[-1].state
+            home, away = final.get("home_runs"), final.get("away_runs")
+            if home is None or away is None or home == away:
+                continue          # tied at last sight: game not finished here
+            y = 1.0 if home > away else 0.0
+            bk = books[game.home_market]
+            for s in samples:
+                q = bk.quote(s.recv_ts)
+                if q is None:
+                    continue
+                p_mkt = (q[0] + q[1]) / 200.0
+                if not 0.01 < p_mkt < 0.99:
+                    continue      # settled/one-sided book carries no opinion
+                model_sq[pk].append((s.wp - y) ** 2)
+                market_sq[pk].append((p_mkt - y) ** 2)
+
+    games = sorted(model_sq)
+    n = sum(len(v) for v in model_sq.values())
+    if not games or n < 100:
+        print(f"    not enough decided games to score (n={n})")
+        return
+    b_model = sum(sum(v) for v in model_sq.values()) / n
+    b_market = sum(sum(v) for v in market_sq.values()) / n
+    print(f"    scored over {n:,} state observations, {len(games)} games\n")
+    print(f"      WP anchor Brier : {b_model:.5f}")
+    print(f"      market    Brier : {b_market:.5f}")
+    print(f"      difference      : {b_model - b_market:+.5f}"
+          f"   ({'anchor worse' if b_model > b_market else 'ANCHOR BETTER'})")
+
+    # Paired by game so one blowout cannot carry the result.
+    diffs = [statistics.mean(model_sq[pk]) - statistics.mean(market_sq[pk])
+             for pk in games]
+    mu, se = mean_se(diffs)
+    wins = sum(1 for d in diffs if d < 0)
+    print(f"\n    paired by game (n={len(diffs)}): gap {mu:+.5f} "
+          f"se {se:.5f}  t={mu / se:+.2f}")
+    print(f"    anchor beat the market in {wins}/{len(diffs)} games")
+    if b_model > b_market:
+        print("\n    The anchor is the one that is wrong, so section 4's slope")
+        print("    is model over-response — there is no under-reaction to")
+        print("    harvest. A better WP model is a prerequisite for any edge")
+        print("    here, not a refinement of one.")
+    else:
+        print("\n    !! The anchor beats the market. Section 4's slope would")
+        print("    then be market under-response, which IS an edge — revisit")
+        print("    4g6 before dismissing it on latency alone.")
+
+
 def report_liquidity(data_list: Sequence[dict]) -> None:
     h("7. LIQUIDITY")
     spreads = sorted(
@@ -492,6 +560,7 @@ def main() -> int:
     report_capturable(all_events, all_books, median_latency)
     report_tradable(all_events, all_books)
     report_liquidity(data_list)
+    report_who_is_right(data_list)
     return 0
 
 

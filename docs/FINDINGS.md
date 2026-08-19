@@ -477,12 +477,24 @@ toward zero — no reversion to trade. Regression across all 506 clean events:
 market move = −0.15 + 0.321 × anchor move    (se 0.034, t = 9.6)
 ```
 
-The anchor moves ~3× as far as the market. The parsimonious reading is that the
-WP model over-responds — it has no team, pitcher or lineup input, so it prices
-every comeback as league-average — rather than that the market under-responds.
-The slope is worst exactly where the model knows least (Single 0.11, Walk 0.23)
-and best on outs, where game state is nearly sufficient (Strikeout 0.62,
-Flyout 0.57).
+The anchor moves ~3× as far as the market. The slope is worst exactly where
+the model knows least (Single 0.11, Walk 0.23) and best on outs, where game
+state is nearly sufficient (Strikeout 0.62, Flyout 0.57).
+
+Which of the two is wrong is the load-bearing question — "market under-responds"
+would be an edge, "model over-responds" is not — so it is settled against the
+outcomes rather than by argument. Both make a probability claim about the same
+event, and all 15 games finished:
+
+| scored over 2,955 state observations | Brier |
+|---|---:|
+| WP model | 0.15808 |
+| **market** | **0.13392** |
+
+Paired by game, the gap is **+0.02129 (se 0.00833, t = +2.56)** and the market
+is better in **12 of 15** games. The model is the one that is wrong; there is
+no under-reaction to harvest. (0.158 also matches `d4p`'s independent holdout
+Brier of 0.1589, so this is internally consistent.)
 
 ### The trade itself, simulated
 
@@ -502,12 +514,27 @@ resolved a 0.3–0.6¢ edge at t = 2, and the bar to clear is 1–2¢.
 
 Liquidity was never the constraint — game-winner spreads are p50 **1¢**, p75 2¢.
 
-**Decision:** kill criterion fired. `4g6` (live in-game mean-reversion trader)
-closed unbuilt. `162` (isotonic recalibration of the WP model) closed too: it
-addresses level calibration, but the gap here is *response magnitude*, and no
-amount of WP accuracy buys back 25 seconds.
+### What this does not cover
 
-The reusable parts survive: `slugger/recorder/replay.py` (order-book
+Stated plainly, because the decision rests on one slate:
+
+- **Only `KXMLBGAME` was analysed.** The recorder captured 11 `KXMLBTOTAL`
+  markets per game and none were examined. Totals are thinner and may reprice
+  more slowly. This is the largest untested gap.
+- **No resting maker order was simulated.** The fade test entered at mid or
+  crossed the spread; `4g6`'s design is maker-first, which has a different
+  payoff and a queue-position problem this does not model.
+- The reaction-timing table is **n = 71 events on one slate**. The effect is
+  near-saturation (median 0.91 complete at `endTime`) rather than marginal,
+  but it is one day.
+
+**Decision:** kill criterion fired, provisionally. `4g6` and `162` are held
+open and blocked on `ai7` until a second full slate agrees and the totals
+markets are checked — the evidence is strong but a feature epic should not be
+closed unbuilt on n = 1 slate. No amount of WP accuracy buys back 25 seconds,
+so the latency leg is the one that would have to break.
+
+The reusable parts survive regardless: `slugger/recorder/replay.py` (order-book
 reconstruction from the raw feed) and `scripts/overshoot_analysis.py` re-run on
 any recorded slate in ~1 minute. Any future in-game idea must first answer the
 latency question, because on this venue it dominates every model question.
