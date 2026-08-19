@@ -125,6 +125,52 @@ traded settlements), retrains the Ks model, and reports holdout Brier vs
 the market — with an explicit warning when the model has no demonstrated
 edge.
 
+## Phase 0 recorder
+
+Records both sides of the tape — every Kalshi websocket frame and MLB GUMBO
+play-by-play — to `logs/recorder/<date>/`, with a local receive timestamp on
+every record. Zero trading. This is the input to the overshoot analysis.
+
+```bash
+python3 main.py record                    # foreground, today
+scripts/start_recorder.sh                 # detached, today
+scripts/start_recorder.sh 2026-08-19      # a specific date
+python3 scripts/recorder_status.py        # health + live scoreboard
+python3 scripts/first_pitch.py            # when does today's slate start?
+```
+
+Budget roughly **6-7 GB of disk per slate** (2026-08-18: 6.4 GB across 195
+markets).
+
+### Automating it
+
+First pitch moves by hours — 2026-08-19 opened at 09:35 PDT — so the daily
+job looks the time up instead of hard-coding it:
+
+```bash
+scripts/install_recorder_job.sh           # launchd, fires 05:00 local
+RECORDER_HOUR=4 scripts/install_recorder_job.sh
+scripts/install_recorder_job.sh --uninstall
+launchctl kickstart gui/$(id -u)/com.slugger.recorder   # run it now
+```
+
+The job wakes at `RECORDER_HOUR`, asks `statsapi` for the earliest start,
+sleeps until 15 minutes before it (`RECORDER_LEAD_MIN`), and records until
+every game is Final. On an off day it logs that and exits. Progress lands in
+`logs/recorder/daily.log`.
+
+Two things that will bite you:
+
+- **`caffeinate` does not prevent lid-close sleep on battery.** The recorder
+  runs under `caffeinate -is`, which blocks *idle* sleep only. A recording
+  machine must be plugged in, or have its lid open, or the streams stop
+  mid-slate.
+- **Under launchd the recorder must run in the foreground.** launchd tears
+  down the job's whole process group when the main process exits, so a
+  `nohup ... &` recorder is killed seconds after launch and leaves an empty
+  slate behind — verified, and it fails silently. That is why
+  `daily_recorder.sh` calls `start_recorder.sh --foreground`.
+
 ## CLI Options
 
 ```
