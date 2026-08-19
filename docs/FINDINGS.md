@@ -4,7 +4,7 @@ Empirical results that should outlive any one session. Each entry says what was
 measured, on what data, and what decision it drove. Commits referenced are on
 `main`; bead IDs refer to the local beads DB (`bd show <id>`).
 
-Last updated: 2026-08-03.
+Last updated: 2026-08-19.
 
 ---
 
@@ -406,3 +406,102 @@ Every route is now measured, none is tradeable for us:
 The remaining edge on this venue is liquidity provision, which requires capital
 and a quoting engine (§3, §12). The bot should not trade
 (`DRY_RUN=true` permanently); it remains a sound measurement instrument.
+
+---
+
+## 14. In-game overreaction: the market is done reacting before we know (bead `5vo`)
+
+The Phase 1 thesis was that Kalshi overshoots on salient in-game events and
+reverts, tradeably. Measured on the first full recorded slate
+(**2026-08-18: 15 games, 18.5M Kalshi messages / 6.4 GB, 1,118 plays, 294
+with |ΔWP| ≥ 3¢**), against the WP anchor from `d4p`. Reproduce with
+`python3 scripts/overshoot_analysis.py 2026-08-18`.
+
+### The market is fully repriced ~25 seconds before our feed delivers the play
+
+Fraction of the market's total repricing already complete, timed off MLB's own
+`about.endTime` for the play:
+
+| t − endTime | −20s | −10s | −5s | **0s** | +5s | +30s |
+|---|---:|---:|---:|---:|---:|---:|
+| median complete | 0.00 | 0.40 | 0.74 | **0.91** | **1.00** | 1.00 |
+
+Our GUMBO poller receives that play at a **median +25.3s** (p75 37s, p90 48s).
+So by the time we learn a home run happened, the price has been at its new
+level for half a minute.
+
+This is not a clock artifact: our `recv_ts` vs Kalshi's exchange timestamps,
+across 578k book updates, is **+0.03s median** (p99 +0.25s). It is also not a
+polling artifact — the poller runs every 3s, and MLB's `endTime` is itself
+~10s behind the physical play, which is why the market is already 40% moved at
+`endTime − 10s`.
+
+### What is left to capture, as a function of latency
+
+Median |total market move| on these events is 4.0¢:
+
+| our latency vs endTime | fraction left | cents left |
+|---|---:|---:|
+| −10s (impossible: ahead of MLB) | 0.78 | 3.14¢ |
+| −5s (impossible) | 0.45 | 1.79¢ |
+| 0s (perfect, unattainable) | 0.03 | **0.12¢** |
+| +5s and beyond | 0.00 | **0.00¢** |
+| +25s (**what we have**) | 0.00 | 0.00¢ |
+
+Round-trip cost is 1–2¢ (fees per §13/`bvc`) plus any spread. Even a
+*perfect zero-latency* feed leaves 0.12¢ against a 1¢ floor. Buying a faster
+feed does not fix this; we would have to be ~5 seconds **ahead** of MLB's own
+scoring timestamp, i.e. an in-park real-time feed.
+
+### There is no overshoot to fade anyway
+
+Signed excess move (market move − anchor move, in the event's direction;
+positive = overshoot):
+
+| t − endTime | 0s | +10s | +30s | +60s | +120s |
+|---|---:|---:|---:|---:|---:|
+| mean ¢ | −5.12 | −4.91 | −4.77 | −4.65 | −4.01 |
+| share > 0 | 11% | 12% | 13% | 14% | 16% |
+
+The sign is *negative and flat*: the market moves **less** than the anchor and
+then stays there. Only 11–16% of events overshoot at all, and there is no decay
+toward zero — no reversion to trade. Regression across all 506 clean events:
+
+```
+market move = −0.15 + 0.321 × anchor move    (se 0.034, t = 9.6)
+```
+
+The anchor moves ~3× as far as the market. The parsimonious reading is that the
+WP model over-responds — it has no team, pitcher or lineup input, so it prices
+every comeback as league-average — rather than that the market under-responds.
+The slope is worst exactly where the model knows least (Single 0.11, Walk 0.23)
+and best on outs, where game state is nearly sufficient (Strikeout 0.62,
+Flyout 0.57).
+
+### The trade itself, simulated
+
+Enter at feed-receipt time (the earliest instant we could act), fade the
+market/anchor residual, exit after a hold. **Gross of fees:**
+
+| fill | \|residual\| | hold | n | mean | t | min detectable edge |
+|---|---:|---:|---:|---:|---:|---:|
+| mid (unattainable) | ≥3¢ | 60s | 150 | −0.08¢ | −0.5 | 0.30¢ |
+| mid | ≥5¢ | 60s | 95 | −0.15¢ | −0.7 | 0.41¢ |
+| exec (pay spread) | ≥3¢ | 60s | 150 | −0.38¢ | −1.9 | 0.41¢ |
+| exec | ≥5¢ | 60s | 95 | −0.40¢ | −1.4 | 0.59¢ |
+
+Zero at every threshold and horizon, negative once you pay the spread. The
+sample is small but **not underpowered for the question asked**: it could have
+resolved a 0.3–0.6¢ edge at t = 2, and the bar to clear is 1–2¢.
+
+Liquidity was never the constraint — game-winner spreads are p50 **1¢**, p75 2¢.
+
+**Decision:** kill criterion fired. `4g6` (live in-game mean-reversion trader)
+closed unbuilt. `162` (isotonic recalibration of the WP model) closed too: it
+addresses level calibration, but the gap here is *response magnitude*, and no
+amount of WP accuracy buys back 25 seconds.
+
+The reusable parts survive: `slugger/recorder/replay.py` (order-book
+reconstruction from the raw feed) and `scripts/overshoot_analysis.py` re-run on
+any recorded slate in ~1 minute. Any future in-game idea must first answer the
+latency question, because on this venue it dominates every model question.
